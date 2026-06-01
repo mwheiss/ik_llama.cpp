@@ -88,9 +88,13 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     GGML_ASSERT(layer.hc_attn_fn != nullptr);
     GGML_ASSERT(layer.hc_attn_scale != nullptr);
     GGML_ASSERT(layer.hc_attn_base != nullptr);
+    GGML_ASSERT(layer.hc_ffn_fn != nullptr);
+    GGML_ASSERT(layer.hc_ffn_scale != nullptr);
+    GGML_ASSERT(layer.hc_ffn_base != nullptr);
     GGML_ASSERT(layer.attn_norm != nullptr);
     GGML_ASSERT(layer.attn_q_a_norm != nullptr);
     GGML_ASSERT(layer.attn_kv_a_norm != nullptr);
+    GGML_ASSERT(layer.ffn_norm != nullptr);
     GGML_ASSERT(layer.wq_a != nullptr);
     GGML_ASSERT(layer.wq_b != nullptr);
     GGML_ASSERT(layer.attn_kv != nullptr);
@@ -190,9 +194,29 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     cb(inpL, "hc_attn_post", il);
     dsv4_log_tensor_shape("hc_attn_post", inpL);
 
+    residual = inpL;
+    mix = llm_build_deepseek4_hc_pre(ctx0, inpL,
+            layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base,
+            n_embd, n_hc, n_tokens, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
+    cur = mix.x;
+    cb(cur, "hc_ffn_pre", il);
+    cb(mix.mixes, "hc_ffn_pre_mixes", il);
+    cb(mix.pre, "hc_ffn_pre_weights", il);
+    cb(mix.post, "hc_ffn_pre_post_weights", il);
+    cb(mix.comb, "hc_ffn_pre_comb", il);
+    dsv4_log_tensor_shape("hc_ffn_pre", cur);
+    dsv4_log_tensor_shape("hc_ffn_pre_mixes", mix.mixes);
+    dsv4_log_tensor_shape("hc_ffn_pre_weights", mix.pre);
+    dsv4_log_tensor_shape("hc_ffn_pre_post_weights", mix.post);
+    dsv4_log_tensor_shape("hc_ffn_pre_comb", mix.comb);
+
+    cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
+    cb(cur, "ffn_norm", il);
+    dsv4_log_tensor_shape("ffn_norm", cur);
+
     (void) n_lora_q;
 
-    throw std::runtime_error("DeepSeek V4 FFN hyperconnection pre graph segment not implemented yet");
+    throw std::runtime_error("DeepSeek V4 FFN/MoE graph segment not implemented yet");
 
     return gf;
 }
