@@ -51,6 +51,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_OPENELM,         "openelm"      },
     { LLM_ARCH_ARCTIC,          "arctic"       },
     { LLM_ARCH_DEEPSEEK2,       "deepseek2"    },
+    { LLM_ARCH_DEEPSEEK4,       "deepseek4"    },
     { LLM_ARCH_CHATGLM,         "chatglm"      },
     { LLM_ARCH_GLM4,            "glm4"         },
     { LLM_ARCH_GLM4_MOE,        "glm4moe"      },
@@ -141,6 +142,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SWIGLU_LIMITS_SHARED,              "%s.swiglu_limits_shared"              },
     { LLM_KV_SWIGLU_CLAMP_EXP,                  "%s.swiglu_clamp_exp"                  },
     { LLM_KV_SWIGLU_CLAMP_SHEXP,                "%s.swiglu_clamp_shexp"                },
+    { LLM_KV_HASH_LAYER_COUNT,                  "%s.hash_layer_count"                  },
+    { LLM_KV_HYPER_CONNECTION_COUNT,            "%s.hyper_connection.count"            },
+    { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS,   "%s.hyper_connection.sinkhorn_iterations" },
+    { LLM_KV_HYPER_CONNECTION_EPS,              "%s.hyper_connection.epsilon"          },
     { LLM_KV_MTP_BACKBONE_EMBEDDING_LENGTH,     "%s.backbone_embedding_length"         },
     { LLM_KV_MTP_USE_ORDERED_EMBEDDINGS,        "%s.use_ordered_embeddings"            },
     { LLM_KV_MTP_CENTROID_COUNT,                "%s.centroid_count"                    },
@@ -174,6 +179,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_KEY_LENGTH_SWA,         "%s.attention.key_length_swa"         },
     { LLM_KV_ATTENTION_VALUE_LENGTH_SWA,       "%s.attention.value_length_swa"       },
     { LLM_KV_ATTENTION_VALUE_SCALE,            "%s.attention.value_scale"            },
+    { LLM_KV_ATTENTION_COMPRESS_RATIOS,        "%s.attention.compress_ratios"        },
+    { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,"%s.attention.compress_rope_freq_base"},
+    { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,       "%s.attention.output_lora_rank"       },
+    { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,     "%s.attention.output_group_count"     },
 
     { LLM_KV_ROPE_DIMENSION_COUNT,          "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_DIMENSION_COUNT_SWA,      "%s.rope.dimension_count_swa"             },
@@ -279,4 +288,3 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         return false;
     }
 }
-

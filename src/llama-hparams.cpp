@@ -3,6 +3,7 @@
 #include "llama-model-loader.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <map>
 
 #define LLAMA_MAX_EXPERTS 512  // Qwen3 Next
@@ -32,6 +33,7 @@ static inline const char * llm_expert_gating_func_name(llm_expert_gating_func_ty
         case LLM_EXPERT_GATING_FUNC_SOFTMAX: return "softmax";
         case LLM_EXPERT_GATING_FUNC_SIGMOID: return "sigmoid";
         case LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: return "weight";
+        case LLM_EXPERT_GATING_FUNC_SQRTSOFTPLUS: return "sqrtsoftplus";
         default: return "none";
     }
 }
@@ -85,6 +87,7 @@ void llm_load_hparams(
     std::fill(hparams.n_head_kv_arr.begin(), hparams.n_head_kv_arr.end(), 0);
     std::fill(hparams.n_ff_arr.begin(),      hparams.n_ff_arr.end(),      0);
     std::fill(hparams.recurrent_layer_arr.begin(), hparams.recurrent_layer_arr.end(), false);
+    std::fill(hparams.attn_compress_ratio.begin(), hparams.attn_compress_ratio.end(), 0);
 
     ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer, false);
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer, false);
@@ -928,6 +931,63 @@ void llm_load_hparams(
                 } else {
                     model.type = e_model::MODEL_UNKNOWN;
                 }
+            } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,  hparams.n_lora_o);
+                ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,hparams.n_attn_out_groups);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+                if (hparams.expert_gating_func == LLM_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SQRTSOFTPLUS;
+                }
+
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                if (hparams.n_swa > 0) {
+                    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                    hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+                }
+                ml.get_key(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.compress_rope_freq_base, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,      hparams.indexer_n_head, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,      hparams.indexer_head_size, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,           hparams.indexer_top_k, false);
+                ml.get_key(LLM_KV_HASH_LAYER_COUNT,                  hparams.n_hash_layers);
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,              hparams.nextn_predict_layers, false);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,            hparams.n_hc);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS,   hparams.hc_sinkhorn_iters);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_EPS,              hparams.hc_eps);
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,           hparams.swiglu_limits, hparams.n_layer, false);
+
+                uint32_t n_compress_ratios = 0;
+                ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, n_compress_ratios);
+                if (n_compress_ratios < hparams.n_layer) {
+                    throw std::runtime_error(format("DeepSeek V4 compress ratio count mismatch: got %u, expected at least %u",
+                                n_compress_ratios, hparams.n_layer));
+                }
+                std::array<uint32_t, LLAMA_MAX_LAYERS> compress_ratios = {};
+                ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, compress_ratios, n_compress_ratios);
+                for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    hparams.attn_compress_ratio[il] = compress_ratios[il];
+
+                    const uint32_t ratio = hparams.attn_compress_ratio[il];
+                    if (ratio == 0) {
+                        continue;
+                    }
+
+                    const uint32_t coff = ratio == 4 ? 2 : 1;
+                    uint32_t state_size = coff * ratio * coff * hparams.n_embd_head_k(il);
+                    if (ratio == 4) {
+                        state_size += coff * ratio * coff * hparams.indexer_head_size;
+                    }
+                    hparams.dsv4_state_size = std::max(hparams.dsv4_state_size, state_size);
+                }
+
+                model.type = hparams.n_expert == 256 ? e_model::MODEL_685B_A37B : e_model::MODEL_UNKNOWN;
             } break;
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_DEEPSEEK2:

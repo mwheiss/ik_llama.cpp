@@ -116,6 +116,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_deepseek2_tensors(const LLM_TN & tn);
 
+    bool create_deepseek4_tensors(const LLM_TN & tn);
+
     bool create_glm_dsa_tensors(const LLM_TN & tn);
 
     bool create_glm4_tensors(const LLM_TN & tn);
@@ -2591,6 +2593,101 @@ bool create_tensors_helper::create_deepseek2_tensors(const LLM_TN & tn) {
     return use_mmap_buffer;
 }
 
+bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    const int64_t q_lora_rank     = hparams.n_lora_q;
+    const int64_t o_lora_rank     = hparams.n_lora_o;
+    const int64_t n_out_groups    = hparams.n_attn_out_groups;
+    const int64_t n_ff_exp        = hparams.n_ff_exp;
+    const int64_t n_expert_shared = hparams.n_expert_shared;
+    const int64_t n_hc            = hparams.n_hc;
+    const int64_t hc_dim          = n_hc * n_embd;
+    const int64_t hc_mix          = (2 + n_hc) * n_hc;
+
+    if (n_out_groups == 0) {
+        throw std::runtime_error("DeepSeek V4 requires attention output groups");
+    }
+
+    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+    model.output          = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,          "weight"), {n_embd, n_vocab});
+    model.output_norm     = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM,     "weight"), {n_embd});
+    model.output_hc_base  = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_HC_BASE,  "weight"), {n_hc});
+    model.output_hc_fn    = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_HC_FN,    "weight"), {hc_dim, n_hc});
+    model.output_hc_scale = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_HC_SCALE, "weight"), {1});
+
+    auto create_compressor = [&](llama_layer & layer, int bid, int64_t ratio, int64_t head_size, bool indexer) {
+        const int64_t coff = ratio == 4 ? 2 : 1;
+        ggml_tensor *& ape  = indexer ? layer.indexer_compressor_ape  : layer.attn_compressor_ape;
+        ggml_tensor *& kv   = indexer ? layer.indexer_compressor_kv   : layer.attn_compressor_kv;
+        ggml_tensor *& gate = indexer ? layer.indexer_compressor_gate : layer.attn_compressor_gate;
+        ggml_tensor *& norm = indexer ? layer.indexer_compressor_norm : layer.attn_compressor_norm;
+
+        ggml_context * ctx_split = ctx_for_layer_split(bid);
+        ggml_context * ctx_layer = ctx_for_layer(bid);
+        ape  = create_tensor(ctx_split, indexer ? tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE,  "weight", bid) : tn(LLM_TENSOR_ATTN_COMPRESSOR_APE,  "weight", bid), {coff * head_size, ratio});
+        kv   = create_tensor(ctx_split, indexer ? tn(LLM_TENSOR_INDEXER_COMPRESSOR_KV,   "weight", bid) : tn(LLM_TENSOR_ATTN_COMPRESSOR_KV,   "weight", bid), {n_embd, coff * head_size});
+        gate = create_tensor(ctx_split, indexer ? tn(LLM_TENSOR_INDEXER_COMPRESSOR_GATE, "weight", bid) : tn(LLM_TENSOR_ATTN_COMPRESSOR_GATE, "weight", bid), {n_embd, coff * head_size});
+        norm = create_tensor(ctx_layer, indexer ? tn(LLM_TENSOR_INDEXER_COMPRESSOR_NORM, "weight", bid) : tn(LLM_TENSOR_ATTN_COMPRESSOR_NORM, "weight", bid), {head_size});
+    };
+
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_layer = ctx_for_layer(i);
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+        auto & layer = model.layers[i];
+        const int64_t compress_ratio = hparams.attn_compress_ratio[i];
+
+        layer.hc_attn_base  = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix});
+        layer.hc_attn_fn    = create_tensor(ctx_split, tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix});
+        layer.hc_attn_scale = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3});
+        layer.hc_ffn_base   = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix});
+        layer.hc_ffn_fn     = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, hc_mix});
+        layer.hc_ffn_scale  = create_tensor(ctx_layer, tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3});
+
+        layer.attn_norm      = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd});
+        layer.ffn_norm       = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM,       "weight", i), {n_embd});
+        layer.attn_sinks     = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_SINKS,     "weight", i), {n_head});
+        layer.attn_q_a_norm  = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank});
+        layer.attn_kv_a_norm = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {n_embd_head_k});
+
+        layer.wq_a      = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_A,    "weight", i), {n_embd, q_lora_rank});
+        layer.wq_b      = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_B,    "weight", i), {q_lora_rank, n_head * n_embd_head_k});
+        layer.attn_kv   = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_KV,     "weight", i), {n_embd, n_embd_head_k});
+        layer.attn_wo_a = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT_A,  "weight", i), {n_head * n_embd_head_v / n_out_groups, n_out_groups * o_lora_rank});
+        layer.attn_wo_b = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT_B,  "weight", i), {n_out_groups * o_lora_rank, n_embd});
+
+        if (compress_ratio > 0) {
+            create_compressor(layer, i, compress_ratio, n_embd_head_k, false);
+        }
+        if (compress_ratio == 4) {
+            layer.indexer_attn_q_b = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * hparams.indexer_head_size});
+            layer.indexer_proj     = create_tensor(ctx_split, tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head});
+            create_compressor(layer, i, compress_ratio, hparams.indexer_head_size, true);
+        }
+
+        layer.ffn_gate_inp = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert});
+        if (static_cast<uint32_t>(i) < hparams.n_hash_layers) {
+            layer.ffn_gate_tid2eid = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab});
+            layer.ffn_exp_probs_b  = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, llama_model_loader::TENSOR_NOT_REQUIRED);
+        } else {
+            layer.ffn_exp_probs_b  = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert});
+            layer.ffn_gate_tid2eid = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+        }
+
+        layer.ffn_gate_exps = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert});
+        layer.ffn_down_exps = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert});
+        layer.ffn_up_exps   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert});
+
+        layer.ffn_gate_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared});
+        layer.ffn_down_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd});
+        layer.ffn_up_shexp   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared});
+    }
+
+    return use_mmap_buffer;
+}
+
 bool create_tensors_helper::create_glm_dsa_tensors(const LLM_TN & tn) {
     LOADING_PRELUDE
 
@@ -4282,6 +4379,8 @@ bool create_tensors_helper::create_tensors() {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_MISTRAL4:
             use_mmap_buffer = create_deepseek2_tensors(tn); break;
+        case LLM_ARCH_DEEPSEEK4:
+            use_mmap_buffer = create_deepseek4_tensors(tn); break;
         case LLM_ARCH_GLM_DSA:
             use_mmap_buffer = create_glm_dsa_tensors(tn); break;
         case LLM_ARCH_GLM4_MOE:

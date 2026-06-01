@@ -9,6 +9,7 @@
 
 #include <unordered_set>
 #include <algorithm>
+#include <stdexcept>
 
 uint32_t llm_build_context::llama_kv_qnext_state_slots(const llama_kv_cache & kv_self) {
     uint32_t n_slots = 0;
@@ -2413,6 +2414,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_MISTRAL4:
             {
                 result = llm.build_deepseek2();
+            } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                throw std::runtime_error("DeepSeek V4 graph construction not implemented yet");
             } break;
         case LLM_ARCH_CHATGLM:
             {

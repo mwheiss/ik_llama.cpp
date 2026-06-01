@@ -401,6 +401,7 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
         case LLM_EXPERT_GATING_FUNC_SOFTMAX: return "softmax";
         case LLM_EXPERT_GATING_FUNC_SIGMOID: return "sigmoid";
         case LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: return "softmax_weight";
+        case LLM_EXPERT_GATING_FUNC_SQRTSOFTPLUS: return "sqrtsoftplus";
         default:                             return "unknown";
     }
 }
@@ -2158,6 +2159,35 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
         LLAMA_LOG_INFO("%s: rope_yarn_log_mul    = %.4f\n",   __func__, hparams.rope_yarn_log_mul);
     }
 
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        uint32_t n_compressed_layers = 0;
+        uint32_t n_indexed_layers    = 0;
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            n_compressed_layers += hparams.attn_compress_ratio[il] > 0;
+            n_indexed_layers    += hparams.attn_compress_ratio[il] == 4;
+        }
+        LLAMA_LOG_INFO("%s: n_lora_q             = %d\n",     __func__, hparams.n_lora_q);
+        LLAMA_LOG_INFO("%s: n_lora_o             = %d\n",     __func__, hparams.n_lora_o);
+        LLAMA_LOG_INFO("%s: n_attn_out_groups    = %d\n",     __func__, hparams.n_attn_out_groups);
+        LLAMA_LOG_INFO("%s: n_ff_exp             = %d\n",     __func__, hparams.n_ff_exp);
+        LLAMA_LOG_INFO("%s: n_expert_shared      = %d\n",     __func__, hparams.n_expert_shared);
+        LLAMA_LOG_INFO("%s: n_hash_layers        = %d\n",     __func__, hparams.n_hash_layers);
+        LLAMA_LOG_INFO("%s: n_hc                 = %d\n",     __func__, hparams.n_hc);
+        LLAMA_LOG_INFO("%s: hc_sinkhorn_iters    = %d\n",     __func__, hparams.hc_sinkhorn_iters);
+        LLAMA_LOG_INFO("%s: hc_eps               = %.1e\n",   __func__, hparams.hc_eps);
+        LLAMA_LOG_INFO("%s: compress_rope_base   = %.1f\n",   __func__, hparams.compress_rope_freq_base);
+        LLAMA_LOG_INFO("%s: dsv4_state_size      = %d\n",     __func__, hparams.dsv4_state_size);
+        LLAMA_LOG_INFO("%s: compress layers      = %u\n",     __func__, n_compressed_layers);
+        LLAMA_LOG_INFO("%s: indexer layers       = %u\n",     __func__, n_indexed_layers);
+        LLAMA_LOG_INFO("%s: indexer heads        = %u\n",     __func__, hparams.indexer_n_head);
+        LLAMA_LOG_INFO("%s: indexer head size    = %u\n",     __func__, hparams.indexer_head_size);
+        LLAMA_LOG_INFO("%s: indexer top k        = %u\n",     __func__, hparams.indexer_top_k);
+        LLAMA_LOG_INFO("%s: expert_weights_scale = %.1f\n",   __func__, hparams.expert_weights_scale);
+        LLAMA_LOG_INFO("%s: expert_weights_norm  = %d\n",     __func__, hparams.expert_weights_norm);
+        LLAMA_LOG_INFO("%s: expert_gating_func   = %s\n",     __func__, llama_expert_gating_func_name((llm_expert_gating_func_type) hparams.expert_gating_func));
+        LLAMA_LOG_INFO("%s: gguf tensors         = %d\n",     __func__, ml.n_tensors);
+    }
+
     if (model.arch == LLM_ARCH_QWEN2MOE) {
         LLAMA_LOG_INFO("%s: n_ff_exp         = %d\n",     __func__, hparams.n_ff_exp);
         LLAMA_LOG_INFO("%s: n_ff_shexp       = %d\n",     __func__, hparams.n_ff_shexp);
@@ -3137,6 +3167,14 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
         }
         if (name == "output_norm.weight") {
             continue;
+        }
+        if (model.arch == LLM_ARCH_DEEPSEEK4) {
+            if (name == "output_hc_base.weight" ||
+                name == "output_hc_fn.weight" ||
+                name == "output_hc_scale.weight") {
+                output_misc_size += size;
+                continue;
+            }
         }
         if (model.arch == LLM_ARCH_GEMMA4) {
             if (name == "per_layer_token_embd.weight" ||
@@ -4131,6 +4169,10 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             params.progress_callback, params.progress_callback_user_data
         )) {
             return -2;
+        }
+
+        if (model.arch == LLM_ARCH_DEEPSEEK4) {
+            throw std::runtime_error("DeepSeek V4 graph construction not implemented yet");
         }
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
@@ -7353,6 +7395,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_OLMO:
         case LLM_ARCH_ARCTIC:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GLM4:
         case LLM_ARCH_GRANITE:
