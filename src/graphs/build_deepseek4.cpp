@@ -265,12 +265,93 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         return layer_inp;
     };
 
+    auto build_compressed_prefix = [&](ggml_tensor * layer_inp, int il) {
+        const auto & layer = model.layers[il];
+        GGML_ASSERT(layer.hc_attn_fn != nullptr);
+        GGML_ASSERT(layer.hc_attn_scale != nullptr);
+        GGML_ASSERT(layer.hc_attn_base != nullptr);
+        GGML_ASSERT(layer.attn_norm != nullptr);
+        GGML_ASSERT(layer.attn_q_a_norm != nullptr);
+        GGML_ASSERT(layer.attn_kv_a_norm != nullptr);
+        GGML_ASSERT(layer.wq_a != nullptr);
+        GGML_ASSERT(layer.wq_b != nullptr);
+        GGML_ASSERT(layer.attn_kv != nullptr);
+        GGML_ASSERT(layer.attn_compressor_kv != nullptr);
+        GGML_ASSERT(layer.attn_compressor_gate != nullptr);
+        GGML_ASSERT(layer.attn_compressor_ape != nullptr);
+        GGML_ASSERT(layer.attn_compressor_norm != nullptr);
+
+        const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
+        GGML_ASSERT(compress_ratio == 4 || compress_ratio == 128);
+        const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
+
+        LLAMA_LOG_INFO("%s: DeepSeek4 compressed graph prefix: layer=%d ratio=%u n_embd=%" PRId64
+                " n_hc=%" PRId64 " n_tokens=%d\n",
+                __func__, il, compress_ratio, n_embd, n_hc, n_tokens);
+
+        llm_deepseek4_hc_mix mix = llm_build_deepseek4_hc_pre(ctx0, layer_inp,
+                layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base,
+                n_embd, n_hc, n_tokens, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
+
+        ggml_tensor * cur = mix.x;
+        cb(cur, "hc_attn_pre", il);
+        cb(mix.mixes, "hc_attn_pre_mixes", il);
+        cb(mix.pre, "hc_attn_pre_weights", il);
+        cb(mix.post, "hc_attn_pre_post_weights", il);
+        cb(mix.comb, "hc_attn_pre_comb", il);
+        dsv4_log_tensor_shape("hc_attn_pre", cur);
+        dsv4_log_tensor_shape("hc_attn_pre_mixes", mix.mixes);
+        dsv4_log_tensor_shape("hc_attn_pre_weights", mix.pre);
+        dsv4_log_tensor_shape("hc_attn_pre_post_weights", mix.post);
+        dsv4_log_tensor_shape("hc_attn_pre_comb", mix.comb);
+
+        cur = llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr, LLM_NORM_RMS, cb, il);
+        cb(cur, "attn_norm", il);
+        dsv4_log_tensor_shape("attn_norm", cur);
+
+        ggml_tensor * qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
+        cb(qr, "q_lora", il);
+        dsv4_log_tensor_shape("q_lora", qr);
+        qr = llm_build_norm(ctx0, qr, hparams, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, cb, il);
+        cb(qr, "q_lora_norm", il);
+        dsv4_log_tensor_shape("q_lora_norm", qr);
+
+        ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
+        q = ggml_reshape_3d(ctx0, q, n_embd_head_k, n_head, n_tokens);
+        q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+        cb(q, "Qnorm", il);
+        dsv4_log_tensor_shape("Qnorm", q);
+        q = llm_build_deepseek4_rope_tail(ctx0, q, inp_pos, nullptr, n_rot, rope_type,
+                rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
+        cb(q, "Qcur", il);
+        dsv4_log_tensor_shape("Qcur", q);
+
+        ggml_tensor * kv = ggml_mul_mat(ctx0, layer.attn_kv, cur);
+        kv = llm_build_norm(ctx0, kv, hparams, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, cb, il);
+        kv = ggml_reshape_3d(ctx0, kv, n_embd_head_k, 1, n_tokens);
+        cb(kv, "KVnorm", il);
+        dsv4_log_tensor_shape("KVnorm", kv);
+        kv = llm_build_deepseek4_rope_tail(ctx0, kv, inp_pos, nullptr, n_rot, rope_type,
+                rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, false);
+        cb(kv, "KVrope", il);
+        dsv4_log_tensor_shape("KVrope", kv);
+        kv = ggml_dsv4_fp8_kv_quantize(ctx0, kv, n_rot);
+        cb(kv, "KVcur", il);
+        dsv4_log_tensor_shape("KVcur", kv);
+
+        ggml_build_forward_expand(gf, q);
+        ggml_build_forward_expand(gf, kv);
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
         if (compress_ratio != 0) {
             LLAMA_LOG_INFO("%s: DeepSeek4 graph slice: reached compressed layer %d, ratio=%u\n",
                     __func__, il, compress_ratio);
-            throw std::runtime_error("DeepSeek V4 compressed layer graph segment not implemented yet");
+            build_compressed_prefix(inpL, il);
+            throw std::runtime_error("DeepSeek V4 compressed compressor graph segment not implemented yet");
         }
 
         inpL = build_local_layer(inpL, il);
