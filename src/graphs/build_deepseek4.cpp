@@ -100,6 +100,13 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     GGML_ASSERT(layer.attn_kv != nullptr);
     GGML_ASSERT(layer.attn_wo_a != nullptr);
     GGML_ASSERT(layer.attn_wo_b != nullptr);
+    GGML_ASSERT(layer.ffn_gate_inp != nullptr);
+    GGML_ASSERT(layer.ffn_up_exps != nullptr);
+    GGML_ASSERT(layer.ffn_gate_exps != nullptr);
+    GGML_ASSERT(layer.ffn_down_exps != nullptr);
+    GGML_ASSERT(layer.ffn_up_shexp != nullptr);
+    GGML_ASSERT(layer.ffn_gate_shexp != nullptr);
+    GGML_ASSERT(layer.ffn_down_shexp != nullptr);
 
     const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
     const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
@@ -214,9 +221,49 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     cb(cur, "ffn_norm", il);
     dsv4_log_tensor_shape("ffn_norm", cur);
 
+    ggml_tensor * selected = nullptr;
+    if ((uint32_t) il < hparams.n_hash_layers && !warmup) {
+        GGML_ASSERT(lctx.inp_tokens != nullptr);
+        GGML_ASSERT(layer.ffn_gate_tid2eid != nullptr);
+        selected = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, lctx.inp_tokens);
+        cb(selected, "ffn_moe_hash_topk", il);
+        dsv4_log_tensor_shape("ffn_moe_hash_topk", selected);
+    }
+
+    ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps,
+            layer.ffn_gate_exps,
+            layer.ffn_down_exps,
+            layer.ffn_exp_probs_b,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, hparams.expert_weights_norm,
+            true, hparams.expert_weights_scale,
+            (llm_expert_gating_func_type) hparams.expert_gating_func,
+            cb, il, gf, false, nullptr, nullptr, nullptr, nullptr, selected);
+    cb(moe_out, "ffn_moe_out", il);
+    dsv4_log_tensor_shape("ffn_moe_out", moe_out);
+
+    ggml_tensor * ffn_shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
+            layer.ffn_up_shexp,   nullptr, nullptr,
+            layer.ffn_gate_shexp, nullptr, nullptr,
+            layer.ffn_down_shexp, nullptr, nullptr,
+            nullptr,
+            LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+    cb(ffn_shexp, "ffn_shexp", il);
+    dsv4_log_tensor_shape("ffn_shexp", ffn_shexp);
+
+    cur = ggml_add(ctx0, moe_out, ffn_shexp);
+    cb(cur, "ffn_out", il);
+    dsv4_log_tensor_shape("ffn_out", cur);
+
+    inpL = llm_build_deepseek4_hc_expand(ctx0, cur, residual, mix.post, mix.comb);
+    cb(inpL, "hc_ffn_post", il);
+    dsv4_log_tensor_shape("hc_ffn_post", inpL);
+
     (void) n_lora_q;
 
-    throw std::runtime_error("DeepSeek V4 FFN/MoE graph segment not implemented yet");
+    throw std::runtime_error("DeepSeek V4 next layer graph segment not implemented yet");
 
     return gf;
 }

@@ -84,6 +84,7 @@ struct llm_build_context {
     const bool rope_cache;
     const bool k_cache_hadamard;
     const bool split_mode_graph_scheduling;
+    const bool warmup;
     const int  min_experts;
     const float thresh_experts;
 
@@ -399,7 +400,8 @@ struct llm_build_context {
 llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr);
+         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr,
+         ggml_tensor * selected_experts_in = nullptr);
 
     static ggml_tensor * llm_build_moe_ffn(ggml_context * ctx, llama_context & lctx,
          ggml_tensor * cur,
@@ -417,7 +419,8 @@ llm_expert_gating_func_type   gating_op,
 llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr) {
+         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr,
+         ggml_tensor * selected_experts_in = nullptr) {
         return llm_build_moe_ffn(ctx, lctx, cur,
                 gate_inp,   nullptr,
                 up_exps,    nullptr,
@@ -427,7 +430,7 @@ llm_expert_gating_func_type   gating_op,
                 n_expert, n_expert_used,
                 type_op, norm_w, scale_w, w_scale,
                 gating_op, cb, il, graph, add_input, up_gate_exps, up_gate_exps_b,
-                input_logits, down_exps_s);
+                input_logits, down_exps_s, selected_experts_in);
     }
 
     static ggml_tensor * llm_build_std_moe_ffn(ggml_context * ctx, llama_context & lctx,

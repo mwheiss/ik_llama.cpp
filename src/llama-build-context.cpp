@@ -79,6 +79,7 @@ llm_build_context::llm_build_context(
         rope_cache       (cparams.rope_cache),
         k_cache_hadamard (cparams.k_cache_hadamard),
         split_mode_graph_scheduling (cparams.split_mode_graph_scheduling),
+        warmup           (warmup),
         min_experts      (cparams.min_experts),
         thresh_experts   (cparams.thresh_experts),
         pooling_type     (cparams.pooling_type),
@@ -1030,7 +1031,8 @@ ggml_tensor * llm_build_context::llm_build_moe_ffn(
 llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input,
          ggml_tensor * up_gate_exps, ggml_tensor * up_gate_exps_b,
-         ggml_tensor * input_logits, ggml_tensor * down_exps_s) {
+         ggml_tensor * input_logits, ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in) {
 
     GGML_ASSERT(gate_inp || input_logits);
 
@@ -1060,6 +1062,10 @@ llm_expert_gating_func_type   gating_op,
             {
                 probs = ggml_sigmoid(ctx, logits); // [n_expert, n_tokens]
             } break;
+        case LLM_EXPERT_GATING_FUNC_SQRTSOFTPLUS:
+            {
+                probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits)); // [n_expert, n_tokens]
+            } break;
         case LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
             {
                 probs = logits; // [n_expert, n_tokens]
@@ -1084,16 +1090,19 @@ llm_expert_gating_func_type   gating_op,
     }
 
     // select experts
-    ggml_tensor * selected_experts;
-    if (lctx.cparams.grouped_expert_routing && lctx.model.arch == LLM_ARCH_BAILINGMOE2 && n_tokens > 0) {
+    ggml_tensor * selected_experts = selected_experts_in;
+    if (selected_experts != nullptr) {
+        cb(selected_experts, "ffn_moe_topk", il);
+    } else if (lctx.cparams.grouped_expert_routing && lctx.model.arch == LLM_ARCH_BAILINGMOE2 && n_tokens > 0) {
         auto& hparams = lctx.model.hparams;
         selected_experts = ggml_grouped_topk(ctx, selection_probs, hparams.n_expert_groups, hparams.n_group_used, 2, n_expert_used);
+        cb(selected_experts, "ffn_moe_topk", il);
     } else {
         //selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
         //        lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
         selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        cb(selected_experts, "ffn_moe_topk", il);
     }
-    cb(selected_experts, "ffn_moe_topk", il);
     ggml_tensor * weights = ggml_get_rows(ctx,
             ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
