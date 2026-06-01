@@ -67,8 +67,10 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
     ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
     ggml_tensor * inp_pos = build_inp_pos();
+    ggml_tensor * KQ_mask_swa = build_inp_KQ_mask_swa();
     cb(inpL, "inp_embd", -1);
     dsv4_log_tensor_shape("inp_embd", inpL);
+    dsv4_log_tensor_shape("KQ_mask_swa", KQ_mask_swa);
 
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
@@ -90,6 +92,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
     const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
     const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
+    const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
 
     LLAMA_LOG_INFO("%s: DeepSeek4 graph slice: layer=%d hc_pre n_embd=%" PRId64
             " n_hc=%" PRId64 " n_tokens=%d sinkhorn_iters=%u hc_eps=%.9g\n",
@@ -156,9 +159,17 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     dsv4_log_tensor_shape("kv_cache_v_layer0", kv_self.v_l[il]);
     llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, kv, n_tokens, kv_head, cb, il);
 
+    ggml_tensor * attn_out = llm_build_kv(ctx0, lctx, kv_self, gf,
+            nullptr, nullptr,
+            nullptr, nullptr,
+            q, KQ_mask_swa,
+            n_tokens, kv_head, n_kv, kq_scale, cb, il, layer.attn_sinks, hparams.n_swa);
+    cb(attn_out, "dsv4_local_attn_out", il);
+    dsv4_log_tensor_shape("dsv4_local_attn_out", attn_out);
+
     (void) n_lora_q;
 
-    throw std::runtime_error("DeepSeek V4 local attention graph segment not implemented yet");
+    throw std::runtime_error("DeepSeek V4 attention output projection graph segment not implemented yet");
 
     return gf;
 }
