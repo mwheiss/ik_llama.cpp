@@ -156,3 +156,78 @@ worst: ik=0.000224000061 cchuter=0.000223999989
 The model graph still uses normal `ggml_mul_mat` for quantized grouped output
 weights. The scalar-equivalent projection is currently only a validation path
 for F32 helper tests and parity probes.
+
+## DeepSeek4 KV cache type must stay F16 for now
+
+### Context
+
+DeepSeek V4 has more cache state than a standard dense attention model. The
+reference implementation maintains:
+
+- local/SWA K/V cache state,
+- compressed-attention K/V cache state,
+- indexer K cache state.
+
+The compressed-attention graph composes local and compressed K sources. In the
+reference path, those K views must agree in dtype because they are concatenated
+or otherwise fed through common attention composition primitives.
+
+The model also applies DSV4's own FP8 KV quantize/dequantize behavior before
+the ordinary user KV cache type would be applied:
+
+```c++
+kv = ggml_dsv4_fp8_kv_quantize(kv, n_rot)
+```
+
+So a user-requested `q8_0` KV cache is not simply "store the model's original K
+in q8_0"; it is a second, different quantization applied after the DSV4 FP8
+activation transform.
+
+### Current policy
+
+For DeepSeek4, force K and V cache types to F16 when the user requests an
+unsafe cache type such as:
+
+```text
+--cache-type-k q8_0 --cache-type-v q8_0
+```
+
+The warning is most visible in Q8 model smokes only because those smokes
+intentionally request `q8_0` KV. It is not inherently tied to Q8 model weights.
+A Q4 model run with `--cache-type-k q8_0 --cache-type-v q8_0` should trigger
+the same override. A default Q4 run usually does not warn because the default
+KV cache is already F16.
+
+### Why this is not treated as a harmless speed toggle
+
+Removing the F16 override can fail in two ways:
+
+1. The graph can become invalid if local, compressed, and indexer cache views
+   have incompatible dtypes at concat/attention-composition boundaries.
+2. Worse, the graph may run but silently corrupt decode because `q8_0`'s block
+   scale does not faithfully preserve the post-FP8-quantized K activation
+   distribution. The cchuter reference comments report repetitive/gibberish
+   decode symptoms from this class of issue.
+
+The second failure mode is especially dangerous for bring-up: it looks like a
+model-quality or sampling problem rather than a cache numerics bug.
+
+### Expected speed and accuracy tradeoff
+
+`q8_0` KV could reduce cache memory traffic and footprint for long-context
+decode, so it may eventually improve speed or allow larger contexts. It is not
+expected to improve accuracy. F16 is the higher-fidelity cache representation
+and is the current correctness baseline.
+
+Any future `q8_0` or other quantized DeepSeek4 KV cache support should be
+treated as a separate optimization project, not a loader convenience. It needs
+explicit gates against the cchuter F16 reference:
+
+1. cache write/read parity for local/SWA, compressed, and indexer caches,
+2. dtype compatibility checks for local+compressed K composition,
+3. first-token logits or top-k agreement where practical,
+4. decode stability on short prompts,
+5. sparse compressed-attention context coverage,
+6. Q4 and Q8 model-weight smokes with the same forced/unforced cache settings.
+
+Until those gates exist and pass, keep the forced F16 policy.
