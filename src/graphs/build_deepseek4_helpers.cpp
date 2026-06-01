@@ -1,5 +1,7 @@
 #include "build_deepseek4_helpers.h"
 
+#include <cmath>
+
 static struct ggml_tensor * llm_build_deepseek4_f32_project(
         struct ggml_context * ctx,
         struct ggml_tensor  * w,
@@ -27,6 +29,37 @@ static struct ggml_tensor * llm_build_deepseek4_f32_project(
     }
 
     return out;
+}
+
+static struct ggml_tensor * llm_build_deepseek4_softmax_pool_ratio(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv,
+        struct ggml_tensor  * score) {
+    score = ggml_soft_max(ctx, score);
+    struct ggml_tensor * pooled = ggml_mul(ctx, kv, score);
+    pooled = ggml_sum_rows(ctx, pooled);
+    return ggml_reshape_2d(ctx, pooled, kv->ne[1], kv->ne[2]);
+}
+
+static struct ggml_tensor * llm_build_deepseek4_shift_overlap_state(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        float                 pad_value) {
+    const int64_t n_embd = x->ne[0];
+    const int64_t ratio  = x->ne[1];
+    const int64_t n_comp = x->ne[2];
+
+    struct ggml_tensor * first = ggml_view_3d(ctx, x, n_embd, ratio, 1,
+            x->nb[1], x->nb[2], 0);
+    struct ggml_tensor * pad = ggml_fill(ctx, ggml_cont(ctx, first), pad_value);
+
+    if (n_comp == 1) {
+        return pad;
+    }
+
+    struct ggml_tensor * prev = ggml_view_3d(ctx, x, n_embd, ratio, n_comp - 1,
+            x->nb[1], x->nb[2], 0);
+    return ggml_concat(ctx, pad, prev, 2);
 }
 
 struct ggml_tensor * llm_build_deepseek4_rope_tail(
@@ -248,4 +281,89 @@ struct ggml_tensor * llm_build_deepseek4_grouped_out(
     return wo_b->type == GGML_TYPE_F32 && low->type == GGML_TYPE_F32
         ? llm_build_deepseek4_f32_project(ctx, wo_b, low)
         : ggml_mul_mat(ctx, wo_b, low);
+}
+
+struct ggml_tensor * llm_build_deepseek4_compressor_prefill(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * wkv,
+        struct ggml_tensor  * wgate,
+        struct ggml_tensor  * ape,
+        struct ggml_tensor  * norm,
+        struct ggml_tensor  * pos,
+        int64_t               n_embd_head,
+        int64_t               n_rot,
+        int64_t               compress_ratio,
+        int                   rope_type,
+        int32_t               n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 norm_eps) {
+    GGML_ASSERT(compress_ratio > 0);
+    const int64_t n_tokens = x->ne[1];
+    const int64_t n_comp = n_tokens / compress_ratio;
+    GGML_ASSERT(n_comp > 0);
+    GGML_ASSERT(n_comp * compress_ratio <= n_tokens);
+
+    const int64_t coff = compress_ratio == 4 ? 2 : 1;
+    const int64_t n_kv = coff * n_embd_head;
+
+    GGML_ASSERT(wkv->ne[0] == x->ne[0]);
+    GGML_ASSERT(wkv->ne[1] == n_kv);
+    GGML_ASSERT(wgate->ne[0] == x->ne[0]);
+    GGML_ASSERT(wgate->ne[1] == n_kv);
+    GGML_ASSERT(ape->ne[0] == n_kv);
+    GGML_ASSERT(ape->ne[1] == compress_ratio);
+    GGML_ASSERT(norm->ne[0] == n_embd_head);
+    GGML_ASSERT(pos->ne[0] == n_comp);
+
+    struct ggml_tensor * kv    = ggml_mul_mat(ctx, wkv,   x);
+    struct ggml_tensor * score = ggml_mul_mat(ctx, wgate, x);
+
+    kv = ggml_view_3d(ctx, kv, n_kv, compress_ratio, n_comp,
+            kv->nb[1], kv->nb[1]*compress_ratio, 0);
+    score = ggml_view_3d(ctx, score, n_kv, compress_ratio, n_comp,
+            score->nb[1], score->nb[1]*compress_ratio, 0);
+
+    struct ggml_tensor * ape_f = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
+    score = ggml_add(ctx, score, ggml_repeat(ctx, ape_f, score));
+
+    if (coff == 1) {
+        kv    = ggml_cont(ctx, ggml_permute(ctx, kv,    1, 0, 2, 3));
+        score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));
+        kv = llm_build_deepseek4_softmax_pool_ratio(ctx, kv, score);
+    } else {
+        struct ggml_tensor * kv_prev = ggml_view_3d(ctx, kv, n_embd_head, compress_ratio, n_comp,
+                kv->nb[1], kv->nb[2], 0);
+        struct ggml_tensor * kv_curr = ggml_view_3d(ctx, kv, n_embd_head, compress_ratio, n_comp,
+                kv->nb[1], kv->nb[2], n_embd_head*kv->nb[0]);
+        struct ggml_tensor * score_prev = ggml_view_3d(ctx, score, n_embd_head, compress_ratio, n_comp,
+                score->nb[1], score->nb[2], 0);
+        struct ggml_tensor * score_curr = ggml_view_3d(ctx, score, n_embd_head, compress_ratio, n_comp,
+                score->nb[1], score->nb[2], n_embd_head*score->nb[0]);
+
+        kv_prev    = llm_build_deepseek4_shift_overlap_state(ctx, kv_prev,    0.0f);
+        score_prev = llm_build_deepseek4_shift_overlap_state(ctx, score_prev, -INFINITY);
+
+        kv_prev    = ggml_cont(ctx, ggml_permute(ctx, kv_prev,    1, 0, 2, 3));
+        kv_curr    = ggml_cont(ctx, ggml_permute(ctx, kv_curr,    1, 0, 2, 3));
+        score_prev = ggml_cont(ctx, ggml_permute(ctx, score_prev, 1, 0, 2, 3));
+        score_curr = ggml_cont(ctx, ggml_permute(ctx, score_curr, 1, 0, 2, 3));
+
+        kv    = ggml_concat(ctx, kv_prev,    kv_curr,    0);
+        score = ggml_concat(ctx, score_prev, score_curr, 0);
+        kv = llm_build_deepseek4_softmax_pool_ratio(ctx, kv, score);
+    }
+
+    kv = ggml_rms_norm(ctx, kv, norm_eps);
+    kv = ggml_mul(ctx, kv, norm);
+    kv = ggml_reshape_3d(ctx, kv, n_embd_head, 1, n_comp);
+
+    return llm_build_deepseek4_rope_tail(ctx, kv, pos, nullptr, n_rot, rope_type,
+            n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow, false);
 }

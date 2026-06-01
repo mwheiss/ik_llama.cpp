@@ -61,3 +61,24 @@ struct ggml_tensor * llm_build_deepseek4_grouped_out(
         int64_t               n_groups,
         int64_t               o_lora_rank,
         int64_t               n_tokens);
+
+struct ggml_tensor * llm_build_deepseek4_compressor_prefill(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * wkv,
+        struct ggml_tensor  * wgate,
+        struct ggml_tensor  * ape,
+        struct ggml_tensor  * norm,
+        struct ggml_tensor  * pos,
+        int64_t               n_embd_head,
+        int64_t               n_rot,
+        int64_t               compress_ratio,
+        int                   rope_type,
+        int32_t               n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 norm_eps);

@@ -434,6 +434,95 @@ static void test_grouped_out_helper() {
     ggml_free(ctx);
 }
 
+static void test_compressor_prefill_ratio4_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 8 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 3;
+    constexpr int64_t n_embd_head = 2;
+    constexpr int64_t n_tokens = 4;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t coff = 2;
+    constexpr int64_t n_kv = coff * n_embd_head;
+    constexpr int64_t n_comp = 1;
+    constexpr int64_t n_rot = 2;
+    constexpr float norm_eps = 1.0e-6f;
+
+    ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * wkv   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_kv);
+    ggml_tensor * wgate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_kv);
+    ggml_tensor * ape   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, ratio);
+    ggml_tensor * norm  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd_head);
+    ggml_tensor * pos   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_comp);
+
+    ggml_set_i32_1d(pos, 0, 0);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t e = 0; e < n_embd; ++e) {
+            ggml_set_f32_nd(x, e, t, 0, 0, 0.10f * (float) (e + 1) - 0.03f * (float) t);
+        }
+    }
+    for (int64_t r = 0; r < n_kv; ++r) {
+        for (int64_t e = 0; e < n_embd; ++e) {
+            ggml_set_f32_nd(wkv, e, r, 0, 0, 0.04f * (float) (r + 1) - 0.02f * (float) e);
+            ggml_set_f32_nd(wgate, e, r, 0, 0, -0.03f * (float) (r + 1) + 0.015f * (float) e);
+        }
+        for (int64_t t = 0; t < ratio; ++t) {
+            ggml_set_f32_nd(ape, r, t, 0, 0, 0.01f * (float) r - 0.02f * (float) t);
+        }
+    }
+    ggml_set_f32_1d(norm, 0, 1.25f);
+    ggml_set_f32_1d(norm, 1, 0.75f);
+
+    ggml_tensor * out = llm_build_deepseek4_compressor_prefill(ctx,
+            x, wkv, wgate, ape, norm, pos,
+            n_embd_head, n_rot, ratio,
+            0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, norm_eps);
+    graph_compute(ctx, out);
+
+    float pooled[n_embd_head] = {};
+    for (int64_t h = 0; h < n_embd_head; ++h) {
+        float vals[ratio];
+        float scores[ratio];
+        float max_score = -INFINITY;
+        const int64_t row = n_embd_head + h;
+        for (int64_t t = 0; t < ratio; ++t) {
+            vals[t] = 0.0f;
+            scores[t] = ggml_get_f32_nd(ape, row, t, 0, 0);
+            for (int64_t e = 0; e < n_embd; ++e) {
+                const float xe = ggml_get_f32_nd(x, e, t, 0, 0);
+                vals[t] += xe * ggml_get_f32_nd(wkv, e, row, 0, 0);
+                scores[t] += xe * ggml_get_f32_nd(wgate, e, row, 0, 0);
+            }
+            max_score = std::max(max_score, scores[t]);
+        }
+
+        float denom = 0.0f;
+        for (float score : scores) {
+            denom += std::exp(score - max_score);
+        }
+        for (int64_t t = 0; t < ratio; ++t) {
+            pooled[h] += vals[t] * std::exp(scores[t] - max_score) / denom;
+        }
+    }
+
+    float rms = 0.0f;
+    for (float v : pooled) {
+        rms += v * v;
+    }
+    rms = std::sqrt(rms / (float) n_embd_head + norm_eps);
+
+    for (int64_t h = 0; h < n_embd_head; ++h) {
+        const float expected = pooled[h] / rms * ggml_get_f32_1d(norm, h);
+        assert_close(tensor_get_3d(out, h, 0, 0), expected, "compressor_prefill_ratio4", 2.0e-6f);
+    }
+
+    ggml_free(ctx);
+}
+
 static float ref_rope_standard(float x0, float x1, int32_t pos, int64_t pair, int64_t n_rot, bool second) {
     const float theta_scale = std::pow(10000.0f, -2.0f / (float) n_rot);
     const float theta = (float) pos * std::pow(theta_scale, (float) pair);
@@ -500,6 +589,7 @@ int main() {
     test_hc_weighted_sum_helper();
     test_hc_expand_helper();
     test_grouped_out_helper();
+    test_compressor_prefill_ratio4_helper();
     test_rope_tail_helper();
     return 0;
 }
