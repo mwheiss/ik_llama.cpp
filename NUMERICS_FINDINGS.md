@@ -132,3 +132,27 @@ Do not use the optimized F32 `ggml_mul_mat(hc_fn, flat)` path for HC-pre parity
 or scalar reference validation. It can produce errors far beyond expected
 rounding. Keep this special handling local to DSV4 HC-pre bring-up unless a
 general ik matmul bug is isolated and fixed.
+
+## Grouped output projection recurrence
+
+The same class of issue appeared when adding the DeepSeek4 grouped attention
+output helper. A direct F32 implementation using ordinary `ggml_mul_mat` in the
+grouped projection produced:
+
+```text
+grouped_out[0]: ik=0.00204199972 cchuter=0.000641999999
+```
+
+Again, this is much too large to be explained by normal float32 rounding.
+After routing the F32 grouped projection substeps through the same
+scalar-equivalent row decomposition used for HC-pre validation, the cchuter
+parity probe passed:
+
+```text
+grouped_out max_abs=7.2e-11, worst=5 ULP
+worst: ik=0.000224000061 cchuter=0.000223999989
+```
+
+The model graph still uses normal `ggml_mul_mat` for quantized grouped output
+weights. The scalar-equivalent projection is currently only a validation path
+for F32 helper tests and parity probes.

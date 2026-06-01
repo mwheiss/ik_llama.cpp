@@ -50,3 +50,14 @@ struct ggml_tensor * llm_build_deepseek4_hc_expand(
         struct ggml_tensor  * residual,
         struct ggml_tensor  * post,
         struct ggml_tensor  * comb);
+
+struct ggml_tensor * llm_build_deepseek4_grouped_out(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * o,
+        struct ggml_tensor  * wo_a,
+        struct ggml_tensor  * wo_b,
+        int64_t               n_embd_head,
+        int64_t               n_head,
+        int64_t               n_groups,
+        int64_t               o_lora_rank,
+        int64_t               n_tokens);

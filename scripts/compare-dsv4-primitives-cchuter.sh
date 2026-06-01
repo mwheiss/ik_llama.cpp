@@ -309,12 +309,67 @@ static void run_rope_tail() {
     ggml_free(ctx);
 }
 
+static void run_grouped_out() {
+    ggml_init_params params = { 8 * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd_head = 3;
+    constexpr int64_t n_head = 4;
+    constexpr int64_t n_groups = 2;
+    constexpr int64_t group_heads = n_head / n_groups;
+    constexpr int64_t group_dim = n_embd_head * group_heads;
+    constexpr int64_t o_lora_rank = 2;
+    constexpr int64_t n_tokens = 2;
+    constexpr int64_t n_out = 5;
+
+    ggml_tensor * o    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_head, n_head, n_tokens);
+    ggml_tensor * wo_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, group_dim, o_lora_rank * n_groups);
+    ggml_tensor * wo_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, o_lora_rank * n_groups, n_out);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t h = 0; h < n_head; ++h) {
+            for (int64_t e = 0; e < n_embd_head; ++e) {
+                ggml_set_f32_nd(o, e, h, t, 0, 0.03f * (float) e - 0.04f * (float) h + 0.02f * (float) t);
+            }
+        }
+    }
+    for (int64_t col = 0; col < o_lora_rank * n_groups; ++col) {
+        for (int64_t row = 0; row < group_dim; ++row) {
+            ggml_set_f32_nd(wo_a, row, col, 0, 0, 0.01f * (float) ((7*row + 3*col) % 11 - 5));
+        }
+    }
+    for (int64_t col = 0; col < n_out; ++col) {
+        for (int64_t row = 0; row < o_lora_rank * n_groups; ++row) {
+            ggml_set_f32_nd(wo_b, row, col, 0, 0, 0.02f * (float) ((5*row - 2*col) % 13 - 6));
+        }
+    }
+
+#if defined(CCHUTER_ENGINE)
+    ggml_tensor * x = ggml_cont(ctx, o);
+    x = ggml_reshape_3d(ctx, x, group_dim, n_groups, n_tokens);
+    ggml_tensor * wo_a_g = ggml_reshape_3d(ctx, wo_a, group_dim, o_lora_rank, n_groups);
+    ggml_tensor * ids = ggml_arange(ctx, 0.0f, (float) n_groups, 1.0f);
+    ids = ggml_cast(ctx, ids, GGML_TYPE_I32);
+    ids = ggml_repeat_4d(ctx, ids, n_groups, n_tokens, 1, 1);
+    ggml_tensor * low = ggml_mul_mat_id(ctx, wo_a_g, x, ids);
+    low = ggml_reshape_2d(ctx, low, o_lora_rank * n_groups, n_tokens);
+    ggml_tensor * out = ggml_mul_mat(ctx, wo_b, low);
+#else
+    ggml_tensor * out = llm_build_deepseek4_grouped_out(ctx, o, wo_a, wo_b,
+            n_embd_head, n_head, n_groups, o_lora_rank, n_tokens);
+#endif
+    compute(ctx, out);
+    emit("grouped_out", out);
+    ggml_free(ctx);
+}
+
 int main() {
     run_hc_split_sinkhorn();
     run_fp8_kv_quantize();
     run_hc_weighted_sum();
     run_hc_expand();
     run_hc_pre();
+    run_grouped_out();
     run_rope_tail();
     return 0;
 }
@@ -418,6 +473,7 @@ expected = [
     "hc_pre_post",
     "hc_pre_comb",
     "hc_pre_y",
+    "grouped_out",
     "rope_tail",
 ]
 
@@ -432,6 +488,7 @@ tolerances = {
     "hc_pre_pre": 2.0e-6,
     "hc_pre_post": 2.0e-6,
     "hc_pre_comb": 2.0e-6,
+    "grouped_out": 2.0e-6,
     "rope_tail": 2.0e-6,
 }
 

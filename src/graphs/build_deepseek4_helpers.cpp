@@ -1,28 +1,28 @@
 #include "build_deepseek4_helpers.h"
 
-static struct ggml_tensor * llm_build_deepseek4_hc_mix_project(
+static struct ggml_tensor * llm_build_deepseek4_f32_project(
         struct ggml_context * ctx,
-        struct ggml_tensor  * hc_fn,
+        struct ggml_tensor  * w,
         struct ggml_tensor  * flat) {
-    GGML_ASSERT(hc_fn->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
     GGML_ASSERT(flat->type  == GGML_TYPE_F32);
-    GGML_ASSERT(hc_fn->ne[0] == flat->ne[0]);
-    GGML_ASSERT(hc_fn->ne[2] == 1);
-    GGML_ASSERT(hc_fn->ne[3] == 1);
+    GGML_ASSERT(w->ne[0] == flat->ne[0]);
+    GGML_ASSERT(w->ne[2] == 1);
+    GGML_ASSERT(w->ne[3] == 1);
     GGML_ASSERT(flat->ne[2] == 1);
     GGML_ASSERT(flat->ne[3] == 1);
 
     const int64_t hc_dim   = flat->ne[0];
-    const int64_t hc_mix   = hc_fn->ne[1];
+    const int64_t hc_mix   = w->ne[1];
 
     struct ggml_tensor * out = nullptr;
     for (int64_t im = 0; im < hc_mix; ++im) {
-        struct ggml_tensor * w = ggml_view_2d(ctx, hc_fn,
+        struct ggml_tensor * wi = ggml_view_2d(ctx, w,
                 hc_dim, 1,
-                hc_fn->nb[1], im*hc_fn->nb[1]);
-        w = ggml_repeat(ctx, w, flat);
+                w->nb[1], im*w->nb[1]);
+        wi = ggml_repeat(ctx, wi, flat);
 
-        struct ggml_tensor * row = ggml_sum_rows(ctx, ggml_mul(ctx, flat, w));
+        struct ggml_tensor * row = ggml_sum_rows(ctx, ggml_mul(ctx, flat, wi));
         out = out ? ggml_concat(ctx, out, row, 0) : row;
     }
 
@@ -138,7 +138,7 @@ struct llm_deepseek4_hc_mix llm_build_deepseek4_hc_pre(
     // Keep the F32 staged reference path independent of backend GEMM fast
     // paths. Quantized model tensors still use GGML's normal mul_mat path.
     struct ggml_tensor * mixes = hc_fn->type == GGML_TYPE_F32
-        ? llm_build_deepseek4_hc_mix_project(ctx, hc_fn, flat)
+        ? llm_build_deepseek4_f32_project(ctx, hc_fn, flat)
         : ggml_mul_mat(ctx, hc_fn, flat);
     struct ggml_tensor * split = ggml_dsv4_hc_split_sinkhorn(ctx, mixes, hc_scale, hc_base, n_hc, sinkhorn_iters, hc_eps);
 
@@ -203,4 +203,49 @@ struct ggml_tensor * llm_build_deepseek4_hc_expand(
     }
 
     return out;
+}
+
+struct ggml_tensor * llm_build_deepseek4_grouped_out(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * o,
+        struct ggml_tensor  * wo_a,
+        struct ggml_tensor  * wo_b,
+        int64_t               n_embd_head,
+        int64_t               n_head,
+        int64_t               n_groups,
+        int64_t               o_lora_rank,
+        int64_t               n_tokens) {
+    GGML_ASSERT(o->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_head % n_groups == 0);
+    GGML_ASSERT(o->ne[0] == n_embd_head);
+    GGML_ASSERT(o->ne[1] == n_head);
+    GGML_ASSERT(o->ne[2] == n_tokens);
+
+    const int64_t group_heads = n_head / n_groups;
+    const int64_t group_dim   = n_embd_head * group_heads;
+
+    o = ggml_cont(ctx, o);
+    o = ggml_reshape_3d(ctx, o, group_dim, n_groups, n_tokens);
+
+    GGML_ASSERT(wo_a->ne[0] == group_dim);
+    GGML_ASSERT(wo_a->ne[1] == o_lora_rank * n_groups);
+    GGML_ASSERT(wo_b->ne[0] == o_lora_rank * n_groups);
+
+    struct ggml_tensor * low = nullptr;
+    for (int64_t ig = 0; ig < n_groups; ++ig) {
+        struct ggml_tensor * o_g = ggml_view_2d(ctx, o,
+                group_dim, n_tokens,
+                o->nb[2], ig*o->nb[1]);
+        struct ggml_tensor * wo_a_g = ggml_view_2d(ctx, wo_a,
+                group_dim, o_lora_rank,
+                wo_a->nb[1], ig*o_lora_rank*wo_a->nb[1]);
+        struct ggml_tensor * low_g = wo_a_g->type == GGML_TYPE_F32 && o_g->type == GGML_TYPE_F32
+            ? llm_build_deepseek4_f32_project(ctx, wo_a_g, o_g)
+            : ggml_mul_mat(ctx, wo_a_g, o_g);
+        low = low ? ggml_concat(ctx, low, low_g, 0) : low_g;
+    }
+
+    return wo_b->type == GGML_TYPE_F32 && low->type == GGML_TYPE_F32
+        ? llm_build_deepseek4_f32_project(ctx, wo_b, low)
+        : ggml_mul_mat(ctx, wo_b, low);
 }

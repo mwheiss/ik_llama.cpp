@@ -364,6 +364,76 @@ static void test_hc_expand_helper() {
     ggml_free(ctx);
 }
 
+static void test_grouped_out_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 4 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd_head = 3;
+    constexpr int64_t n_head = 4;
+    constexpr int64_t n_groups = 2;
+    constexpr int64_t group_heads = n_head / n_groups;
+    constexpr int64_t group_dim = n_embd_head * group_heads;
+    constexpr int64_t o_lora_rank = 2;
+    constexpr int64_t n_tokens = 2;
+    constexpr int64_t n_out = 5;
+
+    ggml_tensor * o    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_head, n_head, n_tokens);
+    ggml_tensor * wo_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, group_dim, o_lora_rank * n_groups);
+    ggml_tensor * wo_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, o_lora_rank * n_groups, n_out);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t h = 0; h < n_head; ++h) {
+            for (int64_t e = 0; e < n_embd_head; ++e) {
+                ggml_set_f32_nd(o, e, h, t, 0, 0.03f * (float) e - 0.04f * (float) h + 0.02f * (float) t);
+            }
+        }
+    }
+    for (int64_t col = 0; col < o_lora_rank * n_groups; ++col) {
+        for (int64_t row = 0; row < group_dim; ++row) {
+            ggml_set_f32_nd(wo_a, row, col, 0, 0, 0.01f * (float) ((7*row + 3*col) % 11 - 5));
+        }
+    }
+    for (int64_t col = 0; col < n_out; ++col) {
+        for (int64_t row = 0; row < o_lora_rank * n_groups; ++row) {
+            ggml_set_f32_nd(wo_b, row, col, 0, 0, 0.02f * (float) ((5*row - 2*col) % 13 - 6));
+        }
+    }
+
+    ggml_tensor * out = llm_build_deepseek4_grouped_out(ctx, o, wo_a, wo_b,
+            n_embd_head, n_head, n_groups, o_lora_rank, n_tokens);
+    graph_compute(ctx, out);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        std::vector<float> low(o_lora_rank * n_groups, 0.0f);
+        for (int64_t g = 0; g < n_groups; ++g) {
+            for (int64_t r = 0; r < o_lora_rank; ++r) {
+                float acc = 0.0f;
+                for (int64_t gh = 0; gh < group_heads; ++gh) {
+                    const int64_t h = g * group_heads + gh;
+                    for (int64_t e = 0; e < n_embd_head; ++e) {
+                        const int64_t d = e + n_embd_head * gh;
+                        acc += tensor_get_3d(o, e, h, t) * ggml_get_f32_nd(wo_a, d, r + o_lora_rank * g, 0, 0);
+                    }
+                }
+                low[r + o_lora_rank * g] = acc;
+            }
+        }
+        for (int64_t col = 0; col < n_out; ++col) {
+            float ref = 0.0f;
+            for (int64_t i = 0; i < o_lora_rank * n_groups; ++i) {
+                ref += low[i] * ggml_get_f32_nd(wo_b, i, col, 0, 0);
+            }
+            assert_close(ggml_get_f32_nd(out, col, t, 0, 0), ref, "grouped_out_helper", 1.0e-6f);
+        }
+    }
+
+    ggml_free(ctx);
+}
+
 static float ref_rope_standard(float x0, float x1, int32_t pos, int64_t pair, int64_t n_rot, bool second) {
     const float theta_scale = std::pow(10000.0f, -2.0f / (float) n_rot);
     const float theta = (float) pos * std::pow(theta_scale, (float) pair);
@@ -429,6 +499,7 @@ int main() {
     test_fp8_kv_quantize();
     test_hc_weighted_sum_helper();
     test_hc_expand_helper();
+    test_grouped_out_helper();
     test_rope_tail_helper();
     return 0;
 }
