@@ -203,6 +203,78 @@ static void run_hc_expand() {
     ggml_free(ctx);
 }
 
+static void run_hc_pre() {
+    ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 4;
+    constexpr int64_t n_hc = 3;
+    constexpr int64_t n_tokens = 2;
+    constexpr int64_t hc_dim = n_embd * n_hc;
+    constexpr int64_t hc_mix = (2 + n_hc) * n_hc;
+
+    ggml_tensor * x        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+    ggml_tensor * hc_fn    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, hc_mix);
+    ggml_tensor * hc_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+    ggml_tensor * hc_base  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_mix);
+
+    ggml_set_f32_1d(hc_scale, 0,  0.40f);
+    ggml_set_f32_1d(hc_scale, 1, -0.15f);
+    ggml_set_f32_1d(hc_scale, 2,  0.65f);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t h = 0; h < n_hc; ++h) {
+            for (int64_t e = 0; e < n_embd; ++e) {
+                ggml_set_f32_nd(x, e, h, t, 0, 0.03f * (float) e - 0.07f * (float) h + 0.02f * (float) t);
+            }
+        }
+    }
+    for (int64_t i = 0; i < hc_mix; ++i) {
+        ggml_set_f32_1d(hc_base, i, 0.005f * (float) ((i % 7) - 3));
+        for (int64_t d = 0; d < hc_dim; ++d) {
+            ggml_set_f32_nd(hc_fn, d, i, 0, 0, 0.001f * (float) ((13*d + 5*i) % 17 - 8));
+        }
+    }
+
+    ggml_tensor * flat = ggml_cont(ctx, ggml_reshape_2d(ctx, x, hc_dim, n_tokens));
+    flat = ggml_rms_norm(ctx, flat, 1.0e-6f);
+#if defined(CCHUTER_ENGINE)
+    ggml_tensor * mixes = ggml_mul_mat(ctx, hc_fn, flat);
+    ggml_tensor * split = ggml_dsv4_hc_split_sinkhorn(ctx, mixes, hc_scale, hc_base, n_hc, 5, 1.0e-6f);
+    ggml_tensor * pre  = ggml_view_2d(ctx, split, n_hc, n_tokens, split->nb[1], 0);
+    ggml_tensor * post = ggml_view_2d(ctx, split, n_hc, n_tokens, split->nb[1], n_hc * split->nb[0]);
+    ggml_tensor * comb = ggml_view_2d(ctx, split, n_hc * n_hc, n_tokens, split->nb[1], 2 * n_hc * split->nb[0]);
+    pre  = ggml_cont(ctx, pre);
+    post = ggml_cont(ctx, post);
+    comb = ggml_cont(ctx, comb);
+    comb = ggml_reshape_3d(ctx, comb, n_hc, n_hc, n_tokens);
+    ggml_tensor * y = ggml_dsv4_hc_weighted_sum(ctx, x, pre);
+#else
+    llm_deepseek4_hc_mix mix = llm_build_deepseek4_hc_pre(ctx,
+            x, hc_fn, hc_scale, hc_base, n_embd, n_hc, n_tokens, 1.0e-6f, 5, 1.0e-6f);
+    ggml_tensor * y      = mix.x;
+    ggml_tensor * mixes  = mix.mixes;
+    ggml_tensor * pre    = mix.pre;
+    ggml_tensor * post   = mix.post;
+    ggml_tensor * comb   = mix.comb;
+#endif
+
+    compute(ctx, flat);
+    emit("hc_pre_flat", flat);
+    compute(ctx, y);
+    emit("hc_pre_y", y);
+    compute(ctx, mixes);
+    emit("hc_pre_mixes", mixes);
+    compute(ctx, pre);
+    emit("hc_pre_pre", pre);
+    compute(ctx, post);
+    emit("hc_pre_post", post);
+    compute(ctx, comb);
+    emit("hc_pre_comb", comb);
+
+    ggml_free(ctx);
+}
+
 static void run_rope_tail() {
     ggml_init_params params = { 8 * 1024 * 1024, nullptr, false };
     ggml_context * ctx = ggml_init(params);
@@ -242,6 +314,7 @@ int main() {
     run_fp8_kv_quantize();
     run_hc_weighted_sum();
     run_hc_expand();
+    run_hc_pre();
     run_rope_tail();
     return 0;
 }
@@ -339,6 +412,12 @@ expected = [
     "fp8_kv_quantize",
     "hc_weighted_sum",
     "hc_expand",
+    "hc_pre_flat",
+    "hc_pre_mixes",
+    "hc_pre_pre",
+    "hc_pre_post",
+    "hc_pre_comb",
+    "hc_pre_y",
     "rope_tail",
 ]
 
@@ -347,6 +426,12 @@ tolerances = {
     "fp8_kv_quantize": 1.0e-6,
     "hc_weighted_sum": 2.0e-6,
     "hc_expand": 2.0e-6,
+    "hc_pre_flat": 2.0e-6,
+    "hc_pre_y": 2.0e-6,
+    "hc_pre_mixes": 2.0e-6,
+    "hc_pre_pre": 2.0e-6,
+    "hc_pre_post": 2.0e-6,
+    "hc_pre_comb": 2.0e-6,
     "rope_tail": 2.0e-6,
 }
 

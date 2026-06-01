@@ -2,6 +2,14 @@
 
 #include "ggml.h"
 
+struct llm_deepseek4_hc_mix {
+    struct ggml_tensor * x;
+    struct ggml_tensor * mixes;
+    struct ggml_tensor * pre;
+    struct ggml_tensor * post;
+    struct ggml_tensor * comb;
+};
+
 struct ggml_tensor * llm_build_deepseek4_rope_tail(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -22,6 +30,19 @@ struct ggml_tensor * llm_build_deepseek4_hc_weighted_sum(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
         struct ggml_tensor  * weights);
+
+struct llm_deepseek4_hc_mix llm_build_deepseek4_hc_pre(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * hc_fn,
+        struct ggml_tensor  * hc_scale,
+        struct ggml_tensor  * hc_base,
+        int64_t               n_embd,
+        int64_t               n_hc,
+        int64_t               n_tokens,
+        float                 norm_eps,
+        int                   sinkhorn_iters,
+        float                 hc_eps);
 
 struct ggml_tensor * llm_build_deepseek4_hc_expand(
         struct ggml_context * ctx,
