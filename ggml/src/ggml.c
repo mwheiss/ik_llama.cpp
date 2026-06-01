@@ -4320,9 +4320,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FAKE_CPY",
     "FUSED_NORM",
     "FUSED_RMS_RMS_ADD",
+
+    "DSV4_HC_SPLIT_SINKHORN",
+    "DSV4_FP8_KV_QUANTIZE",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4441,9 +4444,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "norm(x,y)",
     "rms(x1)+rms(x2)",
 
+    "dsv4_hc_split_sinkhorn(x)",
+    "dsv4_fp8_kv_quantize(x)",
+
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -10084,6 +10090,70 @@ struct ggml_tensor * ggml_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
     result->src[6] = saved_steps;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        int                   n_hc,
+        int                   sinkhorn_iters,
+        float                 eps) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(mixes));
+    GGML_ASSERT(ggml_is_contiguous(scale));
+    GGML_ASSERT(ggml_is_contiguous(base));
+    GGML_ASSERT(n_hc > 0);
+    GGML_ASSERT(n_hc <= 16);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(mixes->ne[0] == (2 + n_hc) * n_hc);
+    GGML_ASSERT(mixes->ne[2] == 1);
+    GGML_ASSERT(mixes->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(scale) >= 3);
+    GGML_ASSERT(ggml_nelements(base)  >= mixes->ne[0]);
+
+    // The Sinkhorn loop is value-dependent and iterative. Expressing it as
+    // graph primitives would create many tiny row/column reductions per token
+    // and per iteration, so keep it as a scalar reference op until a real
+    // optimized kernel is justified.
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, mixes);
+
+    ggml_set_op_params_i32(result, 0, n_hc);
+    ggml_set_op_params_i32(result, 1, sinkhorn_iters);
+    ggml_set_op_params_f32(result, 2, eps);
+
+    result->op     = GGML_OP_DSV4_HC_SPLIT_SINKHORN;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_fp8_kv_quantize(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_rot) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_rot >= 0);
+    GGML_ASSERT(a->ne[0] > n_rot);
+    GGML_ASSERT((a->ne[0] - n_rot) % 64 == 0);
+
+    // This simulates E4M3FN quantize-dequantize with a dynamic scale per
+    // 64-value non-RoPE block. Existing primitives do not expose quantized
+    // rounding/saturation as graph operations, so a custom scalar reference op
+    // keeps the graph contract explicit without touching quant kernels.
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_i32(result, 0, n_rot);
+
+    result->op     = GGML_OP_DSV4_FP8_KV_QUANTIZE;
+    result->src[0] = a;
 
     return result;
 }
@@ -23860,6 +23930,216 @@ static void ggml_compute_forward_add_rel_pos(
     }
 }
 
+// ggml_compute_forward_dsv4_hc_split_sinkhorn
+
+static void ggml_compute_forward_dsv4_hc_split_sinkhorn(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * mixes = dst->src[0];
+    const struct ggml_tensor * scale = dst->src[1];
+    const struct ggml_tensor * base  = dst->src[2];
+
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
+    GGML_ASSERT(mixes->nb[0] == sizeof(float));
+    GGML_ASSERT(scale->nb[0] == sizeof(float));
+    GGML_ASSERT(base->nb[0]  == sizeof(float));
+    GGML_ASSERT(dst->nb[0]   == sizeof(float));
+
+    const int n_hc           = ggml_get_op_params_i32(dst, 0);
+    const int sinkhorn_iters = ggml_get_op_params_i32(dst, 1);
+    const float eps          = ggml_get_op_params_f32(dst, 2);
+    const int64_t mix_hc     = mixes->ne[0];
+    const int64_t n_rows     = ggml_nrows(mixes);
+
+    GGML_ASSERT(n_hc > 0 && n_hc <= 16);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(mix_hc == (2 + n_hc) * n_hc);
+    GGML_ASSERT(ggml_nrows(dst) == n_rows);
+
+    const float * scale_data = (const float *) scale->data;
+    const float * base_data  = (const float *) base->data;
+
+    const float pre_scale  = scale_data[0];
+    const float post_scale = scale_data[1];
+    const float comb_scale = scale_data[2];
+
+    const int64_t dr = (n_rows + params->nth - 1) / params->nth;
+    const int64_t r0 = dr * params->ith;
+    const int64_t r1 = MIN(r0 + dr, n_rows);
+
+    for (int64_t r = r0; r < r1; ++r) {
+        const float * mix = (const float *) ((const char *) mixes->data + r*mixes->nb[1]);
+        float * out = (float *) ((char *) dst->data + r*dst->nb[1]);
+
+        for (int i = 0; i < n_hc; ++i) {
+            const float z = mix[i] * pre_scale + base_data[i];
+            out[i] = 1.0f / (1.0f + expf(-z)) + eps;
+        }
+
+        for (int i = 0; i < n_hc; ++i) {
+            const int off = n_hc + i;
+            const float z = mix[off] * post_scale + base_data[off];
+            out[off] = 2.0f / (1.0f + expf(-z));
+        }
+
+        float c[16*16];
+
+        for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+            float row_max = -INFINITY;
+            for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                const int idx = src_hc + dst_hc*n_hc;
+                const int off = 2*n_hc + idx;
+                const float v = mix[off] * comb_scale + base_data[off];
+                c[idx] = v;
+                row_max = MAX(row_max, v);
+            }
+
+            float row_sum = 0.0f;
+            for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                const int idx = src_hc + dst_hc*n_hc;
+                const float v = expf(c[idx] - row_max);
+                c[idx] = v;
+                row_sum += v;
+            }
+
+            const float inv_sum = 1.0f / row_sum;
+            for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                const int idx = src_hc + dst_hc*n_hc;
+                c[idx] = c[idx] * inv_sum + eps;
+            }
+        }
+
+        for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+            float sum = 0.0f;
+            for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+                sum += c[src_hc + dst_hc*n_hc];
+            }
+
+            const float inv_denom = 1.0f / (sum + eps);
+            for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+                c[src_hc + dst_hc*n_hc] *= inv_denom;
+            }
+        }
+
+        for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+            for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+                float sum = 0.0f;
+                for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                    sum += c[src_hc + dst_hc*n_hc];
+                }
+
+                const float inv_denom = 1.0f / (sum + eps);
+                for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                    c[src_hc + dst_hc*n_hc] *= inv_denom;
+                }
+            }
+
+            for (int src_hc = 0; src_hc < n_hc; ++src_hc) {
+                float sum = 0.0f;
+                for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+                    sum += c[src_hc + dst_hc*n_hc];
+                }
+
+                const float inv_denom = 1.0f / (sum + eps);
+                for (int dst_hc = 0; dst_hc < n_hc; ++dst_hc) {
+                    c[src_hc + dst_hc*n_hc] *= inv_denom;
+                }
+            }
+        }
+
+        for (int i = 0; i < n_hc*n_hc; ++i) {
+            out[2*n_hc + i] = c[i];
+        }
+    }
+}
+
+static float ggml_dsv4_e4m3fn_dequant(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = MIN(fabsf(x), 448.0f);
+
+    int best = 0;
+    float best_diff = ax;
+
+    for (int i = 1; i < 127; ++i) {
+        const int exp  = (i >> 3) & 0x0f;
+        const int mant = i & 0x07;
+        const float val = exp == 0
+            ? ldexpf((float) mant, -9)
+            : ldexpf(1.0f + (float) mant / 8.0f, exp - 7);
+        const float diff = fabsf(ax - val);
+        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+
+    const int exp  = (best >> 3) & 0x0f;
+    const int mant = best & 0x07;
+    const float val = exp == 0
+        ? ldexpf((float) mant, -9)
+        : ldexpf(1.0f + (float) mant / 8.0f, exp - 7);
+
+    return sign * val;
+}
+
+// ggml_compute_forward_dsv4_fp8_kv_quantize
+
+static void ggml_compute_forward_dsv4_fp8_kv_quantize(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0]  == sizeof(float));
+
+    const int64_t n_rot = ggml_get_op_params_i32(dst, 0);
+    const int64_t head_dim = src0->ne[0];
+    const int64_t n_nope = head_dim - n_rot;
+
+    GGML_ASSERT(n_rot >= 0);
+    GGML_ASSERT(n_nope > 0);
+    GGML_ASSERT(n_nope % 64 == 0);
+
+    const int64_t n_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const int64_t row_start = (n_rows * params->ith) / params->nth;
+    const int64_t row_end   = (n_rows * (params->ith + 1)) / params->nth;
+
+    for (int64_t row = row_start; row < row_end; ++row) {
+        const int64_t i1 = row % src0->ne[1];
+        const int64_t i2 = (row / src0->ne[1]) % src0->ne[2];
+        const int64_t i3 = row / (src0->ne[1] * src0->ne[2]);
+
+        const char * src_base = (const char *) src0->data + i1*src0->nb[1] + i2*src0->nb[2] + i3*src0->nb[3];
+        char       * dst_base = (      char *) dst->data  + i1*dst->nb[1]  + i2*dst->nb[2]  + i3*dst->nb[3];
+
+        for (int64_t off = 0; off < n_nope; off += 64) {
+            float amax = 0.0f;
+            for (int64_t i = 0; i < 64; ++i) {
+                const float v = *(const float *) (src_base + (off + i)*src0->nb[0]);
+                amax = MAX(amax, fabsf(v));
+            }
+
+            amax = MAX(amax, 1.0e-4f);
+            const float scale = ldexpf(1.0f, (int) ceilf(log2f(amax / 448.0f)));
+            for (int64_t i = 0; i < 64; ++i) {
+                const float v = *(const float *) (src_base + (off + i)*src0->nb[0]);
+                const float q = MAX(-448.0f, MIN(448.0f, v / scale));
+                *(float *) (dst_base + (off + i)*dst->nb[0]) = ggml_dsv4_e4m3fn_dequant(q) * scale;
+            }
+        }
+
+        for (int64_t i = n_nope; i < head_dim; ++i) {
+            *(float *) (dst_base + i*dst->nb[0]) = *(const float *) (src_base + i*src0->nb[0]);
+        }
+    }
+}
+
 // ggml_compute_forward_map_unary
 
 static void ggml_compute_forward_map_unary_f32(
@@ -24686,6 +24966,14 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
         case GGML_OP_ADD_REL_POS:
             {
                 ggml_compute_forward_add_rel_pos(params, tensor);
+            } break;
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+            {
+                ggml_compute_forward_dsv4_hc_split_sinkhorn(params, tensor);
+            } break;
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+            {
+                ggml_compute_forward_dsv4_fp8_kv_quantize(params, tensor);
             } break;
         case GGML_OP_MAP_UNARY:
             {
@@ -25873,6 +26161,8 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
             } break;
         case GGML_OP_GET_REL_POS:
         case GGML_OP_ADD_REL_POS:
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
         case GGML_OP_MAP_UNARY:
         case GGML_OP_MAP_BINARY:
         case GGML_OP_MAP_CUSTOM1_F32:
@@ -26467,6 +26757,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ROPE_CACHE:
         case GGML_OP_ROPE_FAST:
         case GGML_OP_ADD_REL_POS:
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
             {
                 n_tasks = n_threads;
             } break;

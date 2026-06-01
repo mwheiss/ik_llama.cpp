@@ -206,11 +206,11 @@ llama_build_and_test(test-regex-partial.cpp)
 
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
+llama_target_and_test(test-dsv4-primitives.cpp    LABEL "dsv4")
 
 
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
-
 

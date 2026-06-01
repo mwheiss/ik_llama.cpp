@@ -701,6 +701,9 @@ extern "C" {
         GGML_OP_FUSED_NORM,
         GGML_OP_FUSED_RMS_RMS_ADD,
 
+        GGML_OP_DSV4_HC_SPLIT_SINKHORN,
+        GGML_OP_DSV4_FP8_KV_QUANTIZE,
+
         GGML_OP_COUNT,
     };
 
@@ -2552,6 +2555,27 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             struct ggml_tensor  * saved_steps);
+
+    // DeepSeek V4 hyperconnection split/Sinkhorn. This remains a custom op
+    // because the per-row softmax plus alternating row/column normalizations
+    // are a small value-dependent iterative matrix normalization loop.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            int                   n_hc,
+            int                   sinkhorn_iters,
+            float                 eps);
+
+    // DeepSeek V4 compressed KV scalar FP8 simulation. This quantizes and
+    // immediately dequantizes 64-value non-RoPE blocks with dynamic E4M3FN
+    // scaling; that blockwise quant/dequant contract is not a normal quant
+    // kernel and is not cleanly expressible as existing scalar primitives.
+    GGML_API struct ggml_tensor * ggml_dsv4_fp8_kv_quantize(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_rot);
 
     // custom operators
 
