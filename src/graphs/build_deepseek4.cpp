@@ -147,9 +147,18 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     cb(kv, "KVcur", il);
     dsv4_log_tensor_shape("KVcur", kv);
 
+    ggml_build_forward_expand(gf, q);
+    ggml_build_forward_expand(gf, kv);
+
+    // Layer 0 is an uncompressed/local attention layer. DeepSeek4 uses the
+    // FP8-simulated KV tensor as both the local K and V source before attention.
+    dsv4_log_tensor_shape("kv_cache_k_layer0", kv_self.k_l[il]);
+    dsv4_log_tensor_shape("kv_cache_v_layer0", kv_self.v_l[il]);
+    llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, kv, n_tokens, kv_head, cb, il);
+
     (void) n_lora_q;
 
-    throw std::runtime_error("DeepSeek V4 KV cache write graph segment not implemented yet");
+    throw std::runtime_error("DeepSeek V4 local attention graph segment not implemented yet");
 
     return gf;
 }
