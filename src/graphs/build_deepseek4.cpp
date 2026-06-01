@@ -61,8 +61,12 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
     const int64_t n_hc = hparams.n_hc;
     const int64_t n_lora_q = hparams.n_lora_q;
+    const int64_t n_lora_o = hparams.n_lora_o;
+    const int64_t n_out_group = hparams.n_attn_out_groups;
     GGML_ASSERT(n_hc > 0);
     GGML_ASSERT(n_lora_q > 0);
+    GGML_ASSERT(n_lora_o > 0);
+    GGML_ASSERT(n_out_group > 0);
     GGML_ASSERT(n_layer > 0);
 
     ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
@@ -80,6 +84,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
     const int il = 0;
     const auto & layer = model.layers[il];
+    ggml_tensor * residual = inpL;
     GGML_ASSERT(layer.hc_attn_fn != nullptr);
     GGML_ASSERT(layer.hc_attn_scale != nullptr);
     GGML_ASSERT(layer.hc_attn_base != nullptr);
@@ -89,6 +94,8 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     GGML_ASSERT(layer.wq_a != nullptr);
     GGML_ASSERT(layer.wq_b != nullptr);
     GGML_ASSERT(layer.attn_kv != nullptr);
+    GGML_ASSERT(layer.attn_wo_a != nullptr);
+    GGML_ASSERT(layer.attn_wo_b != nullptr);
 
     const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
     const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
@@ -167,9 +174,25 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     cb(attn_out, "dsv4_local_attn_out", il);
     dsv4_log_tensor_shape("dsv4_local_attn_out", attn_out);
 
+    cur = ggml_reshape_3d(ctx0, attn_out, n_embd_head_v, n_head, n_tokens);
+    cur = llm_build_deepseek4_rope_tail(ctx0, cur, inp_pos, nullptr, n_rot, rope_type,
+            rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+            rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, true);
+    cb(cur, "attn_out_unrope", il);
+    dsv4_log_tensor_shape("attn_out_unrope", cur);
+
+    cur = llm_build_deepseek4_grouped_out(ctx0, cur, layer.attn_wo_a, layer.attn_wo_b,
+            n_embd_head_v, n_head, n_out_group, n_lora_o, n_tokens);
+    cb(cur, "attn_out", il);
+    dsv4_log_tensor_shape("attn_out", cur);
+
+    inpL = llm_build_deepseek4_hc_expand(ctx0, cur, residual, mix.post, mix.comb);
+    cb(inpL, "hc_attn_post", il);
+    dsv4_log_tensor_shape("hc_attn_post", inpL);
+
     (void) n_lora_q;
 
-    throw std::runtime_error("DeepSeek V4 attention output projection graph segment not implemented yet");
+    throw std::runtime_error("DeepSeek V4 FFN hyperconnection pre graph segment not implemented yet");
 
     return gf;
 }
