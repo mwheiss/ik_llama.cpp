@@ -781,6 +781,24 @@ static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, 
     return n_slots > 0 && seq_id >= 0 && (uint32_t) seq_id < n_slots;
 }
 
+static inline bool llama_dsv4_force_kv_f16(
+        ggml_type & type_k,
+        ggml_type & type_v,
+        const char * where) {
+    if (type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16) {
+        return false;
+    }
+
+    LLAMA_LOG_WARN("%s: DeepSeek4: forcing fp16 KV cache; requested K=%s, V=%s. "
+            "V4 q8_0 KV cache can silently corrupt decode because K activations are post-FP8-quantized; "
+            "--cache-type-k|v are ignored for V4 until the full compressed/indexer cache path is implemented.\n",
+            where, ggml_type_name(type_k), ggml_type_name(type_v));
+
+    type_k = GGML_TYPE_F16;
+    type_v = GGML_TYPE_F16;
+    return true;
+}
+
 static bool llama_kv_cache_init(
              struct llama_kv_cache & cache,
                const llama_context * ctx,
@@ -803,6 +821,15 @@ static bool llama_kv_cache_init(
 
     const int64_t  n_layer = model.mtp ? hparams.n_layer
                                        : hparams.n_layer - hparams.nextn_predict_layers;
+
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        llama_dsv4_force_kv_f16(type_k, type_v, __func__);
+        type_k_first = GGML_TYPE_F16;
+        type_k_last  = GGML_TYPE_F16;
+        type_v_first = GGML_TYPE_F16;
+        type_v_last  = GGML_TYPE_F16;
+        n_k_first = n_k_last = n_v_first = n_v_last = -1;
+    }
 
     cache.has_shift = false;
 
@@ -6947,6 +6974,14 @@ struct llama_context * llama_init_from_model(
         // it's probably best to keep as much precision as possible for the states
         type_k = GGML_TYPE_F32; // required by ggml_ssm_conv for Mamba's conv_states
         type_v = GGML_TYPE_F32; // required by ggml_ssm_scan for Mamba's ssm_states
+    }
+
+    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+        llama_dsv4_force_kv_f16(type_k, type_v, __func__);
+        params.type_k_first = GGML_TYPE_F16;
+        params.type_k_last  = GGML_TYPE_F16;
+        params.type_v_first = GGML_TYPE_F16;
+        params.type_v_last  = GGML_TYPE_F16;
     }
 
     GGML_ASSERT(hparams.n_embd_head_k(0) % ggml_blck_size(type_k) == 0);

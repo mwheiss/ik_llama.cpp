@@ -2417,7 +2417,7 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             } break;
         case LLM_ARCH_DEEPSEEK4:
             {
-                throw std::runtime_error("DeepSeek V4 graph construction not implemented yet");
+                result = llm.build_deepseek4();
             } break;
         case LLM_ARCH_CHATGLM:
             {

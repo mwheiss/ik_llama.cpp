@@ -120,7 +120,6 @@ struct llm_deepseek4_hc_mix llm_build_deepseek4_hc_pre(
         int                   sinkhorn_iters,
         float                 hc_eps) {
     GGML_ASSERT(x->type        == GGML_TYPE_F32);
-    GGML_ASSERT(hc_fn->type    == GGML_TYPE_F32);
     GGML_ASSERT(hc_scale->type == GGML_TYPE_F32);
     GGML_ASSERT(hc_base->type  == GGML_TYPE_F32);
     GGML_ASSERT(x->ne[0] == n_embd);
@@ -136,9 +135,11 @@ struct llm_deepseek4_hc_mix llm_build_deepseek4_hc_pre(
     struct ggml_tensor * flat = ggml_cont(ctx, ggml_reshape_2d(ctx, x, hc_dim, n_tokens));
     flat = ggml_rms_norm(ctx, flat, norm_eps);
 
-    // Keep this staged DSV4 reference path independent of backend GEMM fast
-    // paths. The output is scalar-equivalent to ggml_mul_mat(hc_fn, flat).
-    struct ggml_tensor * mixes = llm_build_deepseek4_hc_mix_project(ctx, hc_fn, flat);
+    // Keep the F32 staged reference path independent of backend GEMM fast
+    // paths. Quantized model tensors still use GGML's normal mul_mat path.
+    struct ggml_tensor * mixes = hc_fn->type == GGML_TYPE_F32
+        ? llm_build_deepseek4_hc_mix_project(ctx, hc_fn, flat)
+        : ggml_mul_mat(ctx, hc_fn, flat);
     struct ggml_tensor * split = ggml_dsv4_hc_split_sinkhorn(ctx, mixes, hc_scale, hc_base, n_hc, sinkhorn_iters, hc_eps);
 
     struct ggml_tensor * pre  = ggml_view_2d(ctx, split, n_hc, n_tokens, split->nb[1], 0);

@@ -258,6 +258,8 @@ struct llm_build_context {
 
     ggml_cgraph * build_deepseek2();
 
+    ggml_cgraph * build_deepseek4();
+
     ggml_tensor * build_deepseek2_tp_attention(
             ggml_cgraph * gf, int il,
             ggml_tensor * inpL,
