@@ -299,6 +299,7 @@ c++ -std=c++17 -O2 -DCCHUTER_ENGINE \
 
 python3 - "$IK_OUT" "$CCHUTER_OUT" <<'PY'
 import math
+import struct
 import sys
 
 def read_blocks(path):
@@ -349,7 +350,14 @@ tolerances = {
     "rope_tail": 2.0e-6,
 }
 
-print("op                         count      max_abs     mean_abs      max_rel  status")
+def f32_ordered_bits(x):
+    bits = struct.unpack("!I", struct.pack("!f", float(x)))[0]
+    return (~bits & 0xffffffff) if (bits & 0x80000000) else (bits | 0x80000000)
+
+def f32_ulp_distance(x, y):
+    return abs(f32_ordered_bits(x) - f32_ordered_bits(y))
+
+print("op                         count      max_abs     mean_abs      max_rel  worst  ulp  status")
 for name in expected:
     if name not in ik or name not in cc:
         raise SystemExit(f"missing block {name}")
@@ -370,13 +378,19 @@ for name in expected:
     max_abs = max(diffs) if diffs else 0.0
     mean_abs = sum(diffs) / len(diffs) if diffs else 0.0
     max_rel = max(rels) if rels else 0.0
+    worst = max(range(len(diffs)), key=lambda i: diffs[i]) if diffs else 0
+    worst_ulp = f32_ulp_distance(a[worst], b[worst]) if diffs else 0
     tol = tolerances[name]
     status = "ok" if max_abs <= tol else "FAIL"
-    print(f"{name:<25} {len(a):>6} {max_abs:12.6g} {mean_abs:12.6g} {max_rel:12.6g}  {status}")
+    print(
+        f"{name:<25} {len(a):>6} {max_abs:12.6g} {mean_abs:12.6g} {max_rel:12.6g} "
+        f"{worst:6d} {worst_ulp:4d}  {status}"
+    )
+    if max_abs != 0.0:
+        print(f"  worst {name}[{worst}]: ik={a[worst]:.9g} cchuter={b[worst]:.9g}")
     if status != "ok":
-        worst = max(range(len(diffs)), key=lambda i: diffs[i])
         raise SystemExit(
             f"{name}: max_abs {max_abs:.9g} exceeds {tol:.9g} at {worst}: "
-            f"ik={a[worst]:.9g} cchuter={b[worst]:.9g}"
+            f"ik={a[worst]:.9g} cchuter={b[worst]:.9g}, ulp={worst_ulp}"
         )
 PY
