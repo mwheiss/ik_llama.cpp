@@ -4171,9 +4171,6 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             return -2;
         }
 
-        if (model.arch == LLM_ARCH_DEEPSEEK4) {
-            throw std::runtime_error("DeepSeek V4 graph construction not implemented yet");
-        }
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
         return -1;
