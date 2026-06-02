@@ -62,6 +62,29 @@ static struct ggml_tensor * llm_build_deepseek4_shift_overlap_state(
     return ggml_concat(ctx, pad, prev, 2);
 }
 
+static struct ggml_tensor * llm_build_deepseek4_add_scalar(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        float                 value) {
+    struct ggml_tensor * shape = x;
+    x = ggml_cont(ctx, x);
+    x = ggml_reshape_1d(ctx, x, ggml_nelements(x));
+    x = ggml_scale_bias(ctx, x, 1.0f, value);
+    return ggml_reshape(ctx, x, shape);
+}
+
+static struct ggml_tensor * llm_build_deepseek4_mul_scalar(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        float                 value) {
+    struct ggml_tensor * shape = x;
+    x = ggml_cont(ctx, x);
+    x = ggml_reshape_1d(ctx, x, ggml_nelements(x));
+    x = ggml_scale(ctx, x, value);
+    return ggml_reshape(ctx, x, shape);
+}
+
+
 struct ggml_tensor * llm_build_deepseek4_rope_tail(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -366,4 +389,62 @@ struct ggml_tensor * llm_build_deepseek4_compressor_prefill(
     return llm_build_deepseek4_rope_tail(ctx, kv, pos, nullptr, n_rot, rope_type,
             n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
             beta_fast, beta_slow, false);
+}
+
+struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * qr,
+        struct ggml_tensor  * index_kv,
+        struct ggml_tensor  * wq_b,
+        struct ggml_tensor  * wproj,
+        struct ggml_tensor  * pos,
+        struct ggml_tensor  * causal_mask,
+        int64_t               n_index_head,
+        int64_t               n_index_head_size,
+        int64_t               n_rot,
+        int                   rope_type,
+        int32_t               n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    const int64_t n_tokens = x->ne[1];
+    const int64_t n_comp = index_kv->ne[2];
+
+    GGML_ASSERT(qr->ne[1] == n_tokens);
+    GGML_ASSERT(index_kv->ne[0] == n_index_head_size);
+    GGML_ASSERT(index_kv->ne[1] == 1);
+    GGML_ASSERT(wq_b->ne[1] == n_index_head*n_index_head_size);
+    GGML_ASSERT(wproj->ne[1] == n_index_head);
+    GGML_ASSERT(pos->ne[0] == n_tokens);
+    GGML_ASSERT(causal_mask->ne[0] == n_comp);
+    GGML_ASSERT(causal_mask->ne[1] == n_tokens);
+
+    struct ggml_tensor * q = ggml_mul_mat(ctx, wq_b, qr);
+    q = ggml_reshape_3d(ctx, q, n_index_head_size, n_index_head, n_tokens);
+    q = llm_build_deepseek4_rope_tail(ctx, q, pos, nullptr, n_rot, rope_type,
+            n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow, false);
+
+    struct ggml_tensor * k = ggml_permute(ctx, index_kv, 0, 2, 1, 3);
+    q = ggml_permute(ctx, q, 0, 2, 1, 3);
+
+    struct ggml_tensor * score = ggml_mul_mat(ctx, k, q);
+    score = ggml_relu(ctx, score);
+
+    struct ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x);
+    const float scale = 1.0f/std::sqrt((float) n_index_head_size*(float) n_index_head);
+    weights = llm_build_deepseek4_mul_scalar(ctx, weights, scale);
+    weights = ggml_reshape_3d(ctx, weights, 1, n_index_head, n_tokens);
+    weights = ggml_permute(ctx, weights, 0, 2, 1, 3);
+
+    score = ggml_mul(ctx, score, weights);
+    score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 2, 0, 3));
+    score = ggml_sum_rows(ctx, score);
+    score = ggml_reshape_2d(ctx, score, n_comp, n_tokens);
+
+    return ggml_add(ctx, score, causal_mask);
 }

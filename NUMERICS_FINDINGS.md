@@ -231,3 +231,58 @@ explicit gates against the cchuter F16 reference:
 6. Q4 and Q8 model-weight smokes with the same forced/unforced cache settings.
 
 Until those gates exist and pass, keep the forced F16 policy.
+
+## Compressed top-k mask scatter is blocked on CPU set_rows
+
+### Context
+
+DeepSeek4 compressed/indexer attention needs a mask with cchuter semantics:
+
+- selected valid compressed rows: `0`,
+- unselected compressed rows: `-inf`,
+- selected invalid rows: `-1e9`.
+
+cchuter builds this from indexer scores and top-k indices with a scatter-style
+primitive:
+
+```c++
+mask = ggml_set_rows(mask, values, topk)
+```
+
+### Observed issue in ik retry branch
+
+When the retry port added a focused synthetic test for the same helper,
+`test-dsv4-primitives` segfaulted inside the CPU implementation:
+
+```text
+SIGSEGV in ggml_compute_forward_set_rows
+```
+
+There are no other CPU-side users of `ggml_set_rows` in this tree, so this
+would introduce an unvalidated primitive into the DSV4 path. The graph might
+build, but the helper is not compute-safe on CPU as of this finding.
+
+### Why not replace it with arithmetic masking immediately?
+
+An exact primitive-only replacement is not obvious with the currently used
+helpers. Building a mask as arithmetic over `-inf` can produce `NaN` through
+terms like:
+
+```text
+0 * -inf
+```
+
+Using a large finite negative value for unselected rows might avoid the `NaN`,
+but it would change cchuter's mask polarity/magnitude and should not be slipped
+into the correctness-first port without explicit numeric validation.
+
+### Current policy
+
+Do not wire a compute path that depends on CPU `ggml_set_rows` for DSV4
+compressed masks. Continue with indexer-score/top-k graph construction, but
+stop before compressed-mask materialization until one of these is true:
+
+1. `ggml_set_rows` CPU support is fixed and covered by a small backend test,
+2. an exact primitive decomposition for scatter-to-`-inf` masks is found, or
+3. a deliberate finite-mask approximation is evaluated against cchuter logits
+   and accepted as a documented semantic change.

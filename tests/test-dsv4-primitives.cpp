@@ -523,6 +523,101 @@ static void test_compressor_prefill_ratio4_helper() {
     ggml_free(ctx);
 }
 
+static void test_indexer_scores_prefill_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 8 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 3;
+    constexpr int64_t q_rank = 2;
+    constexpr int64_t n_tokens = 2;
+    constexpr int64_t n_comp = 2;
+    constexpr int64_t n_index_head = 1;
+    constexpr int64_t head_size = 2;
+    constexpr int64_t n_rot = 2;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * qr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_rank, n_tokens);
+    ggml_tensor * index_kv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_size, 1, n_comp);
+    ggml_tensor * wq_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_rank, n_index_head * head_size);
+    ggml_tensor * wproj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_index_head);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_comp, n_tokens);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        ggml_set_i32_1d(pos, (int) t, 0);
+        for (int64_t e = 0; e < n_embd; ++e) {
+            ggml_set_f32_nd(x, e, t, 0, 0, 0.20f + 0.05f * (float) e - 0.03f * (float) t);
+        }
+        for (int64_t e = 0; e < q_rank; ++e) {
+            ggml_set_f32_nd(qr, e, t, 0, 0, -0.10f + 0.07f * (float) e + 0.02f * (float) t);
+        }
+        for (int64_t c = 0; c < n_comp; ++c) {
+            ggml_set_f32_nd(mask, c, t, 0, 0, c > t ? -INFINITY : 0.0f);
+        }
+    }
+    for (int64_t c = 0; c < n_comp; ++c) {
+        for (int64_t h = 0; h < head_size; ++h) {
+            ggml_set_f32_nd(index_kv, h, 0, c, 0, 0.15f * (float) (h + 1) - 0.04f * (float) c);
+        }
+    }
+    for (int64_t o = 0; o < n_index_head * head_size; ++o) {
+        for (int64_t e = 0; e < q_rank; ++e) {
+            ggml_set_f32_nd(wq_b, e, o, 0, 0, 0.03f * (float) (o + 1) + 0.02f * (float) e);
+        }
+    }
+    for (int64_t h = 0; h < n_index_head; ++h) {
+        for (int64_t e = 0; e < n_embd; ++e) {
+            ggml_set_f32_nd(wproj, e, h, 0, 0, 0.06f * (float) (e + 1));
+        }
+    }
+
+    ggml_tensor * scores = llm_build_deepseek4_indexer_scores_prefill(ctx,
+            x, qr, index_kv, wq_b, wproj, pos, mask,
+            n_index_head, head_size, n_rot,
+            0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+    graph_compute(ctx, scores);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        float q[head_size] = {};
+        for (int64_t h = 0; h < head_size; ++h) {
+            for (int64_t e = 0; e < q_rank; ++e) {
+                q[h] += ggml_get_f32_nd(qr, e, t, 0, 0) * ggml_get_f32_nd(wq_b, e, h, 0, 0);
+            }
+        }
+
+        float weight = 0.0f;
+        for (int64_t e = 0; e < n_embd; ++e) {
+            weight += ggml_get_f32_nd(x, e, t, 0, 0) * ggml_get_f32_nd(wproj, e, 0, 0, 0);
+        }
+        weight *= 1.0f / std::sqrt((float) (head_size * n_index_head));
+
+        for (int64_t c = 0; c < n_comp; ++c) {
+            float dot = 0.0f;
+            for (int64_t h = 0; h < head_size; ++h) {
+                dot += ggml_get_f32_nd(index_kv, h, 0, c, 0) * q[h];
+            }
+            const float base = std::max(0.0f, dot) * weight;
+            const float m = ggml_get_f32_nd(mask, c, t, 0, 0);
+            const float expected = std::isinf(m) ? -INFINITY : base + m;
+            const float actual = ggml_get_f32_nd(scores, c, t, 0, 0);
+            if (std::isinf(expected)) {
+                if (!std::isinf(actual) || actual > 0.0f) {
+                    fprintf(stderr, "indexer_scores_mask: got %.9g, expected -inf\n", actual);
+                    std::abort();
+                }
+            } else {
+                assert_close(actual, expected, "indexer_scores_prefill", 1.0e-6f);
+            }
+        }
+    }
+
+    ggml_free(ctx);
+}
+
 static float ref_rope_standard(float x0, float x1, int32_t pos, int64_t pair, int64_t n_rot, bool second) {
     const float theta_scale = std::pow(10000.0f, -2.0f / (float) n_rot);
     const float theta = (float) pos * std::pow(theta_scale, (float) pair);
@@ -590,6 +685,7 @@ int main() {
     test_hc_expand_helper();
     test_grouped_out_helper();
     test_compressor_prefill_ratio4_helper();
+    test_indexer_scores_prefill_helper();
     test_rope_tail_helper();
     return 0;
 }

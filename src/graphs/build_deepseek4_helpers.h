@@ -82,3 +82,24 @@ struct ggml_tensor * llm_build_deepseek4_compressor_prefill(
         float                 beta_fast,
         float                 beta_slow,
         float                 norm_eps);
+
+struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * qr,
+        struct ggml_tensor  * index_kv,
+        struct ggml_tensor  * wq_b,
+        struct ggml_tensor  * wproj,
+        struct ggml_tensor  * pos,
+        struct ggml_tensor  * causal_mask,
+        int64_t               n_index_head,
+        int64_t               n_index_head_size,
+        int64_t               n_rot,
+        int                   rope_type,
+        int32_t               n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow);
