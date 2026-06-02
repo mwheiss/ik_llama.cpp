@@ -728,3 +728,61 @@ Layers 1 and 2 were also checked after this fix and stayed close at the same
 scale. The first-token logits still diverge later in the graph, so the next
 porting step is to continue layer-by-layer numerical comparison until the next
 unexplained cliff is isolated.
+
+## DeepSeek4 MoE applies routed weights before the down projection
+
+### Finding
+
+After fixing sinked local attention, the next non-rounding cliff appeared in the
+decode-token FFN/MoE path at layer 5. Attention and the post-attention input to
+the FFN were still close, but the routed expert result was too large in ik:
+
+```text
+cchuter ffn_moe_out-5 sum=437.628908 first=[3.7521975, 6.98501253, 1.38501644, 2.05611515]
+ik      ffn_moe_out-5 sum=503.454471 first=[4.25143385, 8.05839825, 1.60922575, 2.3462317]
+```
+
+This was not an expected rounding difference. The discrepancy was isolated with
+intermediate traces for `ffn_moe_weights_scaled-5`, `ffn_moe_gate-5`,
+`ffn_moe_up-5`, `ffn_moe_down-5`, `ffn_moe_out-5`, and `ffn_shexp-5`.
+
+### Cause
+
+cchuter's `build_moe_ffn` has a DeepSeek4-specific path:
+
+- clamp the routed gate tensor to `[-inf, swiglu_clamp_exp[il]]`,
+- apply SiLU to the clamped gate,
+- clamp the routed up tensor to `[-swiglu_clamp_exp[il], swiglu_clamp_exp[il]]`,
+- multiply those tensors to form the limited SwiGLU activation,
+- apply normalized/scaled expert weights to the activation before `down_exps`,
+- then run the down projection and sum the selected expert outputs.
+
+ik's generic MoE helper only applied expert weights after the down projection
+unless the architecture was Llama 4, and its fused up/gate path could not express
+the DeepSeek4 clamp sequence. That produced the routed-output cliff at layer 5.
+
+### Resolution
+
+The shared ik MoE helper now gates the cchuter DeepSeek4 behavior on
+`LLM_ARCH_DEEPSEEK4`:
+
+- router weight sums are clamped to the smallest positive F16 value before
+  normalization,
+- the fused MoE up/gate shortcut is skipped only when the DSV4 limited-SwiGLU
+  clamp is active,
+- the limited-SwiGLU intermediate is multiplied by expert weights before
+  `down_exps`,
+- the post-down weighting path is skipped for DeepSeek4 because weights have
+  already been applied.
+
+After the fix, the layer-5 decode FFN output recovered cchuter parity at the
+scale expected from upstream/ik implementation differences:
+
+```text
+cchuter ffn_out-5 sum=605.743751 first=[4.81803846, 9.42729473, 0.691116333, 2.96347666]
+ik      ffn_out-5 sum=604.739391 first=[4.79407692, 9.46874523, 0.696503937, 2.94940662]
+```
+
+The first-token logits still do not match cchuter, so the next step is to
+continue with exact-name diagnostic filters beyond layer 5 and isolate the next
+unexplained divergence before implementing more graph changes.

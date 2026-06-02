@@ -1043,6 +1043,9 @@ llm_expert_gating_func_type   gating_op,
     int64_t n_embd = cur->ne[0];
     int64_t n_tokens = cur->ne[1];
     bool weight_before_ffn = lctx.model.arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+    bool weight_before_down = lctx.model.arch == LLM_ARCH_DEEPSEEK4; // DSV4 applies routed weights after SwiGLU and before w2
+    const bool dsv4_limited_swiglu = lctx.model.arch == LLM_ARCH_DEEPSEEK4 && il >= 0 &&
+        lctx.model.hparams.swiglu_limits[il] > 1e-6f;
 
     ggml_tensor * logits = gate_inp ? llm_build_lora_mm(lctx, ctx, gate_inp, cur) : input_logits; // [n_expert, n_tokens]
     cb(logits, "ffn_moe_logits", il);
@@ -1122,7 +1125,12 @@ llm_expert_gating_func_type   gating_op,
         ggml_tensor * weights_sum = ggml_sum_rows(ctx, weights); // [1, n_tokens]
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        if (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_STEP35) {
+        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
+            // Match the cchuter DSV4 path: avoid divide-by-zero in the normalized
+            // router weights using the smallest positive F16 value.
+            weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5f, INFINITY);
+            cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
+        } else if (lctx.model.arch == LLM_ARCH_BAILINGMOE2 || lctx.model.arch == LLM_ARCH_STEP35) {
             weights_sum = ggml_scale_bias(ctx, weights_sum, 1.0, 1e-20);
             cb(weights_sum, "ffn_moe_weights_sum_biased", il);
         }
@@ -1174,7 +1182,7 @@ llm_expert_gating_func_type   gating_op,
     } else {
     GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
 
-    if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
+    if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type && !dsv4_limited_swiglu) {
         if (up_exps_b || gate_exps_b) {
             par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
@@ -1211,7 +1219,22 @@ llm_expert_gating_func_type   gating_op,
         }
 
         if (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) {
-            par = ggml_fused_mul_unary(ctx, gate, up, type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+            if (dsv4_limited_swiglu && type_op == LLM_FFN_SILU) {
+                const float limit = lctx.model.hparams.swiglu_limits[il];
+                gate = ggml_clamp(ctx, gate, -INFINITY, limit);
+                cb(gate, "ffn_moe_gate_clamped", il);
+
+                ggml_tensor * gate_act = ggml_silu(ctx, gate);
+                cb(gate_act, "ffn_moe_silu", il);
+
+                up = ggml_clamp(ctx, up, -limit, limit);
+                cb(up, "ffn_moe_up_clamped", il);
+
+                par = ggml_mul(ctx, gate_act, up);
+                cb(par, "ffn_moe_swiglu_limited", il);
+            } else {
+                par = ggml_fused_mul_unary(ctx, gate, up, type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+            }
             if (lctx.model.arch == LLM_ARCH_STEP35) {
                 *((float *)(par->op_params + 1)) = lctx.model.hparams.swiglu_limits[il];
             }
@@ -1227,6 +1250,11 @@ llm_expert_gating_func_type   gating_op,
     }
     }
     cb(par, "ffn_moe_gate_par", il);
+
+    if (weight_before_down) {
+        par = ggml_mul(ctx, par, weights);
+        cb(par, "ffn_moe_weighted_swiglu", il);
+    }
 
     ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
@@ -1247,7 +1275,7 @@ llm_expert_gating_func_type   gating_op,
         weights = ggml_reshape_3d(ctx, w_reshaped, 1, n_expert_used, n_tokens);
     }
 
-    if (!weight_before_ffn) {
+    if (!weight_before_ffn && !weight_before_down) {
         if (lctx.cparams.fused_mmad) {
             experts = ggml_mul_multi_add(ctx, experts, weights);
             cb(experts, "ffn_moe_weighted", il);
