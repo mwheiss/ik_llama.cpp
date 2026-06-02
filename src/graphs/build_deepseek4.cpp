@@ -83,23 +83,12 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     cb(inpL, "hc_residual_init", -1);
     dsv4_log_tensor_shape("hc_residual_init", inpL);
 
-    auto build_local_layer = [&](ggml_tensor * layer_inp, int il) -> ggml_tensor * {
+    auto build_ffn_update = [&](ggml_tensor * layer_inp, int il) -> ggml_tensor * {
         const auto & layer = model.layers[il];
-        GGML_ASSERT(layer.hc_attn_fn != nullptr);
-        GGML_ASSERT(layer.hc_attn_scale != nullptr);
-        GGML_ASSERT(layer.hc_attn_base != nullptr);
         GGML_ASSERT(layer.hc_ffn_fn != nullptr);
         GGML_ASSERT(layer.hc_ffn_scale != nullptr);
         GGML_ASSERT(layer.hc_ffn_base != nullptr);
-        GGML_ASSERT(layer.attn_norm != nullptr);
-        GGML_ASSERT(layer.attn_q_a_norm != nullptr);
-        GGML_ASSERT(layer.attn_kv_a_norm != nullptr);
         GGML_ASSERT(layer.ffn_norm != nullptr);
-        GGML_ASSERT(layer.wq_a != nullptr);
-        GGML_ASSERT(layer.wq_b != nullptr);
-        GGML_ASSERT(layer.attn_kv != nullptr);
-        GGML_ASSERT(layer.attn_wo_a != nullptr);
-        GGML_ASSERT(layer.attn_wo_b != nullptr);
         GGML_ASSERT(layer.ffn_gate_inp != nullptr);
         GGML_ASSERT(layer.ffn_up_exps != nullptr);
         GGML_ASSERT(layer.ffn_gate_exps != nullptr);
@@ -107,6 +96,83 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         GGML_ASSERT(layer.ffn_up_shexp != nullptr);
         GGML_ASSERT(layer.ffn_gate_shexp != nullptr);
         GGML_ASSERT(layer.ffn_down_shexp != nullptr);
+
+        ggml_tensor * residual = layer_inp;
+        llm_deepseek4_hc_mix mix = llm_build_deepseek4_hc_pre(ctx0, layer_inp,
+                layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base,
+                n_embd, n_hc, n_tokens, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
+        ggml_tensor * cur = mix.x;
+        cb(cur, "hc_ffn_pre", il);
+        cb(mix.mixes, "hc_ffn_pre_mixes", il);
+        cb(mix.pre, "hc_ffn_pre_weights", il);
+        cb(mix.post, "hc_ffn_pre_post_weights", il);
+        cb(mix.comb, "hc_ffn_pre_comb", il);
+        dsv4_log_tensor_shape("hc_ffn_pre", cur);
+        dsv4_log_tensor_shape("hc_ffn_pre_mixes", mix.mixes);
+        dsv4_log_tensor_shape("hc_ffn_pre_weights", mix.pre);
+        dsv4_log_tensor_shape("hc_ffn_pre_post_weights", mix.post);
+        dsv4_log_tensor_shape("hc_ffn_pre_comb", mix.comb);
+
+        cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
+        cb(cur, "ffn_norm", il);
+        dsv4_log_tensor_shape("ffn_norm", cur);
+
+        ggml_tensor * selected = nullptr;
+        if ((uint32_t) il < hparams.n_hash_layers && !warmup) {
+            GGML_ASSERT(lctx.inp_tokens != nullptr);
+            GGML_ASSERT(layer.ffn_gate_tid2eid != nullptr);
+            selected = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, lctx.inp_tokens);
+            cb(selected, "ffn_moe_hash_topk", il);
+            dsv4_log_tensor_shape("ffn_moe_hash_topk", selected);
+        }
+
+        ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
+                layer.ffn_gate_inp,
+                layer.ffn_up_exps,
+                layer.ffn_gate_exps,
+                layer.ffn_down_exps,
+                layer.ffn_exp_probs_b,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, hparams.expert_weights_norm,
+                true, hparams.expert_weights_scale,
+                (llm_expert_gating_func_type) hparams.expert_gating_func,
+                cb, il, gf, false, nullptr, nullptr, nullptr, nullptr, selected);
+        cb(moe_out, "ffn_moe_out", il);
+        dsv4_log_tensor_shape("ffn_moe_out", moe_out);
+
+        ggml_tensor * ffn_shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
+                layer.ffn_up_shexp,   nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr,
+                LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+        cb(ffn_shexp, "ffn_shexp", il);
+        dsv4_log_tensor_shape("ffn_shexp", ffn_shexp);
+
+        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        cb(cur, "ffn_out", il);
+        dsv4_log_tensor_shape("ffn_out", cur);
+
+        layer_inp = llm_build_deepseek4_hc_expand(ctx0, cur, residual, mix.post, mix.comb);
+        cb(layer_inp, "hc_ffn_post", il);
+        dsv4_log_tensor_shape("hc_ffn_post", layer_inp);
+
+        return layer_inp;
+    };
+
+    auto build_local_layer = [&](ggml_tensor * layer_inp, int il) -> ggml_tensor * {
+        const auto & layer = model.layers[il];
+        GGML_ASSERT(layer.hc_attn_fn != nullptr);
+        GGML_ASSERT(layer.hc_attn_scale != nullptr);
+        GGML_ASSERT(layer.hc_attn_base != nullptr);
+        GGML_ASSERT(layer.attn_norm != nullptr);
+        GGML_ASSERT(layer.attn_q_a_norm != nullptr);
+        GGML_ASSERT(layer.attn_kv_a_norm != nullptr);
+        GGML_ASSERT(layer.wq_a != nullptr);
+        GGML_ASSERT(layer.wq_b != nullptr);
+        GGML_ASSERT(layer.attn_kv != nullptr);
+        GGML_ASSERT(layer.attn_wo_a != nullptr);
+        GGML_ASSERT(layer.attn_wo_b != nullptr);
 
         const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
         GGML_ASSERT(compress_ratio == 0);
@@ -203,70 +269,10 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         cb(layer_inp, "hc_attn_post", il);
         dsv4_log_tensor_shape("hc_attn_post", layer_inp);
 
-        residual = layer_inp;
-        mix = llm_build_deepseek4_hc_pre(ctx0, layer_inp,
-                layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base,
-                n_embd, n_hc, n_tokens, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
-        cur = mix.x;
-        cb(cur, "hc_ffn_pre", il);
-        cb(mix.mixes, "hc_ffn_pre_mixes", il);
-        cb(mix.pre, "hc_ffn_pre_weights", il);
-        cb(mix.post, "hc_ffn_pre_post_weights", il);
-        cb(mix.comb, "hc_ffn_pre_comb", il);
-        dsv4_log_tensor_shape("hc_ffn_pre", cur);
-        dsv4_log_tensor_shape("hc_ffn_pre_mixes", mix.mixes);
-        dsv4_log_tensor_shape("hc_ffn_pre_weights", mix.pre);
-        dsv4_log_tensor_shape("hc_ffn_pre_post_weights", mix.post);
-        dsv4_log_tensor_shape("hc_ffn_pre_comb", mix.comb);
-
-        cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
-        cb(cur, "ffn_norm", il);
-        dsv4_log_tensor_shape("ffn_norm", cur);
-
-        ggml_tensor * selected = nullptr;
-        if ((uint32_t) il < hparams.n_hash_layers && !warmup) {
-            GGML_ASSERT(lctx.inp_tokens != nullptr);
-            GGML_ASSERT(layer.ffn_gate_tid2eid != nullptr);
-            selected = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, lctx.inp_tokens);
-            cb(selected, "ffn_moe_hash_topk", il);
-            dsv4_log_tensor_shape("ffn_moe_hash_topk", selected);
-        }
-
-        ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
-                layer.ffn_gate_inp,
-                layer.ffn_up_exps,
-                layer.ffn_gate_exps,
-                layer.ffn_down_exps,
-                layer.ffn_exp_probs_b,
-                n_expert, n_expert_used,
-                LLM_FFN_SILU, hparams.expert_weights_norm,
-                true, hparams.expert_weights_scale,
-                (llm_expert_gating_func_type) hparams.expert_gating_func,
-                cb, il, gf, false, nullptr, nullptr, nullptr, nullptr, selected);
-        cb(moe_out, "ffn_moe_out", il);
-        dsv4_log_tensor_shape("ffn_moe_out", moe_out);
-
-        ggml_tensor * ffn_shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
-                layer.ffn_up_shexp,   nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr,
-                LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-        dsv4_log_tensor_shape("ffn_shexp", ffn_shexp);
-
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
-        cb(cur, "ffn_out", il);
-        dsv4_log_tensor_shape("ffn_out", cur);
-
-        layer_inp = llm_build_deepseek4_hc_expand(ctx0, cur, residual, mix.post, mix.comb);
-        cb(layer_inp, "hc_ffn_post", il);
-        dsv4_log_tensor_shape("hc_ffn_post", layer_inp);
-
-        return layer_inp;
+        return build_ffn_update(layer_inp, il);
     };
 
-    auto build_compressed_prefix = [&](ggml_tensor * layer_inp, int il) {
+    auto build_compressed_prefix = [&](ggml_tensor * layer_inp, int il) -> ggml_tensor * {
         const auto & layer = model.layers[il];
         const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
         GGML_ASSERT(compress_ratio == 4 || compress_ratio == 128);
@@ -496,8 +502,11 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                 cb(out, "hc_attn_post", il);
                 dsv4_log_tensor_shape("hc_attn_post", out);
                 ggml_build_forward_expand(gf, out);
+                return out;
             }
         }
+
+        throw std::runtime_error("DeepSeek V4 compressed attention path produced no output");
     };
 
     for (int il = 0; il < n_layer; ++il) {
@@ -505,8 +514,9 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         if (compress_ratio != 0) {
             LLAMA_LOG_INFO("%s: DeepSeek4 graph slice: reached compressed layer %d, ratio=%u\n",
                     __func__, il, compress_ratio);
-            build_compressed_prefix(inpL, il);
-            throw std::runtime_error("DeepSeek V4 compressed FFN graph segment not implemented yet");
+            inpL = build_compressed_prefix(inpL, il);
+            inpL = build_ffn_update(inpL, il);
+            throw std::runtime_error("DeepSeek V4 next layer graph segment not implemented yet");
         }
 
         inpL = build_local_layer(inpL, il);
