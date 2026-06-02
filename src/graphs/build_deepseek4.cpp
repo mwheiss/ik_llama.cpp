@@ -93,6 +93,23 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         return t;
     };
 
+    auto store_dsv4_cache_rows = [&](ggml_tensor * cache, ggml_tensor * src, int64_t row_start, int64_t n_rows) {
+        if (cache == nullptr || src == nullptr || n_rows <= 0) {
+            return;
+        }
+        GGML_ASSERT(row_start >= 0);
+        GGML_ASSERT(row_start + n_rows <= cache->ne[1]);
+        GGML_ASSERT(src->ne[0] == cache->ne[0]);
+        GGML_ASSERT(src->ne[2] >= n_rows);
+
+        ggml_tensor * src_rows = ggml_reshape_2d(ctx0, src, src->ne[0], n_rows);
+        ggml_tensor * dst_rows = ggml_view_2d(ctx0, cache,
+                cache->ne[0], n_rows,
+                cache->nb[1],
+                row_start * cache->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_rows, dst_rows));
+    };
+
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
@@ -463,6 +480,9 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             cb(kv_comp, "KVcompress", il);
             dsv4_log_tensor_shape("KVcompress", kv_comp);
             ggml_build_forward_expand(gf, kv_comp);
+            if (il < (int) kv_self.dsv4_layers.size()) {
+                store_dsv4_cache_rows(kv_self.dsv4_layers[il].attn_k, kv_comp, 0, n_comp);
+            }
 
             ggml_tensor * k_all = ggml_concat(ctx0, kv, kv_comp, 2);
             ggml_tensor * v_all = k_all;
@@ -492,6 +512,9 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                 cb(index_kv, "indexer_KVcompress", il);
                 dsv4_log_tensor_shape("indexer_KVcompress", index_kv);
                 ggml_build_forward_expand(gf, index_kv);
+                if (il < (int) kv_self.dsv4_layers.size()) {
+                    store_dsv4_cache_rows(kv_self.dsv4_layers[il].index_k, index_kv, 0, n_comp);
+                }
 
                 ggml_tensor * index_mask = build_dsv4_mask_input(
                         llama_dsv4_mask_kind::COMPRESS_CAUSAL,
