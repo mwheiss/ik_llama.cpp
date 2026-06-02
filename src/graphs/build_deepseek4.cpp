@@ -530,8 +530,6 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         throw std::runtime_error("DeepSeek V4 compressed attention path produced no output");
     };
 
-    const int dsv4_debug_max_layers = 4;
-
     for (int il = 0; il < n_layer; ++il) {
         const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
         if (compress_ratio != 0) {
@@ -542,15 +540,11 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         } else {
             inpL = build_local_layer(inpL, il);
         }
-
-        if (il + 1 >= dsv4_debug_max_layers) {
-            throw std::runtime_error("DeepSeek V4 bounded layer loop graph segment not implemented yet");
-        }
     }
 
     (void) n_lora_q;
 
-    throw std::runtime_error("DeepSeek V4 next layer graph segment not implemented yet");
+    throw std::runtime_error("DeepSeek V4 final output graph segment not implemented yet");
 
     return gf;
 }
