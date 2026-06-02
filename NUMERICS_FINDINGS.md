@@ -912,3 +912,53 @@ are absent. ik should therefore not invent `8/4` defaults for the Q8 file unless
 the reference semantics change. Q8 validation remains useful for load/runtime
 safety and forced-F16 KV behavior, but Q4 is the authoritative grouped-routing
 parity case for this GGUF pair.
+
+### Post-fix layer sweep
+
+The layer-18 `ffn_out` signed-sum delta after grouped routing is not zero:
+
+```text
+cchuter ffn_out-18 sum=158.050339 abs_sum=10179.6837
+ik      ffn_out-18 sum=156.045430
+delta=-2.004909, abs(delta)/abs_sum=0.000196952, mean_shift=-0.00048948
+```
+
+That is small as an aggregate metric, but it is not sufficient by itself as an
+elementwise proof. The reason it is accepted here is that it comes with the
+semantic checks that were failing before:
+
+- layer-18 selected experts now match cchuter exactly for the decoded token,
+- layer-18 MoE weights are within the same small drift scale,
+- layer 19 and 20 outputs do not show a new jump,
+- final top logits recover the same greedy top token (`21133`, `World`).
+
+The subsequent Q4 layer sweep was rerun on the grouped-routing commit. Exact
+full-tensor trace lines were used so reshaped/view diagnostics did not overwrite
+the tensors under comparison.
+
+For layers 21-28, no new semantic cliff appeared. Worst relative signed-sum
+delta against cchuter:
+
+```text
+layer 27 attn_out: rel_abs=0.00164621, sum_diff=-0.8162181
+```
+
+For layers 29-42, no new semantic cliff appeared. Worst relative signed-sum
+delta against cchuter:
+
+```text
+layer 40 ffn_out: rel_abs=0.00116571, sum_diff=4.176148
+```
+
+The raw n=4 greedy completion gate also matches cchuter for Q4:
+
+```text
+prompt: Hello
+cchuter: World = function()
+ik:      World = function()
+```
+
+This establishes that the grouped-routing fix recovers the first-token and
+short-decode path for the Q4 grouped-routing GGUF. Continue future debugging
+from longer decode/cache-state checks rather than revisiting layer 18 unless a
+new elementwise dump shows a real cliff.
