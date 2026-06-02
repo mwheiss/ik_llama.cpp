@@ -962,3 +962,63 @@ This establishes that the grouped-routing fix recovers the first-token and
 short-decode path for the Q4 grouped-routing GGUF. Continue future debugging
 from longer decode/cache-state checks rather than revisiting layer 18 unless a
 new elementwise dump shows a real cliff.
+
+### Short decode near-tie at n=16
+
+The Q4 raw greedy completion gate was extended after the grouped-routing fix.
+For `-n 8`, ik and cchuter match exactly:
+
+```text
+prompt: Hello
+cchuter: World = function() {
+    return "
+ik:      World = function() {
+    return "
+```
+
+For `-n 16`, the continuations diverge after the shared prefix:
+
+```text
+cchuter: World = function() {
+    return "Hello World";
+  };
+  return Gre
+
+ik:      World = function() {
+    return "Hello, World!";
+};
+
+module.exports
+```
+
+The first prompt/reserve-like `result_output` top-k line differs between the
+two binaries and should not be used as the generated-token comparison point.
+Starting from the generated-token lines, both engines agree through the shared
+prefix. The first real greedy-token split is immediately after generating
+`Hello`, where the top two logits are nearly tied and swap order:
+
+```text
+cchuter top5:
+4495:25.9964123, 14:25.9374676, 2058:24.3284817,
+5493:24.3006001, 582:23.5263596
+
+ik top5:
+14:25.9882355, 4495:25.9369392, 2058:24.2998486,
+5493:24.0584793, 21133:23.4655762
+```
+
+The cchuter margin for token `4495` over token `14` is `0.0589447`. The ik
+margin for token `14` over token `4495` is `0.0512963`. Per-token logit drift
+at this split is about `0.05-0.06` for the two competing tokens:
+
+```text
+token 4495: ik - cchuter = -0.0594731
+token 14:   ik - cchuter =  0.0507679
+```
+
+This explains the text divergence without showing a new semantic cliff: a
+small accumulated decode-logit drift crossed a very close greedy boundary. Do
+not treat exact text equality beyond this point as a stable gate unless logits
+or token ranks are also compared. Future longer-decode work should look for
+larger cache-state or layer-local cliffs, while accepting that greedy text can
+diverge after this documented near-tie.
