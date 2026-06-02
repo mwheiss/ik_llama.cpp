@@ -427,6 +427,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         }
 
         const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
+        const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
         const llama_pos first_pos = batch.pos ? batch.pos[0] : batch.all_pos_0;
         const bool is_prefill = batch.pos == nullptr || first_pos == 0;
 
@@ -636,6 +637,38 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                 LLAMA_LOG_INFO("%s: DeepSeek4 decode compressor state update: layer=%d pos=%d ratio=%u n_comp_before=%" PRId64
                         " n_comp_visible=%" PRId64 " n_comp_cache=%u\n",
                         __func__, il, first_pos, compress_ratio, n_comp_before, n_comp_visible, dsv4_cache.n_comp);
+
+                if (n_comp_visible == 0) {
+                    ggml_tensor * attn_out = llm_build_kv(ctx0, lctx, kv_self, gf,
+                            nullptr, nullptr,
+                            nullptr, nullptr,
+                            q, KQ_mask_swa,
+                            n_tokens, kv_head, n_kv, kq_scale, cb, il, layer.attn_sinks, hparams.n_swa);
+                    cb(attn_out, "dsv4_decode_raw_attn_out", il);
+                    dsv4_log_tensor_shape("dsv4_decode_raw_attn_out", attn_out);
+
+                    ggml_tensor * out = ggml_reshape_3d(ctx0, attn_out, n_embd_head_v, n_head, n_tokens);
+                    out = llm_build_deepseek4_rope_tail(ctx0, out, inp_pos, nullptr, n_rot, rope_type,
+                            rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                            rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, true);
+                    cb(out, "attn_out_unrope", il);
+                    dsv4_log_tensor_shape("attn_out_unrope", out);
+
+                    out = llm_build_deepseek4_grouped_out(ctx0, out, layer.attn_wo_a, layer.attn_wo_b,
+                            n_embd_head_v, n_head, n_out_group, n_lora_o, n_tokens);
+                    cb(out, "attn_out", il);
+                    dsv4_log_tensor_shape("attn_out", out);
+
+                    out = llm_build_deepseek4_hc_expand(ctx0, out, layer_inp, mix.post, mix.comb);
+                    cb(out, "hc_attn_post", il);
+                    dsv4_log_tensor_shape("hc_attn_post", out);
+                    ggml_build_forward_expand(gf, out);
+                    return out;
+                }
+            } else {
+                LLAMA_LOG_INFO("%s: DeepSeek4 decode cache state unavailable: layer=%d pos=%d ratio=%u nextn_tail=%d\n",
+                        __func__, il, first_pos, compress_ratio, int(il >= int(hparams.n_layer - hparams.nextn_predict_layers)));
+                throw std::runtime_error("DeepSeek V4 decode NextN/tail cache path not implemented yet");
             }
 
             throw std::runtime_error("DeepSeek V4 decode compressed cache replay not implemented yet");

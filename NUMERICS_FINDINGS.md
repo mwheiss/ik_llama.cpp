@@ -518,4 +518,63 @@ With DSV4 graph reuse disabled:
   `DeepSeek V4 decode compressed cache replay not implemented yet`,
 - Q8 forced q8_0 KV reaches the same true decode boundary and still logs the
   forced-F16 warning,
+
+## Early decode positions use raw/SWA attention before compressed rows exist
+
+### Finding
+
+For ratio-4 compressed DeepSeek4 layers, the first generated-token decode
+positions can have no visible compressed rows yet:
+
+```text
+n_comp_visible = (pos + 1) / compress_ratio
+```
+
+At `pos=1`, this is zero for `compress_ratio=4`. Entering compressed-cache
+attention composition at that point is premature; there are no compressed K/V
+rows to replay. cchuter still runs the local/raw attention path for those
+positions while updating the compressor state that will later emit compressed
+rows.
+
+### Current implementation
+
+The retry port now updates the decode compressor state, writes any emitted
+compressed row when one exists, and, when `n_comp_visible == 0`, runs only the
+raw/SWA KV attention path for the layer. The path then applies the same
+attention output un-rope, grouped output projection, and post-attention HC
+expand used by the prefill compressed layer path.
+
+This is still a staged decode implementation. It does not claim compressed
+cache replay parity yet; it only handles the mathematically empty-compressed
+prefix case.
+
+### Current boundary
+
+With Q4 `Hello -n 2`, ik reaches real decode at `first_pos=1`, runs the early
+raw/SWA decode path through cache-active layers, and then stops at the explicit
+NextN/tail boundary:
+
+```text
+DeepSeek V4 decode NextN/tail cache path not implemented yet
+```
+
+This boundary is useful because it distinguishes the next missing semantic
+piece from a generic compressed-cache replay failure. The active layers have
+DSV4 compressor/cache state scaffolding; the NextN/tail layer currently does
+not. Before implementing replay for `n_comp_visible > 0`, inspect cchuter's
+decode behavior for layer 42 and decide whether the tail layer needs its own
+cache state, is skipped, or follows a different current-token-only path.
+
+### Validation status
+
+Primitive parity against cchuter remains unchanged after adding the early
+raw/SWA decode path. The expected helper differences are still limited to
+known float32 operation-order cases:
+
+- `hc_weighted_sum`: worst 1 ULP,
+- HC pre-mix/head: worst 1-2 ULP,
+- grouped output F32 validation helper: tiny absolute error with worst 5 ULP.
+
+These differences are unrelated to the early decode control flow and remain
+within expected float32 rounding bounds.
 - helper parity remains unchanged.
