@@ -343,6 +343,38 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
         ggml_build_forward_expand(gf, q);
         ggml_build_forward_expand(gf, kv);
+
+        const int64_t n_comp = n_tokens / compress_ratio;
+        if (n_comp > 0) {
+            ggml_tensor * comp_pos = ggml_arange(ctx0, 0.0f, float(n_comp * compress_ratio), float(compress_ratio));
+            comp_pos = ggml_cast(ctx0, comp_pos, GGML_TYPE_I32);
+            cb(comp_pos, "comp_pos", il);
+            dsv4_log_tensor_shape("comp_pos", comp_pos);
+
+            ggml_tensor * kv_comp = llm_build_deepseek4_compressor_prefill(ctx0,
+                    cur,
+                    layer.attn_compressor_kv,
+                    layer.attn_compressor_gate,
+                    layer.attn_compressor_ape,
+                    layer.attn_compressor_norm,
+                    comp_pos,
+                    n_embd_head_k,
+                    n_rot,
+                    compress_ratio,
+                    rope_type,
+                    rope_cfg.n_ctx_orig,
+                    rope_cfg.freq_base,
+                    rope_cfg.freq_scale,
+                    rope_cfg.ext_factor,
+                    rope_cfg.attn_factor,
+                    rope_cfg.beta_fast,
+                    rope_cfg.beta_slow,
+                    norm_rms_eps);
+            kv_comp = ggml_dsv4_fp8_kv_quantize(ctx0, kv_comp, n_rot);
+            cb(kv_comp, "KVcompress", il);
+            dsv4_log_tensor_shape("KVcompress", kv_comp);
+            ggml_build_forward_expand(gf, kv_comp);
+        }
     };
 
     for (int il = 0; il < n_layer; ++il) {
@@ -351,7 +383,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             LLAMA_LOG_INFO("%s: DeepSeek4 graph slice: reached compressed layer %d, ratio=%u\n",
                     __func__, il, compress_ratio);
             build_compressed_prefix(inpL, il);
-            throw std::runtime_error("DeepSeek V4 compressed compressor graph segment not implemented yet");
+            throw std::runtime_error("DeepSeek V4 compressed KV cache/indexer graph segment not implemented yet");
         }
 
         inpL = build_local_layer(inpL, il);
