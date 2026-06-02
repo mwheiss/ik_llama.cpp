@@ -947,6 +947,10 @@ static bool llama_kv_cache_init(
     }
     if (needs_v_cache) cache.v_l.reserve(n_layer);
     cache.s_l.resize(n_layer, nullptr);
+    cache.dsv4_layers.clear();
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        cache.dsv4_layers.resize(hparams.n_layer);
+    }
 
     std::vector<size_t> mem_split(model.splits.size(), 0);
 
@@ -958,6 +962,9 @@ static bool llama_kv_cache_init(
 
     int n_mla = 0;
     int n_kv_active_layers = 0;
+    int n_dsv4_comp_layers = 0;
+    int n_dsv4_index_layers = 0;
+    size_t dsv4_cache_size = 0;
     const int64_t n_mtp_first_layer = hparams.n_layer - hparams.nextn_predict_layers;
     for (int i = 0; i < (int) n_layer; i++) {
         // For MTP-only context, skip KV allocation for non-MTP layers
@@ -983,6 +990,26 @@ static bool llama_kv_cache_init(
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
         ggml_tensor * s = nullptr;
+        if (model.arch == LLM_ARCH_DEEPSEEK4) {
+            const uint32_t ratio = hparams.attn_compress_ratio[i];
+            if (ratio != 0) {
+                const uint32_t n_comp = std::max<uint32_t>(1, (kv_size + ratio - 1) / ratio);
+                auto & dsv4 = cache.dsv4_layers[i];
+                dsv4.n_comp = n_comp;
+                dsv4.attn_k = ggml_new_tensor_3d(ctx, type_k, n_embd_head_k, n_comp, 1);
+                ggml_format_name(dsv4.attn_k, "cache_dsv4_attn_k_l%d", i);
+                dsv4_cache_size += ggml_nbytes(dsv4.attn_k);
+                ++n_dsv4_comp_layers;
+                if (ratio == 4) {
+                    dsv4.index_k = ggml_new_tensor_3d(ctx, type_k, hparams.indexer_head_size, n_comp, 1);
+                    ggml_format_name(dsv4.index_k, "cache_dsv4_index_k_l%d", i);
+                    dsv4_cache_size += ggml_nbytes(dsv4.index_k);
+                    ++n_dsv4_index_layers;
+                }
+                LLAMA_LOG_DEBUG("%s: DeepSeek4 compressed KV cache layer %d: ratio=%u rows=%u type=%s\n",
+                        __func__, i, ratio, n_comp, ggml_type_name(type_k));
+            }
+        }
         if (is_mla_attn && cparams.mla_attn) {
             // DeepSeek MLA
             const uint32_t n_embd_head_qk_rope = hparams.n_rot;
@@ -1150,6 +1177,10 @@ static bool llama_kv_cache_init(
         LLAMA_LOG_ERROR("%s: unexpected situation with %d out of %d active KV layers having MLA enabled\n", __func__, n_mla, n_kv_active_layers);
         LLAMA_LOG_ERROR("%s: bailing out\n", __func__);
         GGML_ABORT("fatal error");
+    }
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        LLAMA_LOG_INFO("%s: DeepSeek4 compressed KV cache size = %7.2f MiB, cache-active attn layers = %d, cache-active indexer layers = %d\n",
+                __func__, dsv4_cache_size / 1024.0 / 1024.0, n_dsv4_comp_layers, n_dsv4_index_layers);
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
