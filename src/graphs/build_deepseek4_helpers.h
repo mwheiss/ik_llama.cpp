@@ -103,3 +103,8 @@ struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow);
+
+struct ggml_tensor * llm_build_deepseek4_compressed_mask_from_topk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * scores,
+        struct ggml_tensor  * topk);

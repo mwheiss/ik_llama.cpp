@@ -84,6 +84,15 @@ static struct ggml_tensor * llm_build_deepseek4_mul_scalar(
     return ggml_reshape(ctx, x, shape);
 }
 
+static struct ggml_tensor * llm_build_deepseek4_new_filled_3d(
+        struct ggml_context * ctx,
+        int64_t               n0,
+        int64_t               n1,
+        int64_t               n2,
+        float                 value) {
+    return ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n0, n1, n2), value);
+}
+
 
 struct ggml_tensor * llm_build_deepseek4_rope_tail(
         struct ggml_context * ctx,
@@ -447,4 +456,25 @@ struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
     score = ggml_reshape_2d(ctx, score, n_comp, n_tokens);
 
     return ggml_add(ctx, score, causal_mask);
+}
+
+struct ggml_tensor * llm_build_deepseek4_compressed_mask_from_topk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * scores,
+        struct ggml_tensor  * topk) {
+    const int64_t n_comp   = scores->ne[0];
+    const int64_t n_tokens = scores->ne[1];
+
+    GGML_ASSERT(topk->type == GGML_TYPE_I32);
+    GGML_ASSERT(topk->ne[1] == n_tokens);
+
+    struct ggml_tensor * scores_rows = ggml_reshape_3d(ctx, scores, 1, n_comp, n_tokens);
+    struct ggml_tensor * selected_scores = ggml_get_rows(ctx, scores_rows, topk);
+    struct ggml_tensor * valid = ggml_step(ctx, llm_build_deepseek4_add_scalar(ctx, selected_scores, 1.0e30f));
+    struct ggml_tensor * values = llm_build_deepseek4_mul_scalar(ctx,
+            llm_build_deepseek4_add_scalar(ctx, valid, -1.0f), 1.0e9f);
+
+    struct ggml_tensor * mask = llm_build_deepseek4_new_filled_3d(ctx, 1, n_comp, n_tokens, -INFINITY);
+    mask = ggml_set_rows(ctx, mask, values, topk);
+    return ggml_reshape_2d(ctx, mask, n_comp, n_tokens);
 }

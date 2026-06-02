@@ -618,6 +618,57 @@ static void test_indexer_scores_prefill_helper() {
     ggml_free(ctx);
 }
 
+static void test_compressed_mask_from_topk_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 4 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_comp = 4;
+    constexpr int64_t n_tokens = 2;
+    constexpr int64_t top_k = 2;
+
+    ggml_tensor * scores = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_comp, n_tokens);
+    ggml_tensor * topk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, n_tokens);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t c = 0; c < n_comp; ++c) {
+            ggml_set_f32_nd(scores, c, t, 0, 0, 0.1f * (float) c);
+        }
+    }
+    ggml_set_i32_nd(topk, 0, 0, 0, 0, 2);
+    ggml_set_i32_nd(topk, 1, 0, 0, 0, 0);
+    ggml_set_i32_nd(topk, 0, 1, 0, 0, 3);
+    ggml_set_i32_nd(topk, 1, 1, 0, 0, 1);
+    ggml_set_f32_nd(scores, 1, 1, 0, 0, -INFINITY);
+
+    ggml_tensor * mask = llm_build_deepseek4_compressed_mask_from_topk(ctx, scores, topk);
+    graph_compute(ctx, mask);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t c = 0; c < n_comp; ++c) {
+            const float v = ggml_get_f32_nd(mask, c, t, 0, 0);
+            const bool selected =
+                (t == 0 && (c == 2 || c == 0)) ||
+                (t == 1 && (c == 3 || c == 1));
+            const bool invalid_selected = t == 1 && c == 1;
+
+            if (invalid_selected) {
+                assert_close(v, -1.0e9f, "compressed_mask_invalid_selected", 1.0f);
+            } else if (selected) {
+                assert_close(v, 0.0f, "compressed_mask_selected", 1.0e-6f);
+            } else if (!std::isinf(v) || v > 0.0f) {
+                fprintf(stderr, "compressed_mask_unselected: got %.9g, expected -inf\n", v);
+                std::abort();
+            }
+        }
+    }
+
+    ggml_free(ctx);
+}
+
 static float ref_rope_standard(float x0, float x1, int32_t pos, int64_t pair, int64_t n_rot, bool second) {
     const float theta_scale = std::pow(10000.0f, -2.0f / (float) n_rot);
     const float theta = (float) pos * std::pow(theta_scale, (float) pair);
@@ -686,6 +737,7 @@ int main() {
     test_grouped_out_helper();
     test_compressor_prefill_ratio4_helper();
     test_indexer_scores_prefill_helper();
+    test_compressed_mask_from_topk_helper();
     test_rope_tail_helper();
     return 0;
 }

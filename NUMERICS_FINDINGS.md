@@ -232,7 +232,7 @@ explicit gates against the cchuter F16 reference:
 
 Until those gates exist and pass, keep the forced F16 policy.
 
-## Compressed top-k mask scatter is blocked on CPU set_rows
+## Compressed top-k mask scatter exposed CPU set_rows F32 bug
 
 ### Context
 
@@ -258,9 +258,11 @@ When the retry port added a focused synthetic test for the same helper,
 SIGSEGV in ggml_compute_forward_set_rows
 ```
 
-There are no other CPU-side users of `ggml_set_rows` in this tree, so this
-would introduce an unvalidated primitive into the DSV4 path. The graph might
-build, but the helper is not compute-safe on CPU as of this finding.
+The crash was not caused by DSV4 mask semantics. The CPU `set_rows` kernel
+looked up `type_traits[dst->type].from_float` and called it unconditionally.
+For an F32 destination this converter is null, so the kernel jumped to address
+zero. The minimal fix is to copy F32 rows directly when `dst->type` is F32 and
+keep the existing converter path for non-F32 destinations.
 
 ### Why not replace it with arithmetic masking immediately?
 
@@ -278,11 +280,14 @@ into the correctness-first port without explicit numeric validation.
 
 ### Current policy
 
-Do not wire a compute path that depends on CPU `ggml_set_rows` for DSV4
-compressed masks. Continue with indexer-score/top-k graph construction, but
-stop before compressed-mask materialization until one of these is true:
+The DSV4 compressed-mask helper may use `ggml_set_rows` only while the focused
+synthetic mask test remains enabled and passing. That test verifies the cchuter
+mask polarity:
 
-1. `ggml_set_rows` CPU support is fixed and covered by a small backend test,
-2. an exact primitive decomposition for scatter-to-`-inf` masks is found, or
-3. a deliberate finite-mask approximation is evaluated against cchuter logits
-   and accepted as a documented semantic change.
+1. selected valid rows are `0`,
+2. unselected rows are `-inf`,
+3. selected invalid rows are `-1e9`.
+
+Do not replace this with a large finite unselected mask or arithmetic `-inf`
+masking unless logits-level validation against cchuter shows the change is
+safe.

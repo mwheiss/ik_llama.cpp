@@ -19082,8 +19082,14 @@ static void ggml_compute_forward_set_rows_f32(
 
                     GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
-                    from_float((const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
-                            ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                    const float * src = (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03);
+                          void  * dst_row =             ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3);
+                    if (from_float) {
+                        from_float(src, dst_row, nc);
+                    } else {
+                        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+                        memcpy(dst_row, src, nc*sizeof(float));
+                    }
                 }
             }
         }
@@ -19100,8 +19106,14 @@ static void ggml_compute_forward_set_rows_f32(
 
                     GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
-                    from_float((const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
-                            ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                    const float * src = (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03);
+                          void  * dst_row =             ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3);
+                    if (from_float) {
+                        from_float(src, dst_row, nc);
+                    } else {
+                        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+                        memcpy(dst_row, src, nc*sizeof(float));
+                    }
                 }
             }
         }
