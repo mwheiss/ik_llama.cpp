@@ -720,7 +720,60 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                                 0, n_comp_visible, 0, compress_ratio,
                                 "dsv4_decode_attn_compress_mask", il);
                     } else {
-                        throw std::runtime_error("DeepSeek V4 decode indexer top-k compressed mask not implemented yet");
+                        GGML_ASSERT(dsv4_cache.index_k != nullptr);
+                        if (n_tokens != 1) {
+                            throw std::runtime_error("DeepSeek V4 sparse multi-token decode indexer mask not implemented yet");
+                        }
+                        LLAMA_LOG_INFO("%s: DeepSeek4 decode sparse indexer mask: layer=%d ratio=%u n_comp_visible=%" PRId64
+                                " indexer_top_k=%u\n",
+                                __func__, il, compress_ratio, n_comp_visible, hparams.indexer_top_k);
+
+                        ggml_tensor * index_cache = ggml_view_3d(ctx0, dsv4_cache.index_k,
+                                hparams.indexer_head_size, 1, n_comp_visible,
+                                dsv4_cache.index_k->nb[1],
+                                dsv4_cache.index_k->nb[1],
+                                0);
+                        cb(index_cache, "dsv4_decode_index_cache", il);
+                        dsv4_log_tensor_shape("dsv4_decode_index_cache", index_cache);
+
+                        index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, n_comp_visible);
+                        cb(index_cache, "dsv4_decode_index_cache_2d", il);
+                        dsv4_log_tensor_shape("dsv4_decode_index_cache_2d", index_cache);
+
+                        ggml_tensor * index_scores = llm_build_deepseek4_indexer_scores_decode(ctx0,
+                                cur,
+                                qr,
+                                index_cache,
+                                layer.indexer_attn_q_b,
+                                layer.indexer_proj,
+                                inp_pos,
+                                hparams.indexer_n_head,
+                                hparams.indexer_head_size,
+                                n_comp_visible,
+                                n_rot,
+                                rope_type,
+                                rope_cfg.n_ctx_orig,
+                                rope_cfg.freq_base,
+                                rope_cfg.freq_scale,
+                                rope_cfg.ext_factor,
+                                rope_cfg.attn_factor,
+                                rope_cfg.beta_fast,
+                                rope_cfg.beta_slow);
+                        cb(index_scores, "indexer_scores", il);
+                        dsv4_log_tensor_shape("indexer_scores", index_scores);
+
+                        const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp_visible);
+                        ggml_tensor * sorted = ggml_argsort(ctx0, index_scores, GGML_SORT_ORDER_DESC);
+                        cb(sorted, "indexer_argsort", il);
+                        dsv4_log_tensor_shape("indexer_argsort", sorted);
+                        ggml_tensor * topk = ggml_view_2d(ctx0, sorted,
+                                top_k, n_tokens,
+                                sorted->nb[1], 0);
+                        cb(topk, "indexer_topk", il);
+                        dsv4_log_tensor_shape("indexer_topk", topk);
+                        ggml_build_forward_expand(gf, topk);
+
+                        comp_mask = llm_build_deepseek4_compressed_mask_from_topk(ctx0, index_scores, topk);
                     }
                 } else {
                     comp_mask = build_dsv4_mask_input(

@@ -1022,3 +1022,61 @@ not treat exact text equality beyond this point as a stable gate unless logits
 or token ranks are also compared. Future longer-decode work should look for
 larger cache-state or layer-local cliffs, while accepting that greedy text can
 diverge after this documented near-tie.
+
+## Sparse decode indexer score helper
+
+### Context
+
+DeepSeek4 decode uses a cheap all-visible compressed mask while the number of
+visible compressed rows is no larger than `indexer_top_k`. For the Q4 metadata
+used here, `indexer_top_k = 512` and ratio-4 layers only become truly sparse
+when:
+
+```text
+n_comp_visible = (pos + 1) / 4 > 512
+```
+
+That requires decode positions at or beyond roughly 2048 tokens. The short
+`Hello` gates exercise compressed-cache replay, but they do not enter sparse
+decode indexer scoring.
+
+### Implementation
+
+The retry port now mirrors cchuter's sparse decode branch for the score/mask
+part:
+
+1. view the cached index K rows as `[indexer_head_size, n_comp_visible]`,
+2. project the current query LoRA state with `indexer_attn_q_b`,
+3. apply the same RoPE-tail transform as cchuter,
+4. compute ReLU indexer scores over cached rows,
+5. scale by `indexer_proj(x) / sqrt(indexer_head_size * indexer_n_head)`,
+6. top-k the rows and build the existing cchuter-polarity sparse mask.
+
+No new GGML ops or kernels were added. The mask construction reuses the
+already-tested `llm_build_deepseek4_compressed_mask_from_topk` helper.
+
+### Validation
+
+The focused primitive test now checks the decode indexer score formula against
+a scalar reference on tiny deterministic tensors. The cchuter parity probe also
+compares the new ik helper against an equivalent primitive expression using
+cchuter's `ggml_dsv4_rope_tail`:
+
+```text
+indexer_scores_decode count=5 max_abs=0 mean_abs=0 max_rel=0 worst=0 ulp=0 ok
+```
+
+Existing nearby gates stayed intact:
+
+```text
+test-dsv4-primitives: pass
+Q4 Hello -n 8: pass, still reaches the known cchuter-matching prefix
+Q8 forced q8_0 KV -n 1: pass, forced-F16 KV warning still present
+```
+
+A full runtime sparse-decode model gate is intentionally deferred because it
+needs a prompt long enough to enter decode at `pos >= 2048`, which is a much
+larger CPU prefill than the current atomic helper validation. The next runtime
+gate for this path should use a long prompt or a purpose-built cache-state
+fixture and compare the sparse mask/top-k tensor directly against cchuter before
+continuing to longer text quality checks.

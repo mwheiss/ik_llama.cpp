@@ -952,6 +952,90 @@ static void test_indexer_scores_prefill_helper() {
     ggml_free(ctx);
 }
 
+static void test_indexer_scores_decode_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 8 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 4;
+    constexpr int64_t q_rank = 3;
+    constexpr int64_t n_comp = 5;
+    constexpr int64_t n_index_head = 2;
+    constexpr int64_t head_size = 2;
+    constexpr int64_t n_rot = 2;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_tensor * qr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_rank, 1);
+    ggml_tensor * index_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_size, n_comp);
+    ggml_tensor * wq_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_rank, n_index_head * head_size);
+    ggml_tensor * wproj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_index_head);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    ggml_set_i32_1d(pos, 0, 0);
+    for (int64_t e = 0; e < n_embd; ++e) {
+        ggml_set_f32_nd(x, e, 0, 0, 0, 0.12f + 0.04f * (float) e);
+    }
+    for (int64_t e = 0; e < q_rank; ++e) {
+        ggml_set_f32_nd(qr, e, 0, 0, 0, -0.08f + 0.05f * (float) e);
+    }
+    for (int64_t c = 0; c < n_comp; ++c) {
+        for (int64_t h = 0; h < head_size; ++h) {
+            ggml_set_f32_nd(index_kv, h, c, 0, 0, 0.09f * (float) (h + 1) - 0.03f * (float) c);
+        }
+    }
+    for (int64_t o = 0; o < n_index_head * head_size; ++o) {
+        for (int64_t e = 0; e < q_rank; ++e) {
+            ggml_set_f32_nd(wq_b, e, o, 0, 0, 0.025f * (float) (o + 1) - 0.015f * (float) e);
+        }
+    }
+    for (int64_t h = 0; h < n_index_head; ++h) {
+        for (int64_t e = 0; e < n_embd; ++e) {
+            ggml_set_f32_nd(wproj, e, h, 0, 0, 0.03f * (float) (e + 1) + 0.02f * (float) h);
+        }
+    }
+
+    ggml_tensor * scores = llm_build_deepseek4_indexer_scores_decode(ctx,
+            x, qr, index_kv, wq_b, wproj, pos,
+            n_index_head, head_size, n_comp, n_rot,
+            0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+    graph_compute(ctx, scores);
+
+    float q[n_index_head][head_size] = {};
+    for (int64_t ih = 0; ih < n_index_head; ++ih) {
+        for (int64_t hs = 0; hs < head_size; ++hs) {
+            const int64_t out = ih * head_size + hs;
+            for (int64_t e = 0; e < q_rank; ++e) {
+                q[ih][hs] += ggml_get_f32_nd(qr, e, 0, 0, 0) * ggml_get_f32_nd(wq_b, e, out, 0, 0);
+            }
+        }
+    }
+
+    float weights[n_index_head] = {};
+    for (int64_t ih = 0; ih < n_index_head; ++ih) {
+        for (int64_t e = 0; e < n_embd; ++e) {
+            weights[ih] += ggml_get_f32_nd(x, e, 0, 0, 0) * ggml_get_f32_nd(wproj, e, ih, 0, 0);
+        }
+        weights[ih] *= 1.0f / std::sqrt((float) (head_size * n_index_head));
+    }
+
+    for (int64_t c = 0; c < n_comp; ++c) {
+        float expected = 0.0f;
+        for (int64_t ih = 0; ih < n_index_head; ++ih) {
+            float dot = 0.0f;
+            for (int64_t hs = 0; hs < head_size; ++hs) {
+                dot += ggml_get_f32_nd(index_kv, hs, c, 0, 0) * q[ih][hs];
+            }
+            expected += std::max(0.0f, dot) * weights[ih];
+        }
+        assert_close(ggml_get_f32_nd(scores, c, 0, 0, 0), expected, "indexer_scores_decode", 1.0e-6f);
+    }
+
+    ggml_free(ctx);
+}
+
 static void test_compressed_mask_from_topk_helper() {
     ggml_init_params params = {
         /* .mem_size   = */ 4 * 1024 * 1024,
@@ -1075,6 +1159,7 @@ int main() {
     test_compressor_decode_ratio4_noncompress_helper();
     test_compressor_decode_ratio4_compress_helper();
     test_indexer_scores_prefill_helper();
+    test_indexer_scores_decode_helper();
     test_compressed_mask_from_topk_helper();
     test_rope_tail_helper();
     return 0;

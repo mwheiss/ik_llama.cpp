@@ -662,6 +662,79 @@ static void run_compressor_decode() {
     run_compressor_decode_one(7, "compressor_decode_pos7");
 }
 
+static void run_indexer_scores_decode() {
+    ggml_init_params params = { 8 * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 4;
+    constexpr int64_t q_rank = 3;
+    constexpr int64_t n_comp = 5;
+    constexpr int64_t n_index_head = 2;
+    constexpr int64_t head_size = 2;
+    constexpr int64_t n_rot = 2;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_tensor * qr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_rank, 1);
+    ggml_tensor * index_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_size, n_comp);
+    ggml_tensor * wq_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_rank, n_index_head * head_size);
+    ggml_tensor * wproj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_index_head);
+    ggml_tensor * pos = probe_arange_i32(ctx, 0, 1);
+
+    for (int64_t e = 0; e < n_embd; ++e) {
+        ggml_set_f32_nd(x, e, 0, 0, 0, 0.12f + 0.04f * (float) e);
+    }
+    for (int64_t e = 0; e < q_rank; ++e) {
+        ggml_set_f32_nd(qr, e, 0, 0, 0, -0.08f + 0.05f * (float) e);
+    }
+    for (int64_t c = 0; c < n_comp; ++c) {
+        for (int64_t h = 0; h < head_size; ++h) {
+            ggml_set_f32_nd(index_kv, h, c, 0, 0, 0.09f * (float) (h + 1) - 0.03f * (float) c);
+        }
+    }
+    for (int64_t o = 0; o < n_index_head * head_size; ++o) {
+        for (int64_t e = 0; e < q_rank; ++e) {
+            ggml_set_f32_nd(wq_b, e, o, 0, 0, 0.025f * (float) (o + 1) - 0.015f * (float) e);
+        }
+    }
+    for (int64_t h = 0; h < n_index_head; ++h) {
+        for (int64_t e = 0; e < n_embd; ++e) {
+            ggml_set_f32_nd(wproj, e, h, 0, 0, 0.03f * (float) (e + 1) + 0.02f * (float) h);
+        }
+    }
+
+#if defined(CCHUTER_ENGINE)
+    ggml_tensor * q = ggml_mul_mat(ctx, wq_b, qr);
+    q = ggml_reshape_3d(ctx, q, head_size, n_index_head, 1);
+    q = ggml_dsv4_rope_tail(ctx, q, pos, nullptr, n_rot, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, false);
+
+    ggml_tensor * k = ggml_reshape_3d(ctx, index_kv, head_size, 1, n_comp);
+    k = ggml_permute(ctx, k, 0, 2, 1, 3);
+    q = ggml_permute(ctx, q, 0, 2, 1, 3);
+
+    ggml_tensor * score = ggml_mul_mat(ctx, k, q);
+    score = ggml_relu(ctx, score);
+
+    ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x);
+    weights = ggml_scale(ctx, weights, 1.0f/std::sqrt((float) (head_size * n_index_head)));
+    weights = ggml_reshape_3d(ctx, weights, 1, n_index_head, 1);
+    weights = ggml_permute(ctx, weights, 0, 2, 1, 3);
+
+    score = ggml_mul(ctx, score, weights);
+    score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 2, 0, 3));
+    score = ggml_sum_rows(ctx, score);
+    ggml_tensor * out = ggml_reshape_2d(ctx, score, n_comp, 1);
+#else
+    ggml_tensor * out = llm_build_deepseek4_indexer_scores_decode(ctx,
+            x, qr, index_kv, wq_b, wproj, pos,
+            n_index_head, head_size, n_comp, n_rot,
+            0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+#endif
+    compute(ctx, out);
+    emit("indexer_scores_decode", out);
+    ggml_free(ctx);
+}
+
 int main() {
     run_hc_split_sinkhorn();
     run_fp8_kv_quantize();
@@ -672,6 +745,7 @@ int main() {
     run_grouped_out();
     run_compressor_prefill_state();
     run_compressor_decode();
+    run_indexer_scores_decode();
     run_rope_tail();
     return 0;
 }
@@ -784,6 +858,7 @@ expected = [
     "compressor_decode_pos7_kv_state",
     "compressor_decode_pos7_score_state",
     "compressor_decode_pos7_kv_comp",
+    "indexer_scores_decode",
     "rope_tail",
 ]
 
@@ -807,6 +882,7 @@ tolerances = {
     "compressor_decode_pos7_kv_state": 2.0e-6,
     "compressor_decode_pos7_score_state": 2.0e-6,
     "compressor_decode_pos7_kv_comp": 2.0e-6,
+    "indexer_scores_decode": 2.0e-6,
     "rope_tail": 2.0e-6,
 }
 

@@ -748,6 +748,59 @@ struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
     return ggml_add(ctx, score, causal_mask);
 }
 
+struct ggml_tensor * llm_build_deepseek4_indexer_scores_decode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * qr,
+        struct ggml_tensor  * index_kv,
+        struct ggml_tensor  * wq_b,
+        struct ggml_tensor  * wproj,
+        struct ggml_tensor  * pos,
+        int64_t               n_index_head,
+        int64_t               n_index_head_size,
+        int64_t               n_comp,
+        int64_t               n_rot,
+        int                   rope_type,
+        int32_t               n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    GGML_ASSERT(x->ne[1] == 1);
+    GGML_ASSERT(qr->ne[1] == 1);
+    GGML_ASSERT(index_kv->ne[0] == n_index_head_size);
+    GGML_ASSERT(index_kv->ne[1] == n_comp);
+    GGML_ASSERT(wq_b->ne[1] == n_index_head*n_index_head_size);
+    GGML_ASSERT(wproj->ne[1] == n_index_head);
+    GGML_ASSERT(pos->ne[0] == 1);
+
+    struct ggml_tensor * q = ggml_mul_mat(ctx, wq_b, qr);
+    q = ggml_reshape_3d(ctx, q, n_index_head_size, n_index_head, 1);
+    q = llm_build_deepseek4_rope_tail(ctx, q, pos, nullptr, n_rot, rope_type,
+            n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow, false);
+
+    struct ggml_tensor * k = ggml_reshape_3d(ctx, index_kv, n_index_head_size, 1, n_comp);
+    k = ggml_permute(ctx, k, 0, 2, 1, 3);
+    q = ggml_permute(ctx, q, 0, 2, 1, 3);
+
+    struct ggml_tensor * score = ggml_mul_mat(ctx, k, q);
+    score = ggml_relu(ctx, score);
+
+    struct ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x);
+    const float scale = 1.0f/std::sqrt((float) n_index_head_size*(float) n_index_head);
+    weights = llm_build_deepseek4_mul_scalar(ctx, weights, scale);
+    weights = ggml_reshape_3d(ctx, weights, 1, n_index_head, 1);
+    weights = ggml_permute(ctx, weights, 0, 2, 1, 3);
+
+    score = ggml_mul(ctx, score, weights);
+    score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 2, 0, 3));
+    score = ggml_sum_rows(ctx, score);
+    return ggml_reshape_2d(ctx, score, n_comp, 1);
+}
+
 struct ggml_tensor * llm_build_deepseek4_compressed_mask_from_topk(
         struct ggml_context * ctx,
         struct ggml_tensor  * scores,
