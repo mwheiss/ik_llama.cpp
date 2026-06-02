@@ -786,3 +786,60 @@ ik      ffn_out-5 sum=604.739391 first=[4.79407692, 9.46874523, 0.696503937, 2.9
 The first-token logits still do not match cchuter, so the next step is to
 continue with exact-name diagnostic filters beyond layer 5 and isolate the next
 unexplained divergence before implementing more graph changes.
+
+## DeepSeek4 MoE layer-18 tail routing drift
+
+### Finding
+
+After the routed-weight ordering fix, layers 5 through 17 stayed close enough to
+cchuter to treat the differences as accumulated implementation drift. The first
+suspicious post-fix point was the decode-token FFN/MoE at layer 18:
+
+```text
+cchuter ffn_out-18 sum=158.050339 first=[1.00673652, -1.44433689, 0.650724173, -0.228909552]
+ik      ffn_out-18 sum=146.651850 first=[1.04708195, -1.46272063, 0.591088831, -1.35625148]
+```
+
+The layer-18 FFN input, router logits, and router probabilities were close:
+
+```text
+ffn_norm-18       diff_sum=0.104626 first_max=0.0049693
+ffn_moe_logits-18 diff_sum=-0.168109 first_max=0.00253105
+ffn_moe_probs-18  diff_sum=-0.029417 first_max=0.000527739
+```
+
+However the selected expert set differed in the lower-ranked slots:
+
+```text
+cchuter ffn_moe_topk-18 sum=731 first=[83, 186, 152, 74, ...]
+ik      ffn_moe_topk-18 sum=787 first=[83, 186, 152, 74, ...]
+```
+
+The first four selected experts match; the hidden lower-rank entries differ.
+This is a routing discontinuity: very small logit/probability drift can flip
+near-tied tail experts and produce a larger routed-output delta.
+
+### Top-k primitive audit
+
+cchuter's DSV4 MoE path uses `ggml_argsort_top_k`, implemented as a full
+descending argsort followed by a view of the first k entries.
+
+ik's generic `ggml_top_k` is also argsort + view, but it sets `op_params[1] = k`,
+allowing the CPU argsort implementation to use partial sorting. A temporary
+DSV4-gated full `ggml_argsort(..., GGML_SORT_ORDER_DESC)` plus view was tested
+to rule out partial top-k as the source of the layer-18 tail expert mismatch.
+
+### Result
+
+The full-sort experiment did not change the layer-18 routed output. That means
+the layer-18 tail expert mismatch is not caused by ik's partial top-k path; it
+is a consequence of the already-present small upstream numerical drift crossing
+a close routing boundary.
+
+Because the experiment did not improve parity, the implementation keeps ik's
+optimized `ggml_top_k` path rather than forcing a slower DSV4-only full sort.
+
+This mismatch is quantified and currently treated as expected routing
+sensitivity, not as the next hard semantic bug. The remaining first-token logits
+are still far from cchuter, so continue probing later layers with exact tensor
+filters and look for the next non-local cliff.
