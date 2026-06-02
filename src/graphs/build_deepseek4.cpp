@@ -862,10 +862,8 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             } else {
                 LLAMA_LOG_INFO("%s: DeepSeek4 decode cache state unavailable: layer=%d pos=%d ratio=%u nextn_tail=%d\n",
                         __func__, il, first_pos, compress_ratio, int(il >= int(hparams.n_layer - hparams.nextn_predict_layers)));
-                throw std::runtime_error("DeepSeek V4 decode NextN/tail cache path not implemented yet");
+                throw std::runtime_error("DeepSeek V4 decode cache state unavailable");
             }
-
-            throw std::runtime_error("DeepSeek V4 decode compressed cache replay not implemented yet");
         }
 
         const int64_t n_comp = n_tokens / compress_ratio;
