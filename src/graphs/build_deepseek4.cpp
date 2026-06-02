@@ -267,6 +267,8 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
     auto build_compressed_prefix = [&](ggml_tensor * layer_inp, int il) {
         const auto & layer = model.layers[il];
+        const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
+        GGML_ASSERT(compress_ratio == 4 || compress_ratio == 128);
         GGML_ASSERT(layer.hc_attn_fn != nullptr);
         GGML_ASSERT(layer.hc_attn_scale != nullptr);
         GGML_ASSERT(layer.hc_attn_base != nullptr);
@@ -280,9 +282,13 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         GGML_ASSERT(layer.attn_compressor_gate != nullptr);
         GGML_ASSERT(layer.attn_compressor_ape != nullptr);
         GGML_ASSERT(layer.attn_compressor_norm != nullptr);
+        if (compress_ratio == 4) {
+            GGML_ASSERT(layer.indexer_compressor_kv != nullptr);
+            GGML_ASSERT(layer.indexer_compressor_gate != nullptr);
+            GGML_ASSERT(layer.indexer_compressor_ape != nullptr);
+            GGML_ASSERT(layer.indexer_compressor_norm != nullptr);
+        }
 
-        const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
-        GGML_ASSERT(compress_ratio == 4 || compress_ratio == 128);
         const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
 
         LLAMA_LOG_INFO("%s: DeepSeek4 compressed graph prefix: layer=%d ratio=%u n_embd=%" PRId64
@@ -374,6 +380,31 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             cb(kv_comp, "KVcompress", il);
             dsv4_log_tensor_shape("KVcompress", kv_comp);
             ggml_build_forward_expand(gf, kv_comp);
+
+            if (compress_ratio == 4) {
+                ggml_tensor * index_kv = llm_build_deepseek4_compressor_prefill(ctx0,
+                        cur,
+                        layer.indexer_compressor_kv,
+                        layer.indexer_compressor_gate,
+                        layer.indexer_compressor_ape,
+                        layer.indexer_compressor_norm,
+                        comp_pos,
+                        hparams.indexer_head_size,
+                        n_rot,
+                        compress_ratio,
+                        rope_type,
+                        rope_cfg.n_ctx_orig,
+                        rope_cfg.freq_base,
+                        rope_cfg.freq_scale,
+                        rope_cfg.ext_factor,
+                        rope_cfg.attn_factor,
+                        rope_cfg.beta_fast,
+                        rope_cfg.beta_slow,
+                        norm_rms_eps);
+                cb(index_kv, "indexer_KVcompress", il);
+                dsv4_log_tensor_shape("indexer_KVcompress", index_kv);
+                ggml_build_forward_expand(gf, index_kv);
+            }
         }
     };
 
@@ -383,7 +414,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             LLAMA_LOG_INFO("%s: DeepSeek4 graph slice: reached compressed layer %d, ratio=%u\n",
                     __func__, il, compress_ratio);
             build_compressed_prefix(inpL, il);
-            throw std::runtime_error("DeepSeek V4 compressed KV cache/indexer graph segment not implemented yet");
+            throw std::runtime_error("DeepSeek V4 indexer scoring graph segment not implemented yet");
         }
 
         inpL = build_local_layer(inpL, il);
