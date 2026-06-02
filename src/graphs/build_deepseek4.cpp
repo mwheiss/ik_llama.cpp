@@ -444,6 +444,11 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                 cb(topk, "indexer_topk", il);
                 dsv4_log_tensor_shape("indexer_topk", topk);
                 ggml_build_forward_expand(gf, topk);
+
+                ggml_tensor * comp_mask = llm_build_deepseek4_compressed_mask_from_topk(ctx0, index_scores, topk);
+                cb(comp_mask, "dsv4_attn_compress_mask", il);
+                dsv4_log_tensor_shape("dsv4_attn_compress_mask", comp_mask);
+                ggml_build_forward_expand(gf, comp_mask);
             }
         }
     };
@@ -454,7 +459,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             LLAMA_LOG_INFO("%s: DeepSeek4 graph slice: reached compressed layer %d, ratio=%u\n",
                     __func__, il, compress_ratio);
             build_compressed_prefix(inpL, il);
-            throw std::runtime_error("DeepSeek V4 compressed top-k mask graph segment not implemented yet");
+            throw std::runtime_error("DeepSeek V4 compressed attention composition graph segment not implemented yet");
         }
 
         inpL = build_local_layer(inpL, il);
