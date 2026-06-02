@@ -105,6 +105,22 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         return t;
     };
 
+    auto pad_dsv4_mask_cols = [&](ggml_tensor * mask, int64_t n_cols, const char * name, int il) {
+        GGML_ASSERT(mask != nullptr);
+        GGML_ASSERT(mask->type == GGML_TYPE_F32);
+        GGML_ASSERT(mask->ne[1] <= n_cols);
+        if (mask->ne[1] == n_cols) {
+            return mask;
+        }
+
+        ggml_tensor * padded = ggml_fill(ctx0,
+                ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, mask->ne[0], n_cols), -INFINITY);
+        padded = ggml_set_2d_inplace(ctx0, padded, mask, padded->nb[1], 0);
+        cb(padded, name, il);
+        dsv4_log_tensor_shape(name, padded);
+        return padded;
+    };
+
     auto store_dsv4_cache_rows = [&](ggml_tensor * cache, ggml_tensor * src, int64_t row_start, int64_t n_rows) {
         if (cache == nullptr || src == nullptr || n_rows <= 0) {
             return;
@@ -782,6 +798,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                             0, n_comp_visible, 0, compress_ratio,
                             "dsv4_decode_attn_compress_mask", il);
                 }
+                comp_mask = pad_dsv4_mask_cols(comp_mask, n_tokens_attn, "dsv4_decode_attn_compress_mask_padded", il);
                 cb(comp_mask, "dsv4_decode_attn_compress_mask", il);
                 dsv4_log_tensor_shape("dsv4_decode_attn_compress_mask", comp_mask);
 

@@ -1055,6 +1055,13 @@ part:
 No new GGML ops or kernels were added. The mask construction reuses the
 already-tested `llm_build_deepseek4_compressed_mask_from_topk` helper.
 
+One ik-specific shape detail matters in decode: the raw/SWA decode mask is
+padded to `GGML_KQ_MASK_PAD` columns for CPU FlashAttention. Sparse top-k masks
+are naturally produced with only the logical decode token count, so the retry
+port pads those masks with `-inf` columns before concatenating raw and
+compressed mask rows. This preserves cchuter mask polarity while matching ik's
+FlashAttention mask shape requirement.
+
 ### Validation
 
 The focused primitive test now checks the decode indexer score formula against
