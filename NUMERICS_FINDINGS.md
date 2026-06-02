@@ -409,3 +409,30 @@ Future work can revisit cchuter's CPY-view dependency idiom if GPU or
 multi-device scheduling is added to the ik DeepSeek4 path. For the current CPU
 reference path, `ggml_set_2d_inplace` is numerically equivalent and covered by
 cross-engine parity tests.
+
+## Decode compressor graph boundary is not yet runtime-position validation
+
+The first ik graph wiring for decode compressor state updates reaches the
+intentional boundary:
+
+```text
+DeepSeek V4 decode compressed cache replay not implemented yet
+```
+
+Both Q4 and Q8 smokes log the expected decode state tensor shapes for metadata
+layer 2 and Q8 still logs the forced-F16 KV warning. However, the smoke reaches
+this boundary with the graph-build scalar position logged as `pos=0`.
+
+This appears to be ik's current graph-build/reserve path, not a verified
+post-prefill runtime decode position. Therefore this step validates only:
+
+- helper-level decode state math against cchuter,
+- graph construction of the state update tensors,
+- cache-state shape/offset plumbing,
+- preservation of existing prefill-logits behavior before the boundary.
+
+It does not yet validate real generated-token decode replay. The next cache
+replay step must determine whether ik should derive the decode compressor
+position from a runtime input, from `kv_head`, or from a graph-build batch
+position in the same way the shared KV cache path does. Do not treat the current
+`pos=0` smoke as first-token numerical correctness.

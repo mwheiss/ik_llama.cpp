@@ -139,6 +139,17 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_flat, dst_flat));
     };
 
+    auto view_dsv4_state_segment = [&](ggml_tensor * cache, int64_t elem_offset, int64_t width, int64_t rows) {
+        GGML_ASSERT(cache != nullptr);
+        GGML_ASSERT(cache->type == GGML_TYPE_F32);
+        GGML_ASSERT(elem_offset >= 0);
+        GGML_ASSERT(elem_offset + width * rows <= cache->ne[0]);
+        return ggml_view_2d(ctx0, cache,
+                width, rows,
+                width * ggml_element_size(cache),
+                elem_offset * ggml_element_size(cache));
+    };
+
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
@@ -479,7 +490,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, kv, n_tokens, kv_head, cb, il);
         }
 
-        if (il < (int) kv_self.dsv4_layers.size()) {
+        if (n_tokens > 1 && il < (int) kv_self.dsv4_layers.size()) {
             auto & dsv4_cache = kv_self.dsv4_layers[il];
             if (dsv4_cache.kv_state != nullptr && dsv4_cache.score_state != nullptr) {
                 const auto attn_layout = dsv4_state_layout(compress_ratio, n_embd_head_k);
@@ -518,6 +529,109 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                     store_dsv4_state_segment(dsv4_cache.score_state, index_state.score, attn_layout.elems);
                 }
             }
+        }
+
+        if (n_tokens == 1 && il < (int) kv_self.dsv4_layers.size()) {
+            auto & dsv4_cache = kv_self.dsv4_layers[il];
+            if (dsv4_cache.kv_state != nullptr && dsv4_cache.score_state != nullptr) {
+                const llama_pos first_pos = batch.pos ? batch.pos[0] : batch.all_pos_0;
+                const int64_t n_comp_before  = first_pos / compress_ratio;
+                const int64_t n_comp_visible = (first_pos + 1) / compress_ratio;
+                GGML_ASSERT(n_comp_visible <= dsv4_cache.n_comp);
+
+                const auto attn_layout = dsv4_state_layout(compress_ratio, n_embd_head_k);
+                ggml_tensor * prev_attn_kv_state = view_dsv4_state_segment(
+                        dsv4_cache.kv_state, 0, attn_layout.width, attn_layout.rows);
+                ggml_tensor * prev_attn_score_state = view_dsv4_state_segment(
+                        dsv4_cache.score_state, 0, attn_layout.width, attn_layout.rows);
+
+                llm_deepseek4_decode_compressor dec = llm_build_deepseek4_compressor_decode(ctx0,
+                        cur,
+                        prev_attn_kv_state,
+                        prev_attn_score_state,
+                        layer.attn_compressor_kv,
+                        layer.attn_compressor_gate,
+                        layer.attn_compressor_ape,
+                        layer.attn_compressor_norm,
+                        n_embd_head_k,
+                        n_rot,
+                        first_pos,
+                        compress_ratio,
+                        rope_type,
+                        rope_cfg.n_ctx_orig,
+                        rope_cfg.freq_base,
+                        rope_cfg.freq_scale,
+                        rope_cfg.ext_factor,
+                        rope_cfg.attn_factor,
+                        rope_cfg.beta_fast,
+                        rope_cfg.beta_slow,
+                        norm_rms_eps);
+                cb(dec.kv_state,    "dsv4_attn_kv_state_decode",    il);
+                cb(dec.score_state, "dsv4_attn_score_state_decode", il);
+                dsv4_log_tensor_shape("dsv4_attn_kv_state_decode",    dec.kv_state);
+                dsv4_log_tensor_shape("dsv4_attn_score_state_decode", dec.score_state);
+                store_dsv4_state_segment(dsv4_cache.kv_state,    dec.kv_state,    0);
+                store_dsv4_state_segment(dsv4_cache.score_state, dec.score_state, 0);
+
+                if (dec.kv_comp != nullptr) {
+                    GGML_ASSERT(n_comp_visible > n_comp_before);
+                    ggml_tensor * kv_comp = ggml_dsv4_fp8_kv_quantize(ctx0, dec.kv_comp, n_rot);
+                    cb(kv_comp, "dsv4_attn_kv_comp_decode", il);
+                    dsv4_log_tensor_shape("dsv4_attn_kv_comp_decode", kv_comp);
+                    store_dsv4_cache_rows(dsv4_cache.attn_k, kv_comp, n_comp_before, n_comp_visible - n_comp_before);
+                }
+
+                if (compress_ratio == 4) {
+                    const auto index_layout = dsv4_state_layout(compress_ratio, hparams.indexer_head_size);
+                    GGML_ASSERT(attn_layout.elems + index_layout.elems <= hparams.dsv4_state_size);
+
+                    ggml_tensor * prev_index_kv_state = view_dsv4_state_segment(
+                            dsv4_cache.kv_state, attn_layout.elems, index_layout.width, index_layout.rows);
+                    ggml_tensor * prev_index_score_state = view_dsv4_state_segment(
+                            dsv4_cache.score_state, attn_layout.elems, index_layout.width, index_layout.rows);
+
+                    llm_deepseek4_decode_compressor index_dec = llm_build_deepseek4_compressor_decode(ctx0,
+                            cur,
+                            prev_index_kv_state,
+                            prev_index_score_state,
+                            layer.indexer_compressor_kv,
+                            layer.indexer_compressor_gate,
+                            layer.indexer_compressor_ape,
+                            layer.indexer_compressor_norm,
+                            hparams.indexer_head_size,
+                            n_rot,
+                            first_pos,
+                            compress_ratio,
+                            rope_type,
+                            rope_cfg.n_ctx_orig,
+                            rope_cfg.freq_base,
+                            rope_cfg.freq_scale,
+                            rope_cfg.ext_factor,
+                            rope_cfg.attn_factor,
+                            rope_cfg.beta_fast,
+                            rope_cfg.beta_slow,
+                            norm_rms_eps);
+                    cb(index_dec.kv_state,    "dsv4_index_kv_state_decode",    il);
+                    cb(index_dec.score_state, "dsv4_index_score_state_decode", il);
+                    dsv4_log_tensor_shape("dsv4_index_kv_state_decode",    index_dec.kv_state);
+                    dsv4_log_tensor_shape("dsv4_index_score_state_decode", index_dec.score_state);
+                    store_dsv4_state_segment(dsv4_cache.kv_state,    index_dec.kv_state,    attn_layout.elems);
+                    store_dsv4_state_segment(dsv4_cache.score_state, index_dec.score_state, attn_layout.elems);
+
+                    if (index_dec.kv_comp != nullptr) {
+                        GGML_ASSERT(n_comp_visible > n_comp_before);
+                        cb(index_dec.kv_comp, "dsv4_index_kv_comp_decode", il);
+                        dsv4_log_tensor_shape("dsv4_index_kv_comp_decode", index_dec.kv_comp);
+                        store_dsv4_cache_rows(dsv4_cache.index_k, index_dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before);
+                    }
+                }
+
+                LLAMA_LOG_INFO("%s: DeepSeek4 decode compressor state update: layer=%d pos=%d ratio=%u n_comp_before=%" PRId64
+                        " n_comp_visible=%" PRId64 " n_comp_cache=%u\n",
+                        __func__, il, first_pos, compress_ratio, n_comp_before, n_comp_visible, dsv4_cache.n_comp);
+            }
+
+            throw std::runtime_error("DeepSeek V4 decode compressed cache replay not implemented yet");
         }
 
         const int64_t n_comp = n_tokens / compress_ratio;
