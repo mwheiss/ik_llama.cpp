@@ -996,6 +996,11 @@ static bool llama_kv_cache_init(
                 const uint32_t n_comp = std::max<uint32_t>(1, (kv_size + ratio - 1) / ratio);
                 auto & dsv4 = cache.dsv4_layers[i];
                 dsv4.n_comp = n_comp;
+                dsv4.kv_state    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.dsv4_state_size, 1);
+                dsv4.score_state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.dsv4_state_size, 1);
+                ggml_format_name(dsv4.kv_state,    "cache_dsv4_kv_state_l%d", i);
+                ggml_format_name(dsv4.score_state, "cache_dsv4_score_state_l%d", i);
+                dsv4_cache_size += ggml_nbytes(dsv4.kv_state) + ggml_nbytes(dsv4.score_state);
                 dsv4.attn_k = ggml_new_tensor_3d(ctx, type_k, n_embd_head_k, n_comp, 1);
                 ggml_format_name(dsv4.attn_k, "cache_dsv4_attn_k_l%d", i);
                 dsv4_cache_size += ggml_nbytes(dsv4.attn_k);

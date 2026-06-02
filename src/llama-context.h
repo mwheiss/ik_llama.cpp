@@ -80,6 +80,8 @@ struct llama_kv_cache {
         uint32_t n_comp = 0;
         struct ggml_tensor * attn_k  = nullptr;
         struct ggml_tensor * index_k = nullptr;
+        struct ggml_tensor * kv_state    = nullptr;
+        struct ggml_tensor * score_state = nullptr;
     };
     std::vector<dsv4_layer_cache> dsv4_layers;
 
