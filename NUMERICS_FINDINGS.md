@@ -352,3 +352,60 @@ mask polarity:
 Do not replace this with a large finite unselected mask or arithmetic `-inf`
 masking unless logits-level validation against cchuter shows the change is
 safe.
+
+## Decode compressor state row update uses ik SET instead of cchuter CPY view
+
+### Context
+
+cchuter's DeepSeek4 decode compressor updates one row of the flat compressor
+state, then returns a full-state view that depends on the row-copy operation.
+That state is later consumed by pooling, shifted overlap-state construction, and
+state-cache storage.
+
+### Observed ik behavior
+
+The direct cchuter idiom:
+
+```c++
+row_view = ggml_view_2d(dst, ...);
+cpy      = ggml_cpy(row_src, row_view);
+state    = ggml_view_tensor(dst);
+state->src[0] = cpy;
+```
+
+triggered `ggml_compute_forward_dup` aborts in the focused ik helper test when
+the dependency view/copy appeared in the small standalone graph. This is not a
+numeric disagreement in DeepSeek4 math; it is an ik/GGML graph plumbing
+difference around destination-view CPY execution.
+
+### Current implementation
+
+The retry port uses ik's structured row update primitive for this CPU-only
+bring-up:
+
+```c++
+state = ggml_set_2d_inplace(ctx, prev_state, row_src,
+        prev_state->nb[1], row * prev_state->nb[1]);
+```
+
+The helper parity harness compares the resulting state and emitted compressed
+KV against a cchuter-shaped reference for:
+
+- ratio-4 decode position 5, where no compressed KV row is emitted,
+- ratio-4 decode position 7, where the helper emits one compressed KV row and
+  shifts the overlap state.
+
+Both cases are exact in the current parity harness.
+
+### Position tensor note
+
+The decode helper originally constructed the single compression position as
+`ggml_arange(...)->ggml_cast(I32)`. In the focused test this reached an ik
+F32-to-I32 CPY path that is not suitable for this use. Decode compression uses a
+known scalar position at graph-build time, so the helper now creates a direct
+I32 tensor and fills it with `ggml_set_i32_1d`.
+
+Future work can revisit cchuter's CPY-view dependency idiom if GPU or
+multi-device scheduling is added to the ik DeepSeek4 path. For the current CPU
+reference path, `ggml_set_2d_inplace` is numerically equivalent and covered by
+cross-engine parity tests.

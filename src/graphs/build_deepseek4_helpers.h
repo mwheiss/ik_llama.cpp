@@ -15,6 +15,12 @@ struct llm_deepseek4_state_pair {
     struct ggml_tensor * score;
 };
 
+struct llm_deepseek4_decode_compressor {
+    struct ggml_tensor * kv_state;
+    struct ggml_tensor * score_state;
+    struct ggml_tensor * kv_comp;
+};
+
 struct ggml_tensor * llm_build_deepseek4_rope_tail(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -108,6 +114,29 @@ struct llm_deepseek4_state_pair llm_build_deepseek4_compressor_prefill_state(
         struct ggml_tensor  * ape,
         int64_t               n_embd_head,
         int64_t               compress_ratio);
+
+struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * prev_kv_state,
+        struct ggml_tensor  * prev_score_state,
+        struct ggml_tensor  * wkv,
+        struct ggml_tensor  * wgate,
+        struct ggml_tensor  * ape,
+        struct ggml_tensor  * norm,
+        int64_t               n_embd_head,
+        int64_t               n_rot,
+        int64_t               pos,
+        int64_t               compress_ratio,
+        int                   rope_type,
+        int32_t               n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 norm_eps);
 
 struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
         struct ggml_context * ctx,

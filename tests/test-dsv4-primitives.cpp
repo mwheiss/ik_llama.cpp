@@ -676,6 +676,187 @@ static void test_compressor_prefill_state_ratio4_helper() {
     ggml_free(ctx);
 }
 
+static void init_decode_compressor_case(
+        ggml_tensor * x,
+        ggml_tensor * prev_kv_state,
+        ggml_tensor * prev_score_state,
+        ggml_tensor * wkv,
+        ggml_tensor * wgate,
+        ggml_tensor * ape,
+        ggml_tensor * norm) {
+    constexpr int64_t n_embd = 2;
+    constexpr int64_t head_dim = 2;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t width = 2 * head_dim;
+    constexpr int64_t rows = 2 * ratio;
+
+    ggml_set_f32_nd(x, 0, 0, 0, 0, 1.25f);
+    ggml_set_f32_nd(x, 1, 0, 0, 0, -0.5f);
+
+    for (int64_t i = 0; i < n_embd; ++i) {
+        for (int64_t o = 0; o < width; ++o) {
+            ggml_set_f32_nd(wkv, i, o, 0, 0, 0.0f);
+            ggml_set_f32_nd(wgate, i, o, 0, 0, 0.0f);
+        }
+    }
+    ggml_set_f32_nd(wkv, 0, 0, 0, 0, 1.0f);
+    ggml_set_f32_nd(wkv, 1, 1, 0, 0, 1.0f);
+    ggml_set_f32_nd(wkv, 0, 2, 0, 0, 1.0f);
+    ggml_set_f32_nd(wkv, 1, 2, 0, 0, 1.0f);
+    ggml_set_f32_nd(wkv, 0, 3, 0, 0, 2.0f);
+    ggml_set_f32_nd(wkv, 1, 3, 0, 0, -1.0f);
+
+    ggml_set_f32_nd(wgate, 0, 0, 0, 0, 2.0f);
+    ggml_set_f32_nd(wgate, 1, 1, 0, 0, 3.0f);
+    ggml_set_f32_nd(wgate, 0, 2, 0, 0, 1.0f);
+    ggml_set_f32_nd(wgate, 1, 2, 0, 0, -1.0f);
+    ggml_set_f32_nd(wgate, 0, 3, 0, 0, -1.0f);
+    ggml_set_f32_nd(wgate, 1, 3, 0, 0, 0.5f);
+
+    for (int64_t c = 0; c < ratio; ++c) {
+        for (int64_t r = 0; r < width; ++r) {
+            ggml_set_f32_nd(ape, r, c, 0, 0, 0.01f * (float) r + 0.1f * (float) c);
+        }
+    }
+    for (int64_t r = 0; r < head_dim; ++r) {
+        ggml_set_f32_1d(norm, r, 1.0f);
+    }
+
+    for (int64_t c = 0; c < rows; ++c) {
+        for (int64_t r = 0; r < width; ++r) {
+            ggml_set_f32_nd(prev_kv_state, r, c, 0, 0, 100.0f + 10.0f * (float) c + (float) r);
+            ggml_set_f32_nd(prev_score_state, r, c, 0, 0, -100.0f - 10.0f * (float) c - (float) r);
+        }
+    }
+}
+
+static void expected_decode_projection(float * kv, float * score, int64_t pos_mod) {
+    const float x0 = 1.25f;
+    const float x1 = -0.5f;
+    kv[0] = x0;
+    kv[1] = x1;
+    kv[2] = x0 + x1;
+    kv[3] = 2.0f * x0 - x1;
+
+    score[0] = 2.0f * x0;
+    score[1] = 3.0f * x1;
+    score[2] = x0 - x1;
+    score[3] = -x0 + 0.5f * x1;
+    for (int64_t r = 0; r < 4; ++r) {
+        score[r] += 0.01f * (float) r + 0.1f * (float) pos_mod;
+    }
+}
+
+static void test_compressor_decode_ratio4_noncompress_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 8 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 2;
+    constexpr int64_t head_dim = 2;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t width = 2 * head_dim;
+    constexpr int64_t rows = 2 * ratio;
+    constexpr int64_t pos = 5;
+    constexpr int64_t row = ratio + (pos % ratio);
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_tensor * prev_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    ggml_tensor * prev_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    ggml_tensor * wkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * wgate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * ape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, ratio);
+    ggml_tensor * norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+    init_decode_compressor_case(x, prev_kv, prev_score, wkv, wgate, ape, norm);
+
+    llm_deepseek4_decode_compressor dec = llm_build_deepseek4_compressor_decode(
+            ctx, x, prev_kv, prev_score, wkv, wgate, ape, norm,
+            head_dim, 2, pos, ratio, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0e-6f);
+    if (dec.kv_comp != nullptr) {
+        fprintf(stderr, "compressor_decode noncompress: unexpected kv_comp\n");
+        std::abort();
+    }
+    graph_compute(ctx, ggml_sum(ctx, dec.kv_state));
+    graph_compute(ctx, ggml_sum(ctx, dec.score_state));
+
+    float kv_ref[4];
+    float score_ref[4];
+    expected_decode_projection(kv_ref, score_ref, pos % ratio);
+    for (int64_t c = 0; c < rows; ++c) {
+        for (int64_t r = 0; r < width; ++r) {
+            const float expected_kv = c == row ? kv_ref[r] : 100.0f + 10.0f * (float) c + (float) r;
+            const float expected_sc = c == row ? score_ref[r] : -100.0f - 10.0f * (float) c - (float) r;
+            assert_close(ggml_get_f32_nd(dec.kv_state, r, c, 0, 0), expected_kv, "decode_state_noncompress_kv", 1.0e-6f);
+            assert_close(ggml_get_f32_nd(dec.score_state, r, c, 0, 0), expected_sc, "decode_state_noncompress_score", 1.0e-6f);
+        }
+    }
+
+    ggml_free(ctx);
+}
+
+static void test_compressor_decode_ratio4_compress_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 16 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 2;
+    constexpr int64_t head_dim = 2;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t width = 2 * head_dim;
+    constexpr int64_t rows = 2 * ratio;
+    constexpr int64_t pos = 7;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_tensor * prev_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    ggml_tensor * prev_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    ggml_tensor * wkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * wgate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * ape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, ratio);
+    ggml_tensor * norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+    init_decode_compressor_case(x, prev_kv, prev_score, wkv, wgate, ape, norm);
+
+    llm_deepseek4_decode_compressor dec = llm_build_deepseek4_compressor_decode(
+            ctx, x, prev_kv, prev_score, wkv, wgate, ape, norm,
+            head_dim, 2, pos, ratio, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0e-6f);
+    if (dec.kv_comp == nullptr || dec.kv_comp->ne[0] != head_dim || dec.kv_comp->ne[1] != 1 || dec.kv_comp->ne[2] != 1) {
+        fprintf(stderr, "compressor_decode compress: bad kv_comp shape\n");
+        std::abort();
+    }
+    graph_compute(ctx, dec.kv_state);
+    graph_compute(ctx, dec.score_state);
+    graph_compute(ctx, dec.kv_comp);
+
+    float kv_ref[4];
+    float score_ref[4];
+    expected_decode_projection(kv_ref, score_ref, pos % ratio);
+    for (int64_t c = 0; c < rows; ++c) {
+        const int64_t shifted_c = 4 + (c % 4);
+        for (int64_t r = 0; r < width; ++r) {
+            const float expected_kv = shifted_c == 7 ? kv_ref[r] : 100.0f + 10.0f * (float) shifted_c + (float) r;
+            const float expected_sc = shifted_c == 7 ? score_ref[r] : -100.0f - 10.0f * (float) shifted_c - (float) r;
+            assert_close(ggml_get_f32_nd(dec.kv_state, r, c, 0, 0), expected_kv, "decode_state_compress_kv", 1.0e-6f);
+            assert_close(ggml_get_f32_nd(dec.score_state, r, c, 0, 0), expected_sc, "decode_state_compress_score", 1.0e-6f);
+        }
+    }
+    for (int64_t i = 0; i < ggml_nelements(dec.kv_comp); ++i) {
+        const float v = ggml_get_f32_1d(dec.kv_comp, i);
+        if (!std::isfinite(v)) {
+            fprintf(stderr, "compressor_decode compress: non-finite kv_comp[%lld] = %.9g\n", (long long) i, v);
+            std::abort();
+        }
+    }
+
+    ggml_free(ctx);
+}
+
 static void test_indexer_scores_prefill_helper() {
     ggml_init_params params = {
         /* .mem_size   = */ 8 * 1024 * 1024,
@@ -891,6 +1072,8 @@ int main() {
     test_grouped_out_helper();
     test_compressor_prefill_ratio4_helper();
     test_compressor_prefill_state_ratio4_helper();
+    test_compressor_decode_ratio4_noncompress_helper();
+    test_compressor_decode_ratio4_compress_helper();
     test_indexer_scores_prefill_helper();
     test_compressed_mask_from_topk_helper();
     test_rope_tail_helper();

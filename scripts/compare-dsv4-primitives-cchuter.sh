@@ -41,6 +41,7 @@ cat > "$PROBE_SRC" <<'CPP'
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 static void compute(ggml_context * ctx, ggml_tensor * out) {
@@ -73,6 +74,55 @@ static void emit(const char * name, ggml_tensor * t) {
 
 static ggml_tensor * new_filled_2d(ggml_context * ctx, int64_t n0, int64_t n1, float value) {
     return ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n0, n1), value);
+}
+
+static ggml_tensor * probe_arange_i32(ggml_context * ctx, int64_t begin, int64_t end) {
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, end - begin);
+    for (int64_t i = begin; i < end; ++i) {
+        ggml_set_i32_1d(t, i - begin, (int32_t) i);
+    }
+    return t;
+}
+
+static ggml_tensor * probe_view_cols(
+        ggml_context * ctx,
+        ggml_tensor  * x,
+        int64_t        n0,
+        int64_t        n1,
+        int64_t        off0,
+        int64_t        off1) {
+    return ggml_view_2d(ctx, x, n0, n1, x->nb[1], off1*x->nb[1] + off0*x->nb[0]);
+}
+
+static ggml_tensor * probe_softmax_pool_ratio(ggml_context * ctx, ggml_tensor * kv, ggml_tensor * score) {
+    score = ggml_soft_max(ctx, score);
+    ggml_tensor * pooled = ggml_mul(ctx, kv, score);
+    pooled = ggml_sum_rows(ctx, pooled);
+    return ggml_reshape_2d(ctx, pooled, kv->ne[1], kv->ne[2]);
+}
+
+static ggml_tensor * probe_pool_decode_state(
+        ggml_context * ctx,
+        ggml_tensor  * kv,
+        ggml_tensor  * score,
+        ggml_tensor  * norm,
+        ggml_tensor  * pos,
+        int64_t        head_dim,
+        int64_t        n_rot) {
+    const int64_t n_rows = kv->ne[1];
+    kv    = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, kv)),    n_rows, head_dim, 1);
+    score = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, score)), n_rows, head_dim, 1);
+    ggml_tensor * pooled = probe_softmax_pool_ratio(ctx, kv, score);
+    pooled = ggml_rms_norm(ctx, pooled, 1.0e-6f);
+    pooled = ggml_mul(ctx, pooled, norm);
+    pooled = ggml_reshape_3d(ctx, pooled, head_dim, 1, 1);
+#if defined(CCHUTER_ENGINE)
+    return ggml_dsv4_rope_tail(ctx, pooled, pos, nullptr, n_rot, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, false);
+#else
+    return llm_build_deepseek4_rope_tail(ctx, pooled, pos, nullptr, n_rot, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, false);
+#endif
 }
 
 static void run_hc_split_sinkhorn() {
@@ -491,6 +541,127 @@ static void run_compressor_prefill_state() {
     ggml_free(ctx);
 }
 
+static void init_decode_case(
+        ggml_tensor * x,
+        ggml_tensor * prev_kv_state,
+        ggml_tensor * prev_score_state,
+        ggml_tensor * wkv,
+        ggml_tensor * wgate,
+        ggml_tensor * ape,
+        ggml_tensor * norm) {
+    constexpr int64_t n_embd = 2;
+    constexpr int64_t head_dim = 2;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t width = 2 * head_dim;
+    constexpr int64_t rows = 2 * ratio;
+
+    ggml_set_f32_nd(x, 0, 0, 0, 0, 1.25f);
+    ggml_set_f32_nd(x, 1, 0, 0, 0, -0.5f);
+
+    for (int64_t i = 0; i < n_embd; ++i) {
+        for (int64_t o = 0; o < width; ++o) {
+            ggml_set_f32_nd(wkv, i, o, 0, 0, 0.0f);
+            ggml_set_f32_nd(wgate, i, o, 0, 0, 0.0f);
+        }
+    }
+    ggml_set_f32_nd(wkv, 0, 0, 0, 0, 1.0f);
+    ggml_set_f32_nd(wkv, 1, 1, 0, 0, 1.0f);
+    ggml_set_f32_nd(wkv, 0, 2, 0, 0, 1.0f);
+    ggml_set_f32_nd(wkv, 1, 2, 0, 0, 1.0f);
+    ggml_set_f32_nd(wkv, 0, 3, 0, 0, 2.0f);
+    ggml_set_f32_nd(wkv, 1, 3, 0, 0, -1.0f);
+
+    ggml_set_f32_nd(wgate, 0, 0, 0, 0, 2.0f);
+    ggml_set_f32_nd(wgate, 1, 1, 0, 0, 3.0f);
+    ggml_set_f32_nd(wgate, 0, 2, 0, 0, 1.0f);
+    ggml_set_f32_nd(wgate, 1, 2, 0, 0, -1.0f);
+    ggml_set_f32_nd(wgate, 0, 3, 0, 0, -1.0f);
+    ggml_set_f32_nd(wgate, 1, 3, 0, 0, 0.5f);
+
+    for (int64_t c = 0; c < ratio; ++c) {
+        for (int64_t r = 0; r < width; ++r) {
+            ggml_set_f32_nd(ape, r, c, 0, 0, 0.01f * (float) r + 0.1f * (float) c);
+        }
+    }
+    for (int64_t r = 0; r < head_dim; ++r) {
+        ggml_set_f32_1d(norm, r, 1.0f);
+    }
+    for (int64_t c = 0; c < rows; ++c) {
+        for (int64_t r = 0; r < width; ++r) {
+            ggml_set_f32_nd(prev_kv_state, r, c, 0, 0, 100.0f + 10.0f * (float) c + (float) r);
+            ggml_set_f32_nd(prev_score_state, r, c, 0, 0, -100.0f - 10.0f * (float) c - (float) r);
+        }
+    }
+}
+
+static void run_compressor_decode_one(int64_t pos, const char * prefix) {
+    ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 2;
+    constexpr int64_t head_dim = 2;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t width = 2 * head_dim;
+    constexpr int64_t rows = 2 * ratio;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_tensor * prev_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    ggml_tensor * prev_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    ggml_tensor * wkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * wgate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * ape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, ratio);
+    ggml_tensor * norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+    init_decode_case(x, prev_kv, prev_score, wkv, wgate, ape, norm);
+
+#if defined(CCHUTER_ENGINE)
+    const int64_t pos_mod = pos % ratio;
+    const int64_t row = ratio + pos_mod;
+    ggml_tensor * kv_cur = ggml_mul_mat(ctx, wkv, x);
+    ggml_tensor * sc_cur = ggml_mul_mat(ctx, wgate, x);
+    sc_cur = ggml_add(ctx, sc_cur, ggml_view_2d(ctx, ape, width, 1, ape->nb[1], pos_mod*ape->nb[1]));
+    ggml_tensor * kv_state = ggml_set_2d_inplace(ctx, prev_kv, kv_cur, prev_kv->nb[1], row*prev_kv->nb[1]);
+    ggml_tensor * score_state = ggml_set_2d_inplace(ctx, prev_score, sc_cur, prev_score->nb[1], row*prev_score->nb[1]);
+    ggml_tensor * kv_comp = nullptr;
+    if ((pos + 1) % ratio == 0) {
+        ggml_tensor * kv_prev = probe_view_cols(ctx, kv_state, head_dim, ratio, 0, 0);
+        ggml_tensor * kv_curr = probe_view_cols(ctx, kv_state, head_dim, ratio, head_dim, ratio);
+        ggml_tensor * sc_prev = probe_view_cols(ctx, score_state, head_dim, ratio, 0, 0);
+        ggml_tensor * sc_curr = probe_view_cols(ctx, score_state, head_dim, ratio, head_dim, ratio);
+        ggml_tensor * kv_pool = ggml_concat(ctx, kv_prev, kv_curr, 1);
+        ggml_tensor * score_pool = ggml_concat(ctx, sc_prev, sc_curr, 1);
+        ggml_tensor * shifted_kv = probe_view_cols(ctx, kv_state, width, ratio, 0, ratio);
+        ggml_tensor * shifted_score = probe_view_cols(ctx, score_state, width, ratio, 0, ratio);
+        kv_state = ggml_concat(ctx, shifted_kv, shifted_kv, 1);
+        score_state = ggml_concat(ctx, shifted_score, shifted_score, 1);
+        kv_comp = probe_pool_decode_state(ctx, kv_pool, score_pool, norm,
+                probe_arange_i32(ctx, pos + 1 - ratio, pos + 2 - ratio), head_dim, 2);
+    }
+#else
+    llm_deepseek4_decode_compressor dec = llm_build_deepseek4_compressor_decode(
+            ctx, x, prev_kv, prev_score, wkv, wgate, ape, norm,
+            head_dim, 2, pos, ratio, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0e-6f);
+    ggml_tensor * kv_state = dec.kv_state;
+    ggml_tensor * score_state = dec.score_state;
+    ggml_tensor * kv_comp = dec.kv_comp;
+#endif
+
+    compute(ctx, ggml_sum(ctx, kv_state));
+    emit((std::string(prefix) + "_kv_state").c_str(), kv_state);
+    compute(ctx, ggml_sum(ctx, score_state));
+    emit((std::string(prefix) + "_score_state").c_str(), score_state);
+    if (kv_comp != nullptr) {
+        compute(ctx, kv_comp);
+        emit((std::string(prefix) + "_kv_comp").c_str(), kv_comp);
+    }
+    ggml_free(ctx);
+}
+
+static void run_compressor_decode() {
+    run_compressor_decode_one(5, "compressor_decode_pos5");
+    run_compressor_decode_one(7, "compressor_decode_pos7");
+}
+
 int main() {
     run_hc_split_sinkhorn();
     run_fp8_kv_quantize();
@@ -500,6 +671,7 @@ int main() {
     run_hc_head();
     run_grouped_out();
     run_compressor_prefill_state();
+    run_compressor_decode();
     run_rope_tail();
     return 0;
 }
@@ -607,6 +779,11 @@ expected = [
     "grouped_out",
     "compressor_prefill_state_kv",
     "compressor_prefill_state_score",
+    "compressor_decode_pos5_kv_state",
+    "compressor_decode_pos5_score_state",
+    "compressor_decode_pos7_kv_state",
+    "compressor_decode_pos7_score_state",
+    "compressor_decode_pos7_kv_comp",
     "rope_tail",
 ]
 
@@ -625,6 +802,11 @@ tolerances = {
     "grouped_out": 2.0e-6,
     "compressor_prefill_state_kv": 2.0e-6,
     "compressor_prefill_state_score": 2.0e-6,
+    "compressor_decode_pos5_kv_state": 2.0e-6,
+    "compressor_decode_pos5_score_state": 2.0e-6,
+    "compressor_decode_pos7_kv_state": 2.0e-6,
+    "compressor_decode_pos7_score_state": 2.0e-6,
+    "compressor_decode_pos7_kv_comp": 2.0e-6,
     "rope_tail": 2.0e-6,
 }
 

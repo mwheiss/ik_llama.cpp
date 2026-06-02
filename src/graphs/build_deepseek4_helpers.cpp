@@ -101,6 +101,59 @@ static struct ggml_tensor * llm_build_deepseek4_new_filled_2d(
     return ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n0, n1), value);
 }
 
+static struct ggml_tensor * llm_build_deepseek4_arange_i32(
+        struct ggml_context * ctx,
+        int64_t               begin,
+        int64_t               end) {
+    GGML_ASSERT(end >= begin);
+    struct ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, end - begin);
+    for (int64_t i = begin; i < end; ++i) {
+        ggml_set_i32_1d(t, i - begin, (int32_t) i);
+    }
+    return t;
+}
+
+static struct ggml_tensor * llm_build_deepseek4_view_cols(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        int64_t               n0,
+        int64_t               n1,
+        int64_t               off0,
+        int64_t               off1) {
+    return ggml_view_2d(ctx, x, n0, n1, x->nb[1], off1*x->nb[1] + off0*x->nb[0]);
+}
+
+static struct ggml_tensor * llm_build_deepseek4_pool_decode_state(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * norm,
+        struct ggml_tensor  * pos,
+        int64_t               n_embd_head,
+        int64_t               n_rot,
+        int                   rope_type,
+        int32_t               n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 norm_eps) {
+    const int64_t n_rows = kv->ne[1];
+    kv    = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, kv)),    n_rows, n_embd_head, 1);
+    score = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, score)), n_rows, n_embd_head, 1);
+
+    struct ggml_tensor * pooled = llm_build_deepseek4_softmax_pool_ratio(ctx, kv, score);
+    pooled = ggml_rms_norm(ctx, pooled, norm_eps);
+    pooled = ggml_mul(ctx, pooled, norm);
+    pooled = ggml_reshape_3d(ctx, pooled, n_embd_head, 1, 1);
+
+    return llm_build_deepseek4_rope_tail(ctx, pooled, pos, nullptr, n_rot, rope_type,
+            n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow, false);
+}
+
 
 struct ggml_tensor * llm_build_deepseek4_rope_tail(
         struct ggml_context * ctx,
@@ -531,6 +584,103 @@ struct llm_deepseek4_state_pair llm_build_deepseek4_compressor_prefill_state(
     }
 
     return { kv_state, score_state };
+}
+
+struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * prev_kv_state,
+        struct ggml_tensor  * prev_score_state,
+        struct ggml_tensor  * wkv,
+        struct ggml_tensor  * wgate,
+        struct ggml_tensor  * ape,
+        struct ggml_tensor  * norm,
+        int64_t               n_embd_head,
+        int64_t               n_rot,
+        int64_t               pos,
+        int64_t               compress_ratio,
+        int                   rope_type,
+        int32_t               n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 norm_eps) {
+    GGML_ASSERT(compress_ratio > 0);
+    GGML_ASSERT(pos >= 0);
+
+    const int64_t pos_mod = pos % compress_ratio;
+    const int64_t coff = compress_ratio == 4 ? 2 : 1;
+    const int64_t width = coff * n_embd_head;
+    const int64_t rows = coff * compress_ratio;
+    const int64_t row = compress_ratio == 4 ? compress_ratio + pos_mod : pos_mod;
+    const bool should_compress = (pos + 1) % compress_ratio == 0;
+
+    GGML_ASSERT(x->ne[1] == 1);
+    GGML_ASSERT(wkv->ne[0] == x->ne[0]);
+    GGML_ASSERT(wkv->ne[1] == width);
+    GGML_ASSERT(wgate->ne[0] == x->ne[0]);
+    GGML_ASSERT(wgate->ne[1] == width);
+    GGML_ASSERT(ape->ne[0] == width);
+    GGML_ASSERT(ape->ne[1] == compress_ratio);
+    GGML_ASSERT(norm->ne[0] == n_embd_head);
+    GGML_ASSERT(prev_kv_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(prev_score_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(prev_kv_state->ne[0] == width);
+    GGML_ASSERT(prev_kv_state->ne[1] == rows);
+    GGML_ASSERT(prev_score_state->ne[0] == width);
+    GGML_ASSERT(prev_score_state->ne[1] == rows);
+    GGML_ASSERT(row < rows);
+
+    struct ggml_tensor * kv_cur = ggml_mul_mat(ctx, wkv, x);
+    struct ggml_tensor * sc_cur = ggml_mul_mat(ctx, wgate, x);
+    struct ggml_tensor * ape_f  = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
+    sc_cur = ggml_add(ctx, sc_cur, ggml_view_2d(ctx, ape_f, width, 1, ape_f->nb[1], pos_mod*ape_f->nb[1]));
+
+    auto set_row = [&](struct ggml_tensor * dst, struct ggml_tensor * row_src) -> struct ggml_tensor * {
+        // cchuter uses a cpy-into-view dependency workaround for multi-GPU
+        // scheduling. ik's CPU bring-up can use the structured SET primitive,
+        // which preserves the same row-update semantics without relying on a
+        // bare destination-view CPY as an intermediate graph output.
+        return ggml_set_2d_inplace(ctx, dst, row_src, dst->nb[1], row * dst->nb[1]);
+    };
+
+    struct ggml_tensor * kv_state    = set_row(prev_kv_state,    kv_cur);
+    struct ggml_tensor * score_state = set_row(prev_score_state, sc_cur);
+    struct ggml_tensor * kv_comp = nullptr;
+
+    if (should_compress) {
+        struct ggml_tensor * kv_pool = nullptr;
+        struct ggml_tensor * score_pool = nullptr;
+
+        if (compress_ratio == 4) {
+            struct ggml_tensor * kv_prev = llm_build_deepseek4_view_cols(ctx, kv_state,    n_embd_head, compress_ratio, 0,           0);
+            struct ggml_tensor * kv_curr = llm_build_deepseek4_view_cols(ctx, kv_state,    n_embd_head, compress_ratio, n_embd_head, compress_ratio);
+            struct ggml_tensor * sc_prev = llm_build_deepseek4_view_cols(ctx, score_state, n_embd_head, compress_ratio, 0,           0);
+            struct ggml_tensor * sc_curr = llm_build_deepseek4_view_cols(ctx, score_state, n_embd_head, compress_ratio, n_embd_head, compress_ratio);
+
+            kv_pool    = ggml_concat(ctx, kv_prev, kv_curr, 1);
+            score_pool = ggml_concat(ctx, sc_prev, sc_curr, 1);
+
+            struct ggml_tensor * shifted_kv    = llm_build_deepseek4_view_cols(ctx, kv_state,    width, compress_ratio, 0, compress_ratio);
+            struct ggml_tensor * shifted_score = llm_build_deepseek4_view_cols(ctx, score_state, width, compress_ratio, 0, compress_ratio);
+            kv_state    = ggml_concat(ctx, shifted_kv,    shifted_kv,    1);
+            score_state = ggml_concat(ctx, shifted_score, shifted_score, 1);
+        } else {
+            kv_pool = kv_state;
+            score_pool = score_state;
+        }
+
+        struct ggml_tensor * comp_pos = llm_build_deepseek4_arange_i32(ctx,
+                pos + 1 - compress_ratio, pos + 2 - compress_ratio);
+        kv_comp = llm_build_deepseek4_pool_decode_state(ctx, kv_pool, score_pool, norm, comp_pos,
+                n_embd_head, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow, norm_eps);
+    }
+
+    return { kv_state, score_state, kv_comp };
 }
 
 struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
