@@ -4258,6 +4258,83 @@ static int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t
     return relative_bucket;
 }
 
+static void llama_dsv4_fill_raw_window_mask(
+        std::vector<float> & data,
+        int64_t              n0,
+        int64_t              n1,
+        int64_t              offset,
+        int64_t              n_raw,
+        int64_t              window,
+        const llama_batch  & batch) {
+    const int64_t n_tokens = batch.n_tokens;
+    const int64_t n_raw_fill = std::min<int64_t>(n_raw, std::min<int64_t>(n0 - offset, n_tokens));
+
+    for (int64_t iq = 0; iq < n1; ++iq) {
+        const llama_pos p1 = batch.pos ? batch.pos[iq] : iq;
+        for (int64_t ik = 0; ik < n_raw_fill; ++ik) {
+            const llama_pos p0 = batch.pos ? batch.pos[ik] : ik;
+            if (p0 <= p1 && !(window > 0 && p1 - p0 >= window)) {
+                data[iq*n0 + offset + ik] = 0.0f;
+            }
+        }
+    }
+}
+
+static void llama_dsv4_fill_compress_causal_mask(
+        std::vector<float> & data,
+        int64_t              n0,
+        int64_t              n1,
+        int64_t              offset,
+        int64_t              n_comp,
+        int64_t              ratio,
+        const llama_batch  & batch) {
+    GGML_ASSERT(ratio > 0);
+
+    const int64_t n_comp_fill = std::min<int64_t>(n_comp, n0 - offset);
+    for (int64_t iq = 0; iq < n1; ++iq) {
+        const llama_pos p1 = batch.pos ? batch.pos[iq] : iq;
+        const int64_t n_visible = std::min<int64_t>(n_comp_fill, (p1 + 1) / ratio);
+        for (int64_t ic = 0; ic < n_visible; ++ic) {
+            data[iq*n0 + offset + ic] = 0.0f;
+        }
+    }
+}
+
+static void llama_set_dsv4_masks(llama_context & lctx, const llama_batch & batch) {
+    if (lctx.inp_dsv4_masks.empty()) {
+        return;
+    }
+
+    for (const llama_dsv4_mask_input & mask : lctx.inp_dsv4_masks) {
+        ggml_tensor * t = mask.tensor;
+        GGML_ASSERT(t != nullptr);
+        GGML_ASSERT(t->type == GGML_TYPE_F32);
+        GGML_ASSERT(t->buffer != nullptr);
+        GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+
+        const int64_t n0 = t->ne[0];
+        const int64_t n1 = t->ne[1];
+        GGML_ASSERT(n1 == batch.n_tokens);
+
+        std::vector<float> data(n0*n1, -INFINITY);
+
+        switch (mask.kind) {
+            case llama_dsv4_mask_kind::RAW_WINDOW:
+                llama_dsv4_fill_raw_window_mask(data, n0, n1, 0, mask.n_raw, mask.window, batch);
+                break;
+            case llama_dsv4_mask_kind::COMPRESS_CAUSAL:
+                llama_dsv4_fill_compress_causal_mask(data, n0, n1, 0, mask.n_comp, mask.ratio, batch);
+                break;
+            case llama_dsv4_mask_kind::ATTN_STATIC:
+                llama_dsv4_fill_raw_window_mask(data, n0, n1, 0, mask.n_raw, mask.window, batch);
+                llama_dsv4_fill_compress_causal_mask(data, n0, n1, mask.n_raw, mask.n_comp, mask.ratio, batch);
+                break;
+        }
+
+        ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+    }
+}
+
 static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     //
     // set input data
@@ -4697,6 +4774,8 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 #endif
         }
     }
+
+    llama_set_dsv4_masks(lctx, batch);
 
     if (cparams.embeddings && cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN) {
         const int64_t n_tokens = batch.n_tokens;

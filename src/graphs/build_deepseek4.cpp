@@ -77,6 +77,22 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     dsv4_log_tensor_shape("inp_embd", inpL);
     dsv4_log_tensor_shape("KQ_mask_swa", KQ_mask_swa);
 
+    auto build_dsv4_mask_input = [&](llama_dsv4_mask_kind kind,
+                                     int64_t n0,
+                                     int64_t n1,
+                                     int64_t n_raw,
+                                     int64_t n_comp,
+                                     int64_t window,
+                                     int64_t ratio,
+                                     const char * name,
+                                     int il) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n0, n1);
+        ggml_set_input(t);
+        cb(t, name, il);
+        lctx.inp_dsv4_masks.push_back({ t, kind, n_raw, n_comp, window, ratio });
+        return t;
+    };
+
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
@@ -468,8 +484,10 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                 dsv4_log_tensor_shape("indexer_KVcompress", index_kv);
                 ggml_build_forward_expand(gf, index_kv);
 
-                ggml_tensor * index_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_comp, n_tokens);
-                cb(index_mask, "dsv4_indexer_causal_mask", il);
+                ggml_tensor * index_mask = build_dsv4_mask_input(
+                        llama_dsv4_mask_kind::COMPRESS_CAUSAL,
+                        n_comp, n_tokens, 0, n_comp, 0, compress_ratio,
+                        "dsv4_indexer_causal_mask", il);
                 dsv4_log_tensor_shape("dsv4_indexer_causal_mask", index_mask);
 
                 ggml_tensor * index_scores = llm_build_deepseek4_indexer_scores_prefill(ctx0,
@@ -510,8 +528,10 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                 dsv4_log_tensor_shape("dsv4_attn_compress_mask", comp_mask);
                 ggml_build_forward_expand(gf, comp_mask);
 
-                ggml_tensor * raw_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
-                cb(raw_mask, "dsv4_attn_raw_window_mask", il);
+                ggml_tensor * raw_mask = build_dsv4_mask_input(
+                        llama_dsv4_mask_kind::RAW_WINDOW,
+                        n_tokens, n_tokens, n_tokens, n_comp, hparams.n_swa, compress_ratio,
+                        "dsv4_attn_raw_window_mask", il);
                 dsv4_log_tensor_shape("dsv4_attn_raw_window_mask", raw_mask);
                 ggml_tensor * attn_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
                 cb(attn_mask, "dsv4_attn_mask", il);
@@ -519,8 +539,10 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
                 return build_compressed_attn_update(layer_inp, q, k_all, v_all, attn_mask, mix, rope_cfg, il);
             } else {
-                ggml_tensor * attn_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens + n_comp, n_tokens);
-                cb(attn_mask, "dsv4_attn_static_mask", il);
+                ggml_tensor * attn_mask = build_dsv4_mask_input(
+                        llama_dsv4_mask_kind::ATTN_STATIC,
+                        n_tokens + n_comp, n_tokens, n_tokens, n_comp, hparams.n_swa, compress_ratio,
+                        "dsv4_attn_static_mask", il);
                 dsv4_log_tensor_shape("dsv4_attn_static_mask", attn_mask);
 
                 return build_compressed_attn_update(layer_inp, q, k_all, v_all, attn_mask, mix, rope_cfg, il);

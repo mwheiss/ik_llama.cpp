@@ -13,6 +13,21 @@ struct llama_model;
 #include <set>
 #include <memory>
 
+enum class llama_dsv4_mask_kind {
+    RAW_WINDOW,
+    COMPRESS_CAUSAL,
+    ATTN_STATIC,
+};
+
+struct llama_dsv4_mask_input {
+    struct ggml_tensor * tensor = nullptr;
+    llama_dsv4_mask_kind kind = llama_dsv4_mask_kind::RAW_WINDOW;
+    int64_t n_raw  = 0;
+    int64_t n_comp = 0;
+    int64_t window = 0;
+    int64_t ratio  = 0;
+};
+
 struct llama_kv_cell {
     llama_pos pos   = -1;
     llama_pos delta = 0;
@@ -298,6 +313,11 @@ struct llama_context {
     struct ggml_tensor * inp_scale = nullptr; // F32 [n_tokens]
     struct ggml_tensor * inp_mtp_states = nullptr;
 
+    // DeepSeek4 uses several graph-local masks whose dimensions differ from
+    // the regular KV mask. They are registered while building the DSV4 graph
+    // and filled from the current ubatch positions in llama_set_inputs().
+    std::vector<llama_dsv4_mask_input> inp_dsv4_masks;
+
     ggml_backend_t ggml_backend_by_name(const char * name);
 
     struct Prev;
@@ -322,4 +342,3 @@ struct llama_context {
     int max_nodes(int n_tokens, int n_kv) const;
 
 };
-

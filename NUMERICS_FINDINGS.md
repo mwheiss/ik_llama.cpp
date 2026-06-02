@@ -232,6 +232,67 @@ explicit gates against the cchuter F16 reference:
 
 Until those gates exist and pass, keep the forced F16 policy.
 
+## DSV4 prefill masks must be runtime inputs
+
+### Context
+
+DeepSeek4 uses graph-local masks whose shapes are not the same as the ordinary
+KV attention mask:
+
+- raw/local sliding-window mask,
+- compressed causal/indexer mask,
+- combined static raw+compressed mask.
+
+cchuter does not treat these as compile-time constants. Its graph builder
+registers them as inputs, then fills them for the current ubatch positions
+before graph execution. The mask orientation is `[keys_or_rows, queries]`,
+with row-major indexing equivalent to:
+
+```text
+data[iq*n0 + ik]
+```
+
+### Observed issue in the retry port
+
+An interrupted retry step briefly replaced placeholder masks with tensors
+written at graph construction time via `ggml_set_f32_nd`. That worked in a
+normal allocated unit-test context, but the model graph uses a no-alloc GGML
+context while building graph metadata. In the full model smoke, this approach
+segfaulted before any useful DSV4 mask marker was reached.
+
+The earlier committed placeholders were also not acceptable for runtime
+correctness: they allowed the graph to reach final prefill logits, but the
+masks were uninitialized rather than cchuter-equivalent.
+
+### Current fix
+
+The retry port now registers DSV4 mask tensors as graph inputs and fills them
+in `llama_set_inputs()` from `batch.pos`:
+
+- `RAW_WINDOW`: visible if `p0 <= p1` and the key is inside the SWA window,
+- `COMPRESS_CAUSAL`: compressed row `ic` visible if
+  `ic < (p1 + 1) / compress_ratio`,
+- `ATTN_STATIC`: raw-window entries first, compressed-causal entries after
+  the raw token block.
+
+All entries start as `-inf`; visible entries are set to `0`. This matches
+cchuter's polarity and keeps the change local to DeepSeek4-specific graph
+inputs instead of modifying the shared KQ mask path.
+
+### Validation status
+
+After replacing graph-construction writes with runtime inputs:
+
+- primitive parity against cchuter still passes,
+- Q4 reaches final prefill logits and then the expected decode boundary,
+- Q8 with requested q8_0 KV still logs the forced-F16 warning and reaches the
+  same boundary,
+- the prior model-smoke segfault is gone.
+
+Future decode work must re-check these masks with nonzero positions, because
+the compressed visible-row rule depends on absolute token position, not just
+the query index in the ubatch.
+
 ## Compressed top-k mask scatter exposed CPU set_rows F32 bug
 
 ### Context
