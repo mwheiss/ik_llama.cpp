@@ -436,3 +436,58 @@ replay step must determine whether ik should derive the decode compressor
 position from a runtime input, from `kv_head`, or from a graph-build batch
 position in the same way the shared KV cache path does. Do not treat the current
 `pos=0` smoke as first-token numerical correctness.
+
+## One-token prompt prefill must not be treated as decode
+
+### Finding
+
+The retry graph initially used `n_tokens == 1` as the decode predicate for
+DeepSeek4 compressed layers. That is wrong. cchuter's DeepSeek4 graph uses:
+
+```c++
+is_prefill = ubatch.pos == nullptr || ubatch.pos[0] == 0;
+```
+
+A one-token prompt such as `Hello` has `n_tokens == 1` and `pos == 0`, so it is
+prefill. Treating it as decode caused ik to enter the decode compressor/cache
+path before any compressed cache replay should exist.
+
+### Fix
+
+The ik compressed path now follows cchuter's prefill predicate. For prefill
+chunks with `n_comp == 0`, it builds raw/local attention only with a DSV4
+raw-window mask, matching cchuter's fallback.
+
+This exposed a second, DSV4-local mask bug: the raw-window mask for
+`n_tokens == 1` must still be padded to `GGML_KQ_MASK_PAD` when it feeds
+FlashAttention. The DSV4 mask input fill code now allows `tensor->ne[1] >=
+batch.n_tokens`, fills only the logical token columns, and leaves padded columns
+at `-inf`.
+
+### ik CPU FlashAttention K/V type note
+
+After the one-token prefill path reached actual execution, ik's CPU
+FlashAttention rejected composed DSV4 K/V tensors in F32:
+
+```text
+K cache f32 coupled with V cache f32 is not a supported combination on the CPU backend.
+```
+
+The shared ik attention helper already casts F32 K/V to F16 for FlashAttention,
+and DSV4's KV cache is forced to F16. The DSV4 compressed attention helper now
+casts composed K/V attention inputs to F16 when `cparams.flash_attn` is enabled.
+
+### Validation
+
+With these fixes:
+
+- Q4 `Hello`, `-c 128 -b 128 -ub 128 -n 1`, exits 0 and produces a first token,
+- Q8 with requested q8_0 KV exits 0, logs the forced-F16 warning, and produces a
+  first token,
+- primitive/helper parity against cchuter remains unchanged,
+- patched cchuter Q4 with `--no-repack --single-turn` also exits 0 for the same
+  tiny prompt.
+
+The cchuter CLI applies different chat/single-turn prompt handling in this
+smoke, so the generated text is a status sanity check only, not a logits/text
+parity result.

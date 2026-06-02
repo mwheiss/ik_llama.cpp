@@ -4305,7 +4305,8 @@ static void llama_dsv4_fill_raw_window_mask(
     const int64_t n_tokens = batch.n_tokens;
     const int64_t n_raw_fill = std::min<int64_t>(n_raw, std::min<int64_t>(n0 - offset, n_tokens));
 
-    for (int64_t iq = 0; iq < n1; ++iq) {
+    const int64_t n1_fill = std::min<int64_t>(n1, n_tokens);
+    for (int64_t iq = 0; iq < n1_fill; ++iq) {
         const llama_pos p1 = batch.pos ? batch.pos[iq] : iq;
         for (int64_t ik = 0; ik < n_raw_fill; ++ik) {
             const llama_pos p0 = batch.pos ? batch.pos[ik] : ik;
@@ -4327,7 +4328,8 @@ static void llama_dsv4_fill_compress_causal_mask(
     GGML_ASSERT(ratio > 0);
 
     const int64_t n_comp_fill = std::min<int64_t>(n_comp, n0 - offset);
-    for (int64_t iq = 0; iq < n1; ++iq) {
+    const int64_t n1_fill = std::min<int64_t>(n1, (int64_t) batch.n_tokens);
+    for (int64_t iq = 0; iq < n1_fill; ++iq) {
         const llama_pos p1 = batch.pos ? batch.pos[iq] : iq;
         const int64_t n_visible = std::min<int64_t>(n_comp_fill, (p1 + 1) / ratio);
         for (int64_t ic = 0; ic < n_visible; ++ic) {
@@ -4350,7 +4352,7 @@ static void llama_set_dsv4_masks(llama_context & lctx, const llama_batch & batch
 
         const int64_t n0 = t->ne[0];
         const int64_t n1 = t->ne[1];
-        GGML_ASSERT(n1 == batch.n_tokens);
+        GGML_ASSERT(n1 >= batch.n_tokens);
 
         std::vector<float> data(n0*n1, -INFINITY);
 

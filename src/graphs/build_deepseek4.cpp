@@ -248,6 +248,12 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         ggml_tensor * q_attn = ggml_permute(ctx0, q, 0, 2, 1, 3);
         ggml_tensor * k_attn = ggml_permute(ctx0, k_all, 0, 2, 1, 3);
         ggml_tensor * v_attn = ggml_permute(ctx0, v_all, 0, 2, 1, 3);
+        if (cparams.flash_attn && k_attn->type == GGML_TYPE_F32) {
+            k_attn = ggml_cast(ctx0, k_attn, GGML_TYPE_F16);
+        }
+        if (cparams.flash_attn && v_attn->type == GGML_TYPE_F32) {
+            v_attn = ggml_cast(ctx0, v_attn, GGML_TYPE_F16);
+        }
         cb(q_attn, "dsv4_attn_q", il);
         cb(k_attn, "dsv4_attn_k", il);
         cb(v_attn, "dsv4_attn_v", il);
@@ -421,10 +427,12 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         }
 
         const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
+        const llama_pos first_pos = batch.pos ? batch.pos[0] : batch.all_pos_0;
+        const bool is_prefill = batch.pos == nullptr || first_pos == 0;
 
         LLAMA_LOG_INFO("%s: DeepSeek4 compressed graph prefix: layer=%d ratio=%u n_embd=%" PRId64
-                " n_hc=%" PRId64 " n_tokens=%d\n",
-                __func__, il, compress_ratio, n_embd, n_hc, n_tokens);
+                " n_hc=%" PRId64 " n_tokens=%d first_pos=%d is_prefill=%d\n",
+                __func__, il, compress_ratio, n_embd, n_hc, n_tokens, first_pos, int(is_prefill));
 
         llm_deepseek4_hc_mix mix = llm_build_deepseek4_hc_pre(ctx0, layer_inp,
                 layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base,
@@ -490,7 +498,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, kv, n_tokens, kv_head, cb, il);
         }
 
-        if (n_tokens > 1 && il < (int) kv_self.dsv4_layers.size()) {
+        if (is_prefill && il < (int) kv_self.dsv4_layers.size()) {
             auto & dsv4_cache = kv_self.dsv4_layers[il];
             if (dsv4_cache.kv_state != nullptr && dsv4_cache.score_state != nullptr) {
                 const auto attn_layout = dsv4_state_layout(compress_ratio, n_embd_head_k);
@@ -531,10 +539,9 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             }
         }
 
-        if (n_tokens == 1 && il < (int) kv_self.dsv4_layers.size()) {
+        if (!is_prefill && il < (int) kv_self.dsv4_layers.size()) {
             auto & dsv4_cache = kv_self.dsv4_layers[il];
             if (dsv4_cache.kv_state != nullptr && dsv4_cache.score_state != nullptr) {
-                const llama_pos first_pos = batch.pos ? batch.pos[0] : batch.all_pos_0;
                 const int64_t n_comp_before  = first_pos / compress_ratio;
                 const int64_t n_comp_visible = (first_pos + 1) / compress_ratio;
                 GGML_ASSERT(n_comp_visible <= dsv4_cache.n_comp);
@@ -635,7 +642,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         }
 
         const int64_t n_comp = n_tokens / compress_ratio;
-        if (n_comp > 0) {
+        if (is_prefill && n_comp > 0) {
             ggml_tensor * comp_pos = ggml_arange(ctx0, 0.0f, float(n_comp * compress_ratio), float(compress_ratio));
             comp_pos = ggml_cast(ctx0, comp_pos, GGML_TYPE_I32);
             cb(comp_pos, "comp_pos", il);
@@ -755,9 +762,10 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
                 return build_compressed_attn_update(layer_inp, q, k_all, v_all, attn_mask, mix, rope_cfg, il);
             } else {
+                const int64_t n_tokens_attn = cparams.flash_attn ? GGML_PAD(n_tokens, GGML_KQ_MASK_PAD) : n_tokens;
                 ggml_tensor * attn_mask = build_dsv4_mask_input(
                         llama_dsv4_mask_kind::ATTN_STATIC,
-                        n_tokens + n_comp, n_tokens, n_tokens, n_comp, hparams.n_swa, compress_ratio,
+                        n_tokens + n_comp, n_tokens_attn, n_tokens, n_comp, hparams.n_swa, compress_ratio,
                         "dsv4_attn_static_mask", il);
                 dsv4_log_tensor_shape("dsv4_attn_static_mask", attn_mask);
 
@@ -765,9 +773,18 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             }
         }
 
-        throw std::runtime_error(n_comp == 0
-                ? "DeepSeek V4 decode compressed attention graph segment not implemented yet"
-                : "DeepSeek V4 compressed attention path produced no output");
+        if (is_prefill) {
+            const int64_t n_tokens_attn = cparams.flash_attn ? GGML_PAD(n_tokens, GGML_KQ_MASK_PAD) : n_tokens;
+            ggml_tensor * raw_mask = build_dsv4_mask_input(
+                    llama_dsv4_mask_kind::RAW_WINDOW,
+                    n_tokens, n_tokens_attn, n_tokens, 0, hparams.n_swa, compress_ratio,
+                    "dsv4_attn_raw_window_mask", il);
+            dsv4_log_tensor_shape("dsv4_attn_raw_window_mask", raw_mask);
+
+            return build_compressed_attn_update(layer_inp, q, kv, kv, raw_mask, mix, rope_cfg, il);
+        }
+
+        throw std::runtime_error("DeepSeek V4 compressed attention path produced no output");
     };
 
     for (int il = 0; il < n_layer; ++il) {
