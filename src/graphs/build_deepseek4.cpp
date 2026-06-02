@@ -479,6 +479,23 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                 cb(attn_out, "dsv4_compressed_attn_out", il);
                 dsv4_log_tensor_shape("dsv4_compressed_attn_out", attn_out);
                 ggml_build_forward_expand(gf, attn_out);
+
+                ggml_tensor * out = ggml_reshape_3d(ctx0, attn_out, n_embd_head_v, n_head, n_tokens);
+                out = llm_build_deepseek4_rope_tail(ctx0, out, inp_pos, nullptr, n_rot, rope_type,
+                        rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
+                        rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, true);
+                cb(out, "attn_out_unrope", il);
+                dsv4_log_tensor_shape("attn_out_unrope", out);
+
+                out = llm_build_deepseek4_grouped_out(ctx0, out, layer.attn_wo_a, layer.attn_wo_b,
+                        n_embd_head_v, n_head, n_out_group, n_lora_o, n_tokens);
+                cb(out, "attn_out", il);
+                dsv4_log_tensor_shape("attn_out", out);
+
+                out = llm_build_deepseek4_hc_expand(ctx0, out, layer_inp, mix.post, mix.comb);
+                cb(out, "hc_attn_post", il);
+                dsv4_log_tensor_shape("hc_attn_post", out);
+                ggml_build_forward_expand(gf, out);
             }
         }
     };
@@ -489,7 +506,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             LLAMA_LOG_INFO("%s: DeepSeek4 graph slice: reached compressed layer %d, ratio=%u\n",
                     __func__, il, compress_ratio);
             build_compressed_prefix(inpL, il);
-            throw std::runtime_error("DeepSeek V4 compressed attention output projection graph segment not implemented yet");
+            throw std::runtime_error("DeepSeek V4 compressed FFN graph segment not implemented yet");
         }
 
         inpL = build_local_layer(inpL, il);
