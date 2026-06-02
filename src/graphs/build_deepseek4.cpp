@@ -110,6 +110,35 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_rows, dst_rows));
     };
 
+    auto dsv4_state_layout = [](uint32_t ratio, int64_t head_dim) {
+        struct layout {
+            int64_t width;
+            int64_t rows;
+            int64_t elems;
+        };
+
+        const int64_t coff = ratio == 4 ? 2 : 1;
+        const int64_t width = coff * head_dim;
+        const int64_t rows  = coff * int64_t(ratio);
+        return layout{ width, rows, width * rows };
+    };
+
+    auto store_dsv4_state_segment = [&](ggml_tensor * cache, ggml_tensor * src, int64_t elem_offset) {
+        if (cache == nullptr || src == nullptr) {
+            return;
+        }
+        GGML_ASSERT(cache->type == GGML_TYPE_F32);
+        GGML_ASSERT(src->type == GGML_TYPE_F32);
+        GGML_ASSERT(cache->ne[1] == 1);
+        const int64_t n_elem = ggml_nelements(src);
+        GGML_ASSERT(elem_offset >= 0);
+        GGML_ASSERT(elem_offset + n_elem <= cache->ne[0]);
+
+        ggml_tensor * src_flat = ggml_reshape_1d(ctx0, src, n_elem);
+        ggml_tensor * dst_flat = ggml_view_1d(ctx0, cache, n_elem, elem_offset * ggml_element_size(cache));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_flat, dst_flat));
+    };
+
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, n_hc, n_tokens, 1);
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_tokens);
@@ -448,6 +477,47 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             dsv4_log_tensor_shape("kv_cache_k_compressed_local", kv_self.k_l[il]);
             dsv4_log_tensor_shape("kv_cache_v_compressed_local", kv_self.v_l[il]);
             llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, kv, n_tokens, kv_head, cb, il);
+        }
+
+        if (il < (int) kv_self.dsv4_layers.size()) {
+            auto & dsv4_cache = kv_self.dsv4_layers[il];
+            if (dsv4_cache.kv_state != nullptr && dsv4_cache.score_state != nullptr) {
+                const auto attn_layout = dsv4_state_layout(compress_ratio, n_embd_head_k);
+                GGML_ASSERT(attn_layout.elems <= hparams.dsv4_state_size);
+
+                llm_deepseek4_state_pair attn_state = llm_build_deepseek4_compressor_prefill_state(ctx0,
+                        cur,
+                        layer.attn_compressor_kv,
+                        layer.attn_compressor_gate,
+                        layer.attn_compressor_ape,
+                        n_embd_head_k,
+                        compress_ratio);
+                cb(attn_state.kv,    "dsv4_attn_kv_state_prefill",    il);
+                cb(attn_state.score, "dsv4_attn_score_state_prefill", il);
+                dsv4_log_tensor_shape("dsv4_attn_kv_state_prefill",    attn_state.kv);
+                dsv4_log_tensor_shape("dsv4_attn_score_state_prefill", attn_state.score);
+                store_dsv4_state_segment(dsv4_cache.kv_state,    attn_state.kv,    0);
+                store_dsv4_state_segment(dsv4_cache.score_state, attn_state.score, 0);
+
+                if (compress_ratio == 4) {
+                    const auto index_layout = dsv4_state_layout(compress_ratio, hparams.indexer_head_size);
+                    GGML_ASSERT(attn_layout.elems + index_layout.elems <= hparams.dsv4_state_size);
+
+                    llm_deepseek4_state_pair index_state = llm_build_deepseek4_compressor_prefill_state(ctx0,
+                            cur,
+                            layer.indexer_compressor_kv,
+                            layer.indexer_compressor_gate,
+                            layer.indexer_compressor_ape,
+                            hparams.indexer_head_size,
+                            compress_ratio);
+                    cb(index_state.kv,    "dsv4_index_kv_state_prefill",    il);
+                    cb(index_state.score, "dsv4_index_score_state_prefill", il);
+                    dsv4_log_tensor_shape("dsv4_index_kv_state_prefill",    index_state.kv);
+                    dsv4_log_tensor_shape("dsv4_index_score_state_prefill", index_state.score);
+                    store_dsv4_state_segment(dsv4_cache.kv_state,    index_state.kv,    attn_layout.elems);
+                    store_dsv4_state_segment(dsv4_cache.score_state, index_state.score, attn_layout.elems);
+                }
+            }
         }
 
         const int64_t n_comp = n_tokens / compress_ratio;

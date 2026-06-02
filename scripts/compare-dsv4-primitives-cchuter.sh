@@ -71,6 +71,10 @@ static void emit(const char * name, ggml_tensor * t) {
     printf("END %s\n", name);
 }
 
+static ggml_tensor * new_filled_2d(ggml_context * ctx, int64_t n0, int64_t n1, float value) {
+    return ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n0, n1), value);
+}
+
 static void run_hc_split_sinkhorn() {
     ggml_init_params params = { 8 * 1024 * 1024, nullptr, false };
     ggml_context * ctx = ggml_init(params);
@@ -411,6 +415,82 @@ static void run_grouped_out() {
     ggml_free(ctx);
 }
 
+static void run_compressor_prefill_state() {
+    ggml_init_params params = { 8 * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 2;
+    constexpr int64_t head_dim = 1;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t width = 2 * head_dim;
+    constexpr int64_t n_tokens = 6;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * wkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * wgate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * ape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, ratio);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        ggml_set_f32_nd(x, 0, t, 0, 0, 10.0f + (float) t);
+        ggml_set_f32_nd(x, 1, t, 0, 0, 20.0f + (float) t);
+    }
+    for (int64_t i = 0; i < n_embd; ++i) {
+        for (int64_t o = 0; o < width; ++o) {
+            ggml_set_f32_nd(wkv, i, o, 0, 0, 0.0f);
+            ggml_set_f32_nd(wgate, i, o, 0, 0, 0.0f);
+        }
+    }
+    ggml_set_f32_nd(wkv, 0, 0, 0, 0, 1.0f);
+    ggml_set_f32_nd(wkv, 1, 1, 0, 0, 1.0f);
+    ggml_set_f32_nd(wgate, 0, 0, 0, 0, 2.0f);
+    ggml_set_f32_nd(wgate, 1, 1, 0, 0, 3.0f);
+
+    for (int64_t c = 0; c < ratio; ++c) {
+        ggml_set_f32_nd(ape, 0, c, 0, 0, 0.1f * (float) c);
+        ggml_set_f32_nd(ape, 1, c, 0, 0, 1.0f + 0.1f * (float) c);
+    }
+
+#if defined(CCHUTER_ENGINE)
+    const int64_t cutoff = (n_tokens / ratio) * ratio;
+    const int64_t remainder = n_tokens - cutoff;
+    ggml_tensor * kv = ggml_mul_mat(ctx, wkv, x);
+    ggml_tensor * score = ggml_mul_mat(ctx, wgate, x);
+
+    ggml_tensor * kv_prev = new_filled_2d(ctx, width, ratio, 0.0f);
+    ggml_tensor * score_prev = new_filled_2d(ctx, width, ratio, -INFINITY);
+    if (cutoff >= ratio) {
+        kv_prev = ggml_view_2d(ctx, kv, width, ratio, kv->nb[1], (cutoff - ratio) * kv->nb[1]);
+        score_prev = ggml_view_2d(ctx, score, width, ratio, score->nb[1], (cutoff - ratio) * score->nb[1]);
+        score_prev = ggml_add(ctx, score_prev, ape);
+    }
+
+    ggml_tensor * kv_curr = new_filled_2d(ctx, width, ratio, 0.0f);
+    ggml_tensor * score_curr = new_filled_2d(ctx, width, ratio, -INFINITY);
+    if (remainder > 0) {
+        ggml_tensor * kv_rem = ggml_view_2d(ctx, kv, width, remainder, kv->nb[1], cutoff * kv->nb[1]);
+        ggml_tensor * sc_rem = ggml_view_2d(ctx, score, width, remainder, score->nb[1], cutoff * score->nb[1]);
+        sc_rem = ggml_add(ctx, sc_rem, ggml_view_2d(ctx, ape, width, remainder, ape->nb[1], 0));
+        kv_curr = ggml_concat(ctx, kv_rem, new_filled_2d(ctx, width, ratio - remainder, 0.0f), 1);
+        score_curr = ggml_concat(ctx, sc_rem, new_filled_2d(ctx, width, ratio - remainder, -INFINITY), 1);
+    }
+
+    ggml_tensor * kv_state = ggml_concat(ctx, kv_prev, kv_curr, 1);
+    ggml_tensor * score_state = ggml_concat(ctx, score_prev, score_curr, 1);
+#else
+    llm_deepseek4_state_pair state = llm_build_deepseek4_compressor_prefill_state(
+            ctx, x, wkv, wgate, ape, head_dim, ratio);
+    ggml_tensor * kv_state = state.kv;
+    ggml_tensor * score_state = state.score;
+#endif
+
+    compute(ctx, kv_state);
+    emit("compressor_prefill_state_kv", kv_state);
+    compute(ctx, score_state);
+    emit("compressor_prefill_state_score", score_state);
+
+    ggml_free(ctx);
+}
+
 int main() {
     run_hc_split_sinkhorn();
     run_fp8_kv_quantize();
@@ -419,6 +499,7 @@ int main() {
     run_hc_pre();
     run_hc_head();
     run_grouped_out();
+    run_compressor_prefill_state();
     run_rope_tail();
     return 0;
 }
@@ -524,6 +605,8 @@ expected = [
     "hc_pre_y",
     "hc_head",
     "grouped_out",
+    "compressor_prefill_state_kv",
+    "compressor_prefill_state_score",
     "rope_tail",
 ]
 
@@ -540,6 +623,8 @@ tolerances = {
     "hc_pre_comb": 2.0e-6,
     "hc_head": 2.0e-6,
     "grouped_out": 2.0e-6,
+    "compressor_prefill_state_kv": 2.0e-6,
+    "compressor_prefill_state_score": 2.0e-6,
     "rope_tail": 2.0e-6,
 }
 
@@ -563,10 +648,16 @@ for name in expected:
     rels = []
     for i, (x, y) in enumerate(zip(a, b)):
         if not math.isfinite(x) or not math.isfinite(y):
-            raise SystemExit(f"{name}: non-finite at {i}: ik={x} cchuter={y}")
-        diff = abs(x - y)
+            if math.isinf(x) and math.isinf(y) and math.copysign(1.0, x) == math.copysign(1.0, y):
+                diff = 0.0
+                rel = 0.0
+            else:
+                raise SystemExit(f"{name}: non-finite mismatch at {i}: ik={x} cchuter={y}")
+        else:
+            diff = abs(x - y)
+            rel = diff / max(1.0, abs(y))
         diffs.append(diff)
-        rels.append(diff / max(1.0, abs(y)))
+        rels.append(rel)
 
     max_abs = max(diffs) if diffs else 0.0
     mean_abs = sum(diffs) / len(diffs) if diffs else 0.0
