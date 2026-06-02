@@ -608,7 +608,7 @@ static void why_not_reuse_previous(const llama_batch & u_batch, const llama_cont
 */
 
 bool llama_context::update_cache_copies() {
-    const int n_layer = model.mtp && cparams.mtp_op_type != MTP_OP_NONE ?
+    const int n_layer = model.arch == LLM_ARCH_DEEPSEEK4 || (model.mtp && cparams.mtp_op_type != MTP_OP_NONE) ?
         model.hparams.n_layer : model.hparams.n_layer - model.hparams.nextn_predict_layers; //cache_copies.size()/2;
     auto layer_has_attention_kv = [&](int il) {
         return !model.hparams.is_recurrent(il);
@@ -825,8 +825,8 @@ static bool llama_kv_cache_init(
 
     const struct llama_hparams & hparams = model.hparams;
 
-    const int64_t  n_layer = model.mtp ? hparams.n_layer
-                                       : hparams.n_layer - hparams.nextn_predict_layers;
+    const int64_t  n_layer = model.arch == LLM_ARCH_DEEPSEEK4 || model.mtp ? hparams.n_layer
+                                                                            : hparams.n_layer - hparams.nextn_predict_layers;
 
     if (model.arch == LLM_ARCH_DEEPSEEK4) {
         llama_dsv4_force_kv_f16(type_k, type_v, __func__);

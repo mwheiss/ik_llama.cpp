@@ -517,7 +517,7 @@ With DSV4 graph reuse disabled:
 - Q4 `Hello -n 2` reaches `first_pos=1 is_prefill=0` and stops at
   `DeepSeek V4 decode compressed cache replay not implemented yet`,
 - Q8 forced q8_0 KV reaches the same true decode boundary and still logs the
-  forced-F16 warning,
+  forced-F16 warning.
 
 ## Early decode positions use raw/SWA attention before compressed rows exist
 
@@ -565,6 +565,34 @@ not. Before implementing replay for `n_comp_visible > 0`, inspect cchuter's
 decode behavior for layer 42 and decide whether the tail layer needs its own
 cache state, is skipped, or follows a different current-token-only path.
 
+### Resolution: layer 42 needs DSV4 cache state
+
+The layer-42 boundary was caused by ik's cache allocation path shortening the
+KV/cache layer count by `nextn_predict_layers`, which is correct for the
+mainline MTP architectures that execute their tail through a separate MTP mode
+but is not faithful to cchuter's DeepSeek4 implementation.
+
+cchuter's DeepSeek4 compressed-cache allocation iterates every metadata layer
+and allocates DSV4 compressed cache/state for every layer with
+`attn_compress_ratio[il] > 0`, including layer 42. The retry port now keeps
+that rule local to `LLM_ARCH_DEEPSEEK4`: DSV4 uses all `hparams.n_layer` layers
+for KV/cache allocation and cache-copy bookkeeping, while other non-MTP models
+keep the existing `n_layer - nextn_predict_layers` behavior.
+
+After this fix, the cache log matches the metadata inventory:
+
+```text
+DeepSeek4 compressed KV cache size = 22.18 MiB,
+cache-active attn layers = 41,
+cache-active indexer layers = 21
+```
+
+Q4 and Q8 forced-cache `Hello -n 2` smokes both run through layer 42 decode,
+produce final logits for the second generated token, and exit successfully.
+The Q8 path still logs the forced-F16 KV warning. This confirms that the
+earlier 40/20 cache-active count was a bug inherited from applying generic
+MTP-tail cache exclusion to DeepSeek4, not a DeepSeek4 semantic rule.
+
 ### Validation status
 
 Primitive parity against cchuter remains unchanged after adding the early
@@ -577,4 +605,3 @@ known float32 operation-order cases:
 
 These differences are unrelated to the early decode control flow and remain
 within expected float32 rounding bounds.
-- helper parity remains unchanged.
