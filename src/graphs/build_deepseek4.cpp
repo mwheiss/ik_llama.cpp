@@ -424,6 +424,15 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         ggml_build_forward_expand(gf, q);
         ggml_build_forward_expand(gf, kv);
 
+        if (kv_self.k_l[il] != nullptr && !kv_self.v_l.empty() && kv_self.v_l[il] != nullptr) {
+            // Compressed layers still attend over the local/SWA KV stream during
+            // decode. Store the post-FP8 KV activation now, matching cchuter's
+            // raw/local cache update before compressed-cache composition.
+            dsv4_log_tensor_shape("kv_cache_k_compressed_local", kv_self.k_l[il]);
+            dsv4_log_tensor_shape("kv_cache_v_compressed_local", kv_self.v_l[il]);
+            llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, kv, n_tokens, kv_head, cb, il);
+        }
+
         const int64_t n_comp = n_tokens / compress_ratio;
         if (n_comp > 0) {
             ggml_tensor * comp_pos = ggml_arange(ctx0, 0.0f, float(n_comp * compress_ratio), float(compress_ratio));
