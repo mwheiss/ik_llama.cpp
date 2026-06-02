@@ -1062,6 +1062,13 @@ port pads those masks with `-inf` columns before concatenating raw and
 compressed mask rows. This preserves cchuter mask polarity while matching ik's
 FlashAttention mask shape requirement.
 
+The retry port also supports multi-token decode compressor chunks by sequencing
+the already-validated one-token compressor update over each chunk position. This
+matches cchuter's `dsv4_build_compressor_decode_chunk` semantics while keeping
+the implementation local to existing primitive helpers. The sparse multi-token
+indexer path uses the same prefill-style indexer score helper cchuter uses for
+decode chunks, with a decode causal mask over the visible compressed rows.
+
 ### Validation
 
 The focused primitive test now checks the decode indexer score formula against
@@ -1071,6 +1078,9 @@ cchuter's `ggml_dsv4_rope_tail`:
 
 ```text
 indexer_scores_decode count=5 max_abs=0 mean_abs=0 max_rel=0 worst=0 ulp=0 ok
+compressor_decode_seq67_kv_state max_abs=0 ok
+compressor_decode_seq67_score_state max_abs=0 ok
+compressor_decode_seq67_kv_comp max_abs=0 ok
 ```
 
 Existing nearby gates stayed intact:

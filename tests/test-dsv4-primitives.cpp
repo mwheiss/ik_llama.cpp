@@ -857,6 +857,83 @@ static void test_compressor_decode_ratio4_compress_helper() {
     ggml_free(ctx);
 }
 
+static void test_compressor_decode_ratio4_sequence_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 24 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 2;
+    constexpr int64_t head_dim = 2;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t width = 2 * head_dim;
+    constexpr int64_t rows = 2 * ratio;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_tensor * prev_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    ggml_tensor * prev_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    ggml_tensor * wkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * wgate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * ape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, ratio);
+    ggml_tensor * norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+    init_decode_compressor_case(x, prev_kv, prev_score, wkv, wgate, ape, norm);
+
+    llm_deepseek4_decode_compressor dec6 = llm_build_deepseek4_compressor_decode(
+            ctx, x, prev_kv, prev_score, wkv, wgate, ape, norm,
+            head_dim, 2, 6, ratio, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0e-6f);
+    if (dec6.kv_comp != nullptr) {
+        fprintf(stderr, "compressor_decode sequence: unexpected pos6 kv_comp\n");
+        std::abort();
+    }
+    llm_deepseek4_decode_compressor dec7 = llm_build_deepseek4_compressor_decode(
+            ctx, x, dec6.kv_state, dec6.score_state, wkv, wgate, ape, norm,
+            head_dim, 2, 7, ratio, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0e-6f);
+    if (dec7.kv_comp == nullptr || dec7.kv_comp->ne[2] != 1) {
+        fprintf(stderr, "compressor_decode sequence: expected one pos7 kv_comp row\n");
+        std::abort();
+    }
+    graph_compute(ctx, dec7.kv_state);
+    graph_compute(ctx, dec7.score_state);
+    graph_compute(ctx, dec7.kv_comp);
+
+    float kv_ref6[4];
+    float score_ref6[4];
+    float kv_ref7[4];
+    float score_ref7[4];
+    expected_decode_projection(kv_ref6, score_ref6, 6 % ratio);
+    expected_decode_projection(kv_ref7, score_ref7, 7 % ratio);
+
+    for (int64_t c = 0; c < rows; ++c) {
+        const int64_t shifted_c = 4 + (c % 4);
+        for (int64_t r = 0; r < width; ++r) {
+            float expected_kv = 100.0f + 10.0f * (float) shifted_c + (float) r;
+            float expected_sc = -100.0f - 10.0f * (float) shifted_c - (float) r;
+            if (shifted_c == 6) {
+                expected_kv = kv_ref6[r];
+                expected_sc = score_ref6[r];
+            } else if (shifted_c == 7) {
+                expected_kv = kv_ref7[r];
+                expected_sc = score_ref7[r];
+            }
+            assert_close(ggml_get_f32_nd(dec7.kv_state, r, c, 0, 0), expected_kv, "decode_state_sequence_kv", 1.0e-6f);
+            assert_close(ggml_get_f32_nd(dec7.score_state, r, c, 0, 0), expected_sc, "decode_state_sequence_score", 1.0e-6f);
+        }
+    }
+    for (int64_t i = 0; i < ggml_nelements(dec7.kv_comp); ++i) {
+        const float v = ggml_get_f32_1d(dec7.kv_comp, i);
+        if (!std::isfinite(v)) {
+            fprintf(stderr, "compressor_decode sequence: non-finite kv_comp[%lld] = %.9g\n", (long long) i, v);
+            std::abort();
+        }
+    }
+
+    ggml_free(ctx);
+}
+
 static void test_indexer_scores_prefill_helper() {
     ggml_init_params params = {
         /* .mem_size   = */ 8 * 1024 * 1024,
@@ -1158,6 +1235,7 @@ int main() {
     test_compressor_prefill_state_ratio4_helper();
     test_compressor_decode_ratio4_noncompress_helper();
     test_compressor_decode_ratio4_compress_helper();
+    test_compressor_decode_ratio4_sequence_helper();
     test_indexer_scores_prefill_helper();
     test_indexer_scores_decode_helper();
     test_compressed_mask_from_topk_helper();

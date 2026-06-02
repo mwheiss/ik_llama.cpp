@@ -444,6 +444,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
         const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
         const llama_pos first_pos = batch.pos ? batch.pos[0] : batch.all_pos_0;
+        const llama_pos last_pos = batch.pos ? batch.pos[n_tokens - 1] : (first_pos + n_tokens - 1);
         const bool is_prefill = batch.pos == nullptr || first_pos == 0;
 
         LLAMA_LOG_INFO("%s: DeepSeek4 compressed graph prefix: layer=%d ratio=%u n_embd=%" PRId64
@@ -559,21 +560,70 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             auto & dsv4_cache = kv_self.dsv4_layers[il];
             if (dsv4_cache.kv_state != nullptr && dsv4_cache.score_state != nullptr) {
                 const int64_t n_comp_before  = first_pos / compress_ratio;
-                const int64_t n_comp_visible = (first_pos + 1) / compress_ratio;
+                const int64_t n_comp_visible = (last_pos + 1) / compress_ratio;
                 GGML_ASSERT(n_comp_visible <= dsv4_cache.n_comp);
 
                 const auto attn_layout = dsv4_state_layout(compress_ratio, n_embd_head_k);
-                ggml_tensor * comp_pos = nullptr;
-                if ((first_pos + 1) % compress_ratio == 0) {
-                    comp_pos = build_dsv4_i32_input(int32_t(first_pos + 1 - compress_ratio), "dsv4_decode_comp_pos", il);
-                    dsv4_log_tensor_shape("dsv4_decode_comp_pos", comp_pos);
-                }
                 ggml_tensor * prev_attn_kv_state = view_dsv4_state_segment(
                         dsv4_cache.kv_state, 0, attn_layout.width, attn_layout.rows);
                 ggml_tensor * prev_attn_score_state = view_dsv4_state_segment(
                         dsv4_cache.score_state, 0, attn_layout.width, attn_layout.rows);
 
-                llm_deepseek4_decode_compressor dec = llm_build_deepseek4_compressor_decode(ctx0,
+                auto build_decode_compressor_sequence = [&](ggml_tensor * x,
+                                                            ggml_tensor * prev_kv_state,
+                                                            ggml_tensor * prev_score_state,
+                                                            ggml_tensor * wkv,
+                                                            ggml_tensor * wgate,
+                                                            ggml_tensor * ape,
+                                                            ggml_tensor * norm,
+                                                            int64_t head_dim) {
+                    ggml_tensor * kv_state    = prev_kv_state;
+                    ggml_tensor * score_state = prev_score_state;
+                    ggml_tensor * kv_comp     = nullptr;
+
+                    for (int32_t it = 0; it < n_tokens; ++it) {
+                        const llama_pos pos = batch.pos ? batch.pos[it] : (first_pos + it);
+                        ggml_tensor * x_t = n_tokens == 1 ? x : ggml_view_2d(ctx0, x,
+                                x->ne[0], 1, x->nb[1], it * x->nb[1]);
+                        ggml_tensor * comp_pos = nullptr;
+                        if ((pos + 1) % compress_ratio == 0) {
+                            comp_pos = build_dsv4_i32_input(int32_t(pos + 1 - compress_ratio), "dsv4_decode_comp_pos", il);
+                            dsv4_log_tensor_shape("dsv4_decode_comp_pos", comp_pos);
+                        }
+
+                        llm_deepseek4_decode_compressor step = llm_build_deepseek4_compressor_decode(ctx0,
+                                x_t,
+                                kv_state,
+                                score_state,
+                                wkv,
+                                wgate,
+                                ape,
+                                norm,
+                                head_dim,
+                                n_rot,
+                                pos,
+                                compress_ratio,
+                                rope_type,
+                                rope_cfg.n_ctx_orig,
+                                rope_cfg.freq_base,
+                                rope_cfg.freq_scale,
+                                rope_cfg.ext_factor,
+                                rope_cfg.attn_factor,
+                                rope_cfg.beta_fast,
+                                rope_cfg.beta_slow,
+                                norm_rms_eps,
+                                comp_pos);
+                        kv_state    = step.kv_state;
+                        score_state = step.score_state;
+                        if (step.kv_comp != nullptr) {
+                            kv_comp = kv_comp == nullptr ? step.kv_comp : ggml_concat(ctx0, kv_comp, step.kv_comp, 2);
+                        }
+                    }
+
+                    return llm_deepseek4_decode_compressor{ kv_state, score_state, kv_comp };
+                };
+
+                llm_deepseek4_decode_compressor dec = build_decode_compressor_sequence(
                         cur,
                         prev_attn_kv_state,
                         prev_attn_score_state,
@@ -581,20 +631,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                         layer.attn_compressor_gate,
                         layer.attn_compressor_ape,
                         layer.attn_compressor_norm,
-                        n_embd_head_k,
-                        n_rot,
-                        first_pos,
-                        compress_ratio,
-                        rope_type,
-                        rope_cfg.n_ctx_orig,
-                        rope_cfg.freq_base,
-                        rope_cfg.freq_scale,
-                        rope_cfg.ext_factor,
-                        rope_cfg.attn_factor,
-                        rope_cfg.beta_fast,
-                        rope_cfg.beta_slow,
-                        norm_rms_eps,
-                        comp_pos);
+                        n_embd_head_k);
                 cb(dec.kv_state,    "dsv4_attn_kv_state_decode",    il);
                 cb(dec.score_state, "dsv4_attn_score_state_decode", il);
                 dsv4_log_tensor_shape("dsv4_attn_kv_state_decode",    dec.kv_state);
@@ -619,7 +656,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                     ggml_tensor * prev_index_score_state = view_dsv4_state_segment(
                             dsv4_cache.score_state, attn_layout.elems, index_layout.width, index_layout.rows);
 
-                    llm_deepseek4_decode_compressor index_dec = llm_build_deepseek4_compressor_decode(ctx0,
+                    llm_deepseek4_decode_compressor index_dec = build_decode_compressor_sequence(
                             cur,
                             prev_index_kv_state,
                             prev_index_score_state,
@@ -627,20 +664,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                             layer.indexer_compressor_gate,
                             layer.indexer_compressor_ape,
                             layer.indexer_compressor_norm,
-                            hparams.indexer_head_size,
-                            n_rot,
-                            first_pos,
-                            compress_ratio,
-                            rope_type,
-                            rope_cfg.n_ctx_orig,
-                            rope_cfg.freq_base,
-                            rope_cfg.freq_scale,
-                            rope_cfg.ext_factor,
-                            rope_cfg.attn_factor,
-                            rope_cfg.beta_fast,
-                            rope_cfg.beta_slow,
-                            norm_rms_eps,
-                            comp_pos);
+                            hparams.indexer_head_size);
                     cb(index_dec.kv_state,    "dsv4_index_kv_state_decode",    il);
                     cb(index_dec.score_state, "dsv4_index_score_state_decode", il);
                     dsv4_log_tensor_shape("dsv4_index_kv_state_decode",    index_dec.kv_state);
@@ -737,44 +761,72 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                                 "dsv4_decode_attn_compress_mask", il);
                     } else {
                         GGML_ASSERT(dsv4_cache.index_k != nullptr);
-                        if (n_tokens != 1) {
-                            throw std::runtime_error("DeepSeek V4 sparse multi-token decode indexer mask not implemented yet");
-                        }
                         LLAMA_LOG_INFO("%s: DeepSeek4 decode sparse indexer mask: layer=%d ratio=%u n_comp_visible=%" PRId64
                                 " indexer_top_k=%u\n",
                                 __func__, il, compress_ratio, n_comp_visible, hparams.indexer_top_k);
 
-                        ggml_tensor * index_cache = ggml_view_3d(ctx0, dsv4_cache.index_k,
+                        ggml_tensor * index_cache_3d = ggml_view_3d(ctx0, dsv4_cache.index_k,
                                 hparams.indexer_head_size, 1, n_comp_visible,
                                 dsv4_cache.index_k->nb[1],
                                 dsv4_cache.index_k->nb[1],
                                 0);
-                        cb(index_cache, "dsv4_decode_index_cache", il);
-                        dsv4_log_tensor_shape("dsv4_decode_index_cache", index_cache);
+                        cb(index_cache_3d, "dsv4_decode_index_cache", il);
+                        dsv4_log_tensor_shape("dsv4_decode_index_cache", index_cache_3d);
 
-                        index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, n_comp_visible);
-                        cb(index_cache, "dsv4_decode_index_cache_2d", il);
-                        dsv4_log_tensor_shape("dsv4_decode_index_cache_2d", index_cache);
+                        ggml_tensor * index_scores = nullptr;
+                        if (n_tokens == 1) {
+                            ggml_tensor * index_cache_2d = ggml_reshape_2d(ctx0,
+                                    index_cache_3d, hparams.indexer_head_size, n_comp_visible);
+                            cb(index_cache_2d, "dsv4_decode_index_cache_2d", il);
+                            dsv4_log_tensor_shape("dsv4_decode_index_cache_2d", index_cache_2d);
 
-                        ggml_tensor * index_scores = llm_build_deepseek4_indexer_scores_decode(ctx0,
-                                cur,
-                                qr,
-                                index_cache,
-                                layer.indexer_attn_q_b,
-                                layer.indexer_proj,
-                                inp_pos,
-                                hparams.indexer_n_head,
-                                hparams.indexer_head_size,
-                                n_comp_visible,
-                                n_rot,
-                                rope_type,
-                                rope_cfg.n_ctx_orig,
-                                rope_cfg.freq_base,
-                                rope_cfg.freq_scale,
-                                rope_cfg.ext_factor,
-                                rope_cfg.attn_factor,
-                                rope_cfg.beta_fast,
-                                rope_cfg.beta_slow);
+                            index_scores = llm_build_deepseek4_indexer_scores_decode(ctx0,
+                                    cur,
+                                    qr,
+                                    index_cache_2d,
+                                    layer.indexer_attn_q_b,
+                                    layer.indexer_proj,
+                                    inp_pos,
+                                    hparams.indexer_n_head,
+                                    hparams.indexer_head_size,
+                                    n_comp_visible,
+                                    n_rot,
+                                    rope_type,
+                                    rope_cfg.n_ctx_orig,
+                                    rope_cfg.freq_base,
+                                    rope_cfg.freq_scale,
+                                    rope_cfg.ext_factor,
+                                    rope_cfg.attn_factor,
+                                    rope_cfg.beta_fast,
+                                    rope_cfg.beta_slow);
+                        } else {
+                            ggml_tensor * index_mask = build_dsv4_mask_input(
+                                    llama_dsv4_mask_kind::COMPRESS_CAUSAL,
+                                    n_comp_visible, n_tokens,
+                                    0, n_comp_visible, 0, compress_ratio,
+                                    "dsv4_indexer_decode_causal_mask", il);
+                            dsv4_log_tensor_shape("dsv4_indexer_decode_causal_mask", index_mask);
+
+                            index_scores = llm_build_deepseek4_indexer_scores_prefill(ctx0,
+                                    cur,
+                                    qr,
+                                    index_cache_3d,
+                                    layer.indexer_attn_q_b,
+                                    layer.indexer_proj,
+                                    inp_pos,
+                                    index_mask,
+                                    hparams.indexer_n_head,
+                                    hparams.indexer_head_size,
+                                    n_rot,
+                                    rope_type,
+                                    rope_cfg.n_ctx_orig,
+                                    rope_cfg.freq_base,
+                                    rope_cfg.freq_scale,
+                                    rope_cfg.ext_factor,
+                                    rope_cfg.attn_factor,
+                                    rope_cfg.beta_fast,
+                                    rope_cfg.beta_slow);
+                        }
                         cb(index_scores, "indexer_scores", il);
                         dsv4_log_tensor_shape("indexer_scores", index_scores);
 

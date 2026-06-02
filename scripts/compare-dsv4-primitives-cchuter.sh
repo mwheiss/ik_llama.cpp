@@ -42,6 +42,7 @@ cat > "$PROBE_SRC" <<'CPP'
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
 
 static void compute(ggml_context * ctx, ggml_tensor * out) {
@@ -662,6 +663,74 @@ static void run_compressor_decode() {
     run_compressor_decode_one(7, "compressor_decode_pos7");
 }
 
+static void run_compressor_decode_sequence() {
+    ggml_init_params params = { 24 * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 2;
+    constexpr int64_t head_dim = 2;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t width = 2 * head_dim;
+    constexpr int64_t rows = 2 * ratio;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_tensor * prev_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    ggml_tensor * prev_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    ggml_tensor * wkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * wgate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * ape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, ratio);
+    ggml_tensor * norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+    init_decode_case(x, prev_kv, prev_score, wkv, wgate, ape, norm);
+
+#if defined(CCHUTER_ENGINE)
+    auto project_step = [&](ggml_tensor * kv_state, ggml_tensor * score_state, int64_t pos) {
+        const int64_t pos_mod = pos % ratio;
+        const int64_t row = ratio + pos_mod;
+        ggml_tensor * kv_cur = ggml_mul_mat(ctx, wkv, x);
+        ggml_tensor * sc_cur = ggml_mul_mat(ctx, wgate, x);
+        sc_cur = ggml_add(ctx, sc_cur, ggml_view_2d(ctx, ape, width, 1, ape->nb[1], pos_mod*ape->nb[1]));
+        kv_state = ggml_set_2d_inplace(ctx, kv_state, kv_cur, kv_state->nb[1], row*kv_state->nb[1]);
+        score_state = ggml_set_2d_inplace(ctx, score_state, sc_cur, score_state->nb[1], row*score_state->nb[1]);
+        return std::pair<ggml_tensor *, ggml_tensor *>(kv_state, score_state);
+    };
+
+    auto state6 = project_step(prev_kv, prev_score, 6);
+    auto state7 = project_step(state6.first, state6.second, 7);
+    ggml_tensor * kv_prev = probe_view_cols(ctx, state7.first, head_dim, ratio, 0, 0);
+    ggml_tensor * kv_curr = probe_view_cols(ctx, state7.first, head_dim, ratio, head_dim, ratio);
+    ggml_tensor * sc_prev = probe_view_cols(ctx, state7.second, head_dim, ratio, 0, 0);
+    ggml_tensor * sc_curr = probe_view_cols(ctx, state7.second, head_dim, ratio, head_dim, ratio);
+    ggml_tensor * kv_pool = ggml_concat(ctx, kv_prev, kv_curr, 1);
+    ggml_tensor * score_pool = ggml_concat(ctx, sc_prev, sc_curr, 1);
+    ggml_tensor * shifted_kv = probe_view_cols(ctx, state7.first, width, ratio, 0, ratio);
+    ggml_tensor * shifted_score = probe_view_cols(ctx, state7.second, width, ratio, 0, ratio);
+    ggml_tensor * kv_state = ggml_concat(ctx, shifted_kv, shifted_kv, 1);
+    ggml_tensor * score_state = ggml_concat(ctx, shifted_score, shifted_score, 1);
+    ggml_tensor * kv_comp = probe_pool_decode_state(ctx, kv_pool, score_pool, norm,
+            probe_arange_i32(ctx, 4, 5), head_dim, 2);
+#else
+    llm_deepseek4_decode_compressor dec6 = llm_build_deepseek4_compressor_decode(
+            ctx, x, prev_kv, prev_score, wkv, wgate, ape, norm,
+            head_dim, 2, 6, ratio, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0e-6f);
+    llm_deepseek4_decode_compressor dec7 = llm_build_deepseek4_compressor_decode(
+            ctx, x, dec6.kv_state, dec6.score_state, wkv, wgate, ape, norm,
+            head_dim, 2, 7, ratio, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0e-6f);
+    ggml_tensor * kv_state = dec7.kv_state;
+    ggml_tensor * score_state = dec7.score_state;
+    ggml_tensor * kv_comp = dec7.kv_comp;
+#endif
+
+    compute(ctx, ggml_sum(ctx, kv_state));
+    emit("compressor_decode_seq67_kv_state", kv_state);
+    compute(ctx, ggml_sum(ctx, score_state));
+    emit("compressor_decode_seq67_score_state", score_state);
+    compute(ctx, kv_comp);
+    emit("compressor_decode_seq67_kv_comp", kv_comp);
+    ggml_free(ctx);
+}
+
 static void run_indexer_scores_decode() {
     ggml_init_params params = { 8 * 1024 * 1024, nullptr, false };
     ggml_context * ctx = ggml_init(params);
@@ -745,6 +814,7 @@ int main() {
     run_grouped_out();
     run_compressor_prefill_state();
     run_compressor_decode();
+    run_compressor_decode_sequence();
     run_indexer_scores_decode();
     run_rope_tail();
     return 0;
@@ -858,6 +928,9 @@ expected = [
     "compressor_decode_pos7_kv_state",
     "compressor_decode_pos7_score_state",
     "compressor_decode_pos7_kv_comp",
+    "compressor_decode_seq67_kv_state",
+    "compressor_decode_seq67_score_state",
+    "compressor_decode_seq67_kv_comp",
     "indexer_scores_decode",
     "rope_tail",
 ]
@@ -882,6 +955,9 @@ tolerances = {
     "compressor_decode_pos7_kv_state": 2.0e-6,
     "compressor_decode_pos7_score_state": 2.0e-6,
     "compressor_decode_pos7_kv_comp": 2.0e-6,
+    "compressor_decode_seq67_kv_state": 2.0e-6,
+    "compressor_decode_seq67_score_state": 2.0e-6,
+    "compressor_decode_seq67_kv_comp": 2.0e-6,
     "indexer_scores_decode": 2.0e-6,
     "rope_tail": 2.0e-6,
 }
