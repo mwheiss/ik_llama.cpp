@@ -293,6 +293,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         }
 
         const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
+        const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
 
         LLAMA_LOG_INFO("%s: DeepSeek4 compressed graph prefix: layer=%d ratio=%u n_embd=%" PRId64
                 " n_hc=%" PRId64 " n_tokens=%d\n",
@@ -384,6 +385,11 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             dsv4_log_tensor_shape("KVcompress", kv_comp);
             ggml_build_forward_expand(gf, kv_comp);
 
+            ggml_tensor * k_all = ggml_concat(ctx0, kv, kv_comp, 2);
+            ggml_tensor * v_all = k_all;
+            cb(k_all, "dsv4_attn_k_all", il);
+            dsv4_log_tensor_shape("dsv4_attn_k_all", k_all);
+
             if (compress_ratio == 4) {
                 ggml_tensor * index_kv = llm_build_deepseek4_compressor_prefill(ctx0,
                         cur,
@@ -449,6 +455,30 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                 cb(comp_mask, "dsv4_attn_compress_mask", il);
                 dsv4_log_tensor_shape("dsv4_attn_compress_mask", comp_mask);
                 ggml_build_forward_expand(gf, comp_mask);
+
+                ggml_tensor * raw_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
+                cb(raw_mask, "dsv4_attn_raw_window_mask", il);
+                dsv4_log_tensor_shape("dsv4_attn_raw_window_mask", raw_mask);
+                ggml_tensor * attn_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+                cb(attn_mask, "dsv4_attn_mask", il);
+                dsv4_log_tensor_shape("dsv4_attn_mask", attn_mask);
+
+                ggml_tensor * q_attn = ggml_permute(ctx0, q, 0, 2, 1, 3);
+                ggml_tensor * k_attn = ggml_permute(ctx0, k_all, 0, 2, 1, 3);
+                ggml_tensor * v_attn = ggml_permute(ctx0, v_all, 0, 2, 1, 3);
+                cb(q_attn, "dsv4_attn_q", il);
+                cb(k_attn, "dsv4_attn_k", il);
+                cb(v_attn, "dsv4_attn_v", il);
+                dsv4_log_tensor_shape("dsv4_attn_q", q_attn);
+                dsv4_log_tensor_shape("dsv4_attn_k", k_attn);
+                dsv4_log_tensor_shape("dsv4_attn_v", v_attn);
+
+                ggml_tensor * attn_out = ggml_flash_attn_ext(ctx0, q_attn, k_attn, v_attn,
+                        attn_mask, kq_scale, hparams.f_max_alibi_bias, 0.0f);
+                ggml_flash_attn_ext_add_sinks(attn_out, layer.attn_sinks);
+                cb(attn_out, "dsv4_compressed_attn_out", il);
+                dsv4_log_tensor_shape("dsv4_compressed_attn_out", attn_out);
+                ggml_build_forward_expand(gf, attn_out);
             }
         }
     };
@@ -459,7 +489,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             LLAMA_LOG_INFO("%s: DeepSeek4 graph slice: reached compressed layer %d, ratio=%u\n",
                     __func__, il, compress_ratio);
             build_compressed_prefix(inpL, il);
-            throw std::runtime_error("DeepSeek V4 compressed attention composition graph segment not implemented yet");
+            throw std::runtime_error("DeepSeek V4 compressed attention output projection graph segment not implemented yet");
         }
 
         inpL = build_local_layer(inpL, il);
