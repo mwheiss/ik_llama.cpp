@@ -364,6 +364,85 @@ static void test_hc_expand_helper() {
     ggml_free(ctx);
 }
 
+static void test_hc_head_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 4 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 2;
+    constexpr int64_t n_hc = 2;
+    constexpr int64_t n_tokens = 2;
+    constexpr float norm_eps = 1.0e-6f;
+    constexpr float hc_eps = 1.0e-5f;
+
+    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+    ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*n_hc, n_hc);
+    ggml_tensor * hc_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * hc_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_hc);
+
+    const float xv[n_tokens][n_hc][n_embd] = {
+        { { 0.20f, -0.30f }, { 0.50f, 0.10f } },
+        { { -0.40f, 0.70f }, { 0.25f, -0.15f } },
+    };
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t h = 0; h < n_hc; ++h) {
+            for (int64_t e = 0; e < n_embd; ++e) {
+                ggml_set_f32_nd(x, e, h, t, 0, xv[t][h][e]);
+            }
+        }
+    }
+
+    const float w[n_hc][n_embd*n_hc] = {
+        { 0.10f, -0.20f, 0.30f, 0.40f },
+        { -0.50f, 0.25f, 0.15f, -0.35f },
+    };
+    for (int64_t h = 0; h < n_hc; ++h) {
+        for (int64_t i = 0; i < n_embd*n_hc; ++i) {
+            ggml_set_f32_nd(hc_fn, i, h, 0, 0, w[h][i]);
+        }
+    }
+    ggml_set_f32(hc_scale, 1.25f);
+    ggml_set_f32_nd(hc_base, 0, 0, 0, 0, -0.10f);
+    ggml_set_f32_nd(hc_base, 1, 0, 0, 0, 0.20f);
+
+    ggml_tensor * out = llm_build_deepseek4_hc_head(ctx, x, hc_fn, hc_scale, hc_base,
+            n_embd, n_hc, n_tokens, norm_eps, hc_eps);
+    graph_compute(ctx, out);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        float flat[n_embd*n_hc];
+        float sum_sq = 0.0f;
+        for (int64_t h = 0; h < n_hc; ++h) {
+            for (int64_t e = 0; e < n_embd; ++e) {
+                const int64_t i = e + h*n_embd;
+                flat[i] = xv[t][h][e];
+                sum_sq += flat[i]*flat[i];
+            }
+        }
+        const float rms = std::sqrt(sum_sq / float(n_embd*n_hc) + norm_eps);
+
+        float weights[n_hc];
+        for (int64_t h = 0; h < n_hc; ++h) {
+            float z = 0.0f;
+            for (int64_t i = 0; i < n_embd*n_hc; ++i) {
+                z += flat[i] / rms * w[h][i];
+            }
+            z = z * 1.25f + (h == 0 ? -0.10f : 0.20f);
+            weights[h] = 1.0f / (1.0f + std::exp(-z)) + hc_eps;
+        }
+
+        for (int64_t e = 0; e < n_embd; ++e) {
+            const float expected = xv[t][0][e]*weights[0] + xv[t][1][e]*weights[1];
+            assert_close(ggml_get_f32_nd(out, e, t, 0, 0), expected, "hc_head_helper", 2.0e-6f);
+        }
+    }
+
+    ggml_free(ctx);
+}
+
 static void test_grouped_out_helper() {
     ggml_init_params params = {
         /* .mem_size   = */ 4 * 1024 * 1024,
@@ -734,6 +813,7 @@ int main() {
     test_fp8_kv_quantize();
     test_hc_weighted_sum_helper();
     test_hc_expand_helper();
+    test_hc_head_helper();
     test_grouped_out_helper();
     test_compressor_prefill_ratio4_helper();
     test_indexer_scores_prefill_helper();

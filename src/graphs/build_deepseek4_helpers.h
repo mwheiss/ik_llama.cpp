@@ -51,6 +51,18 @@ struct ggml_tensor * llm_build_deepseek4_hc_expand(
         struct ggml_tensor  * post,
         struct ggml_tensor  * comb);
 
+struct ggml_tensor * llm_build_deepseek4_hc_head(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * hc_fn,
+        struct ggml_tensor  * hc_scale,
+        struct ggml_tensor  * hc_base,
+        int64_t               n_embd,
+        int64_t               n_hc,
+        int64_t               n_tokens,
+        float                 norm_eps,
+        float                 hc_eps);
+
 struct ggml_tensor * llm_build_deepseek4_grouped_out(
         struct ggml_context * ctx,
         struct ggml_tensor  * o,

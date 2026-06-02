@@ -275,6 +275,54 @@ static void run_hc_pre() {
     ggml_free(ctx);
 }
 
+static void run_hc_head() {
+    ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 4;
+    constexpr int64_t n_hc = 3;
+    constexpr int64_t n_tokens = 2;
+    constexpr int64_t hc_dim = n_embd * n_hc;
+
+    ggml_tensor * x        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+    ggml_tensor * hc_fn    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, n_hc);
+    ggml_tensor * hc_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * hc_base  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_hc);
+
+    ggml_set_f32_1d(hc_scale, 0, 0.75f);
+    for (int64_t h = 0; h < n_hc; ++h) {
+        ggml_set_f32_1d(hc_base, h, 0.02f * (float) (h - 1));
+    }
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t h = 0; h < n_hc; ++h) {
+            for (int64_t e = 0; e < n_embd; ++e) {
+                ggml_set_f32_nd(x, e, h, t, 0, 0.025f * (float) (3*e - 2*h + t));
+            }
+        }
+    }
+    for (int64_t h = 0; h < n_hc; ++h) {
+        for (int64_t d = 0; d < hc_dim; ++d) {
+            ggml_set_f32_nd(hc_fn, d, h, 0, 0, 0.0015f * (float) ((7*d + 3*h) % 11 - 5));
+        }
+    }
+
+#if defined(CCHUTER_ENGINE)
+    ggml_tensor * flat = ggml_cont(ctx, ggml_reshape_2d(ctx, x, hc_dim, n_tokens));
+    flat = ggml_rms_norm(ctx, flat, 1.0e-6f);
+    ggml_tensor * pre = ggml_mul_mat(ctx, hc_fn, flat);
+    pre = ggml_mul(ctx, pre, ggml_repeat(ctx, ggml_view_2d(ctx, hc_scale, 1, 1, hc_scale->nb[1], 0), pre));
+    pre = ggml_add(ctx, pre, ggml_repeat(ctx, ggml_view_2d(ctx, hc_base, n_hc, 1, hc_base->nb[1], 0), pre));
+    pre = ggml_scale_bias(ctx, ggml_cont(ctx, ggml_sigmoid(ctx, pre)), 1.0f, 1.0e-6f);
+    ggml_tensor * out = ggml_dsv4_hc_weighted_sum(ctx, x, pre);
+#else
+    ggml_tensor * out = llm_build_deepseek4_hc_head(ctx,
+            x, hc_fn, hc_scale, hc_base, n_embd, n_hc, n_tokens, 1.0e-6f, 1.0e-6f);
+#endif
+    compute(ctx, out);
+    emit("hc_head", out);
+    ggml_free(ctx);
+}
+
 static void run_rope_tail() {
     ggml_init_params params = { 8 * 1024 * 1024, nullptr, false };
     ggml_context * ctx = ggml_init(params);
@@ -369,6 +417,7 @@ int main() {
     run_hc_weighted_sum();
     run_hc_expand();
     run_hc_pre();
+    run_hc_head();
     run_grouped_out();
     run_rope_tail();
     return 0;
@@ -473,6 +522,7 @@ expected = [
     "hc_pre_post",
     "hc_pre_comb",
     "hc_pre_y",
+    "hc_head",
     "grouped_out",
     "rope_tail",
 ]
@@ -488,6 +538,7 @@ tolerances = {
     "hc_pre_pre": 2.0e-6,
     "hc_pre_post": 2.0e-6,
     "hc_pre_comb": 2.0e-6,
+    "hc_head": 2.0e-6,
     "grouped_out": 2.0e-6,
     "rope_tail": 2.0e-6,
 }

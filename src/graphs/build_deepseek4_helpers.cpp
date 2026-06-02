@@ -270,6 +270,48 @@ struct ggml_tensor * llm_build_deepseek4_hc_expand(
     return out;
 }
 
+struct ggml_tensor * llm_build_deepseek4_hc_head(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * hc_fn,
+        struct ggml_tensor  * hc_scale,
+        struct ggml_tensor  * hc_base,
+        int64_t               n_embd,
+        int64_t               n_hc,
+        int64_t               n_tokens,
+        float                 norm_eps,
+        float                 hc_eps) {
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(hc_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(hc_base->type  == GGML_TYPE_F32);
+    GGML_ASSERT(x->ne[0] == n_embd);
+    GGML_ASSERT(x->ne[1] == n_hc);
+    GGML_ASSERT(x->ne[2] == n_tokens);
+    GGML_ASSERT(hc_fn->ne[0] == n_embd * n_hc);
+    GGML_ASSERT(hc_fn->ne[1] == n_hc);
+    GGML_ASSERT(hc_scale->ne[0] == 1);
+    GGML_ASSERT(hc_base->ne[0] == n_hc);
+
+    const int64_t hc_dim = n_embd * n_hc;
+
+    struct ggml_tensor * flat = ggml_cont(ctx, ggml_reshape_2d(ctx, x, hc_dim, n_tokens));
+    flat = ggml_rms_norm(ctx, flat, norm_eps);
+
+    struct ggml_tensor * pre = hc_fn->type == GGML_TYPE_F32
+        ? llm_build_deepseek4_f32_project(ctx, hc_fn, flat)
+        : ggml_mul_mat(ctx, hc_fn, flat);
+
+    struct ggml_tensor * scale = ggml_view_2d(ctx, hc_scale, 1, 1, hc_scale->nb[1], 0);
+    scale = ggml_repeat(ctx, scale, pre);
+    struct ggml_tensor * base = ggml_view_2d(ctx, hc_base, n_hc, 1, hc_base->nb[1], 0);
+    base = ggml_repeat(ctx, base, pre);
+
+    pre = ggml_add(ctx, ggml_mul(ctx, pre, scale), base);
+    pre = llm_build_deepseek4_add_scalar(ctx, ggml_sigmoid(ctx, pre), hc_eps);
+
+    return llm_build_deepseek4_hc_weighted_sum(ctx, x, pre);
+}
+
 struct ggml_tensor * llm_build_deepseek4_grouped_out(
         struct ggml_context * ctx,
         struct ggml_tensor  * o,

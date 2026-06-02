@@ -527,7 +527,9 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             }
         }
 
-        throw std::runtime_error("DeepSeek V4 compressed attention path produced no output");
+        throw std::runtime_error(n_comp == 0
+                ? "DeepSeek V4 decode compressed attention graph segment not implemented yet"
+                : "DeepSeek V4 compressed attention path produced no output");
     };
 
     for (int il = 0; il < n_layer; ++il) {
@@ -544,7 +546,30 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
 
     (void) n_lora_q;
 
-    throw std::runtime_error("DeepSeek V4 final output graph segment not implemented yet");
+    if (n_tokens > 1) {
+        ggml_tensor * inp_out_ids = build_inp_out_ids();
+        inpL = ggml_reshape_2d(ctx0, inpL, n_embd * n_hc, n_tokens);
+        inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, n_hc, n_outputs);
+        cb(inpL, "result_gather_hc", -1);
+        dsv4_log_tensor_shape("result_gather_hc", inpL);
+    }
+
+    ggml_tensor * cur = llm_build_deepseek4_hc_head(ctx0, inpL,
+            model.output_hc_fn, model.output_hc_scale, model.output_hc_base,
+            n_embd, n_hc, n_tokens > 1 ? n_outputs : n_tokens,
+            norm_rms_eps, hparams.hc_eps);
+    cb(cur, "result_hc", -1);
+    dsv4_log_tensor_shape("result_hc", cur);
+
+    cur = llm_build_norm(ctx0, cur, hparams, model.output_norm, nullptr, LLM_NORM_RMS, cb, -1);
+    cb(cur, "result_norm", -1);
+    dsv4_log_tensor_shape("result_norm", cur);
+
+    cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
+    cb(cur, "result_output", -1);
+    dsv4_log_tensor_shape("result_output", cur);
+    ggml_build_forward_expand(gf, cur);
 
     return gf;
 }
