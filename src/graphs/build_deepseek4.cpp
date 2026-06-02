@@ -4,6 +4,7 @@
 
 #include "build_deepseek4_helpers.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -283,6 +284,8 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         GGML_ASSERT(layer.attn_compressor_ape != nullptr);
         GGML_ASSERT(layer.attn_compressor_norm != nullptr);
         if (compress_ratio == 4) {
+            GGML_ASSERT(layer.indexer_attn_q_b != nullptr);
+            GGML_ASSERT(layer.indexer_proj != nullptr);
             GGML_ASSERT(layer.indexer_compressor_kv != nullptr);
             GGML_ASSERT(layer.indexer_compressor_gate != nullptr);
             GGML_ASSERT(layer.indexer_compressor_ape != nullptr);
@@ -404,6 +407,43 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                 cb(index_kv, "indexer_KVcompress", il);
                 dsv4_log_tensor_shape("indexer_KVcompress", index_kv);
                 ggml_build_forward_expand(gf, index_kv);
+
+                ggml_tensor * index_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_comp, n_tokens);
+                cb(index_mask, "dsv4_indexer_causal_mask", il);
+                dsv4_log_tensor_shape("dsv4_indexer_causal_mask", index_mask);
+
+                ggml_tensor * index_scores = llm_build_deepseek4_indexer_scores_prefill(ctx0,
+                        cur,
+                        qr,
+                        index_kv,
+                        layer.indexer_attn_q_b,
+                        layer.indexer_proj,
+                        inp_pos,
+                        index_mask,
+                        hparams.indexer_n_head,
+                        hparams.indexer_head_size,
+                        n_rot,
+                        rope_type,
+                        rope_cfg.n_ctx_orig,
+                        rope_cfg.freq_base,
+                        rope_cfg.freq_scale,
+                        rope_cfg.ext_factor,
+                        rope_cfg.attn_factor,
+                        rope_cfg.beta_fast,
+                        rope_cfg.beta_slow);
+                cb(index_scores, "indexer_scores", il);
+                dsv4_log_tensor_shape("indexer_scores", index_scores);
+
+                const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp);
+                ggml_tensor * sorted = ggml_argsort(ctx0, index_scores, GGML_SORT_ORDER_DESC);
+                cb(sorted, "indexer_argsort", il);
+                dsv4_log_tensor_shape("indexer_argsort", sorted);
+                ggml_tensor * topk = ggml_view_2d(ctx0, sorted,
+                        top_k, n_tokens,
+                        sorted->nb[1], 0);
+                cb(topk, "indexer_topk", il);
+                dsv4_log_tensor_shape("indexer_topk", topk);
+                ggml_build_forward_expand(gf, topk);
             }
         }
     };
@@ -414,7 +454,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             LLAMA_LOG_INFO("%s: DeepSeek4 graph slice: reached compressed layer %d, ratio=%u\n",
                     __func__, il, compress_ratio);
             build_compressed_prefix(inpL, il);
-            throw std::runtime_error("DeepSeek V4 indexer scoring graph segment not implemented yet");
+            throw std::runtime_error("DeepSeek V4 compressed top-k mask graph segment not implemented yet");
         }
 
         inpL = build_local_layer(inpL, il);
