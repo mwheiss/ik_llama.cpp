@@ -136,7 +136,8 @@ struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow,
-        float                 norm_eps);
+        float                 norm_eps,
+        struct ggml_tensor  * comp_pos = nullptr);
 
 struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
         struct ggml_context * ctx,

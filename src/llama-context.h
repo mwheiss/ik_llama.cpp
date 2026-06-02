@@ -28,6 +28,11 @@ struct llama_dsv4_mask_input {
     int64_t ratio  = 0;
 };
 
+struct llama_dsv4_i32_input {
+    struct ggml_tensor * tensor = nullptr;
+    std::vector<int32_t> values;
+};
+
 struct llama_kv_cell {
     llama_pos pos   = -1;
     llama_pos delta = 0;
@@ -326,6 +331,7 @@ struct llama_context {
     // the regular KV mask. They are registered while building the DSV4 graph
     // and filled from the current ubatch positions in llama_set_inputs().
     std::vector<llama_dsv4_mask_input> inp_dsv4_masks;
+    std::vector<llama_dsv4_i32_input>  inp_dsv4_i32;
 
     ggml_backend_t ggml_backend_by_name(const char * name);
 

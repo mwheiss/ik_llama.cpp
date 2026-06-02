@@ -106,9 +106,7 @@ static struct ggml_tensor * llm_build_deepseek4_arange_i32(
         int64_t               begin,
         int64_t               end) {
     GGML_ASSERT(end >= begin);
-    if (ggml_get_no_alloc(ctx)) {
-        return ggml_cast(ctx, ggml_arange(ctx, float(begin), float(end), 1.0f), GGML_TYPE_I32);
-    }
+    GGML_ASSERT(!ggml_get_no_alloc(ctx));
 
     struct ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, end - begin);
     for (int64_t i = begin; i < end; ++i) {
@@ -611,7 +609,8 @@ struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow,
-        float                 norm_eps) {
+        float                 norm_eps,
+        struct ggml_tensor  * comp_pos) {
     GGML_ASSERT(compress_ratio > 0);
     GGML_ASSERT(pos >= 0);
 
@@ -677,8 +676,12 @@ struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
             score_pool = score_state;
         }
 
-        struct ggml_tensor * comp_pos = llm_build_deepseek4_arange_i32(ctx,
-                pos + 1 - compress_ratio, pos + 2 - compress_ratio);
+        if (comp_pos == nullptr) {
+            comp_pos = llm_build_deepseek4_arange_i32(ctx,
+                    pos + 1 - compress_ratio, pos + 2 - compress_ratio);
+        }
+        GGML_ASSERT(comp_pos->type == GGML_TYPE_I32);
+        GGML_ASSERT(comp_pos->ne[0] == 1);
         kv_comp = llm_build_deepseek4_pool_decode_state(ctx, kv_pool, score_pool, norm, comp_pos,
                 n_embd_head, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow, norm_eps);

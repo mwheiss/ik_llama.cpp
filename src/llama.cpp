@@ -4379,6 +4379,19 @@ static void llama_set_dsv4_masks(llama_context & lctx, const llama_batch & batch
     }
 }
 
+static void llama_set_dsv4_i32_inputs(llama_context & lctx) {
+    for (const llama_dsv4_i32_input & inp : lctx.inp_dsv4_i32) {
+        ggml_tensor * t = inp.tensor;
+        GGML_ASSERT(t != nullptr);
+        GGML_ASSERT(t->type == GGML_TYPE_I32);
+        GGML_ASSERT(t->buffer != nullptr);
+        GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+        GGML_ASSERT((size_t) ggml_nelements(t) == inp.values.size());
+
+        ggml_backend_tensor_set(t, inp.values.data(), 0, inp.values.size()*sizeof(int32_t));
+    }
+}
+
 static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     //
     // set input data
@@ -4820,6 +4833,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     }
 
     llama_set_dsv4_masks(lctx, batch);
+    llama_set_dsv4_i32_inputs(lctx);
 
     if (cparams.embeddings && cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN) {
         const int64_t n_tokens = batch.n_tokens;

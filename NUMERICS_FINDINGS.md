@@ -420,17 +420,21 @@ full model graph, however, `ctx0` is a no-alloc graph-build context. Calling
 as soon as `should_compress` becomes true. For ratio-4 layers, this first
 happens at decode position 3.
 
-The helper now selects the position tensor construction based on the GGML
-context:
+The first attempt to avoid the graph-build segfault used
+`ggml_arange(...)->ggml_cast(I32)` for no-alloc graph contexts. That built the
+graph, but execution then aborted in GGML's F32-to-I32 `dup/cpy` path, which is
+not implemented for this CPU path.
 
-- allocated helper/test contexts keep the direct I32 tensor fill,
-- no-alloc model-graph contexts use `ggml_arange(...)->ggml_cast(I32)`.
+The helper now keeps direct I32 tensor fills only for allocated helper/test
+contexts. For no-alloc model graphs, the graph builder supplies a tiny DSV4 I32
+input tensor and `llama_set_inputs()` fills it with the known compressed-row
+position, e.g. `pos + 1 - compress_ratio` for one emitted row.
 
 This keeps the existing helper parity path unchanged while making the model
 graph construction safe for the first compressed-row decode step. If the
-arange/cast path later shows numeric or backend trouble, add a runtime input
-for the scalar compression position instead of writing constants into a
-no-alloc graph context.
+input plumbing later needs to support multi-token decode chunks, extend it to
+store the corresponding vector of compressed positions instead of writing
+constants into a no-alloc graph context.
 
 ## Decode compressor graph boundary is not yet runtime-position validation
 
@@ -627,3 +631,44 @@ known float32 operation-order cases:
 
 These differences are unrelated to the early decode control flow and remain
 within expected float32 rounding bounds.
+
+## Decode compressed K/V replay cannot concat F16 cache views along dim 2
+
+### Finding
+
+The first compressed-cache replay implementation built the decode attention
+K/V input by appending the visible compressed cache rows after the raw/SWA KV
+cache rows:
+
+```text
+raw cache       [head_dim, 1, n_kv]          f16
+compressed rows [head_dim, 1, n_comp_visible] f16
+concat dim 2 -> [head_dim, 1, n_kv + n_comp_visible]
+```
+
+This matched the intended tensor shape, but it aborted at runtime in GGML:
+
+```text
+ggml.c:15040: GGML_ASSERT(dim == 0) failed
+```
+
+The cause was not DeepSeek4 math. In this ik/GGML version, F32 concat has a
+general multi-dimensional execution path, while the fallback path used by F16
+and other non-F32 types only supports `dim == 0`.
+
+### Resolution
+
+The DSV4 graph now promotes the two F16 cache views to F32 before the dim-2
+concat. The existing flash-attention path then casts the permuted combined K/V
+back to F16 before `ggml_flash_attn_ext`.
+
+This is expected to preserve cache values exactly:
+
+- F16-to-F32 promotion is lossless,
+- the combined tensor is cast back to F16 before attention,
+- the change is local to DSV4 graph construction and does not alter GGML's
+  shared concat implementation.
+
+After the fix, Q4 `Hello -c 128 -b 128 -ub 128 -n 4` exits successfully and
+logs decode compressed replay through layer 42 plus final logits. Primitive
+parity against cchuter remains unchanged.

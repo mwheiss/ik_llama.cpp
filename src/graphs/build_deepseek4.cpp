@@ -93,6 +93,14 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         return t;
     };
 
+    auto build_dsv4_i32_input = [&](int32_t value, const char * name, int il) {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(t);
+        cb(t, name, il);
+        lctx.inp_dsv4_i32.push_back({ t, { value } });
+        return t;
+    };
+
     auto store_dsv4_cache_rows = [&](ggml_tensor * cache, ggml_tensor * src, int64_t row_start, int64_t n_rows) {
         if (cache == nullptr || src == nullptr || n_rows <= 0) {
             return;
@@ -548,6 +556,11 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                 GGML_ASSERT(n_comp_visible <= dsv4_cache.n_comp);
 
                 const auto attn_layout = dsv4_state_layout(compress_ratio, n_embd_head_k);
+                ggml_tensor * comp_pos = nullptr;
+                if ((first_pos + 1) % compress_ratio == 0) {
+                    comp_pos = build_dsv4_i32_input(int32_t(first_pos + 1 - compress_ratio), "dsv4_decode_comp_pos", il);
+                    dsv4_log_tensor_shape("dsv4_decode_comp_pos", comp_pos);
+                }
                 ggml_tensor * prev_attn_kv_state = view_dsv4_state_segment(
                         dsv4_cache.kv_state, 0, attn_layout.width, attn_layout.rows);
                 ggml_tensor * prev_attn_score_state = view_dsv4_state_segment(
@@ -573,7 +586,8 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                         rope_cfg.attn_factor,
                         rope_cfg.beta_fast,
                         rope_cfg.beta_slow,
-                        norm_rms_eps);
+                        norm_rms_eps,
+                        comp_pos);
                 cb(dec.kv_state,    "dsv4_attn_kv_state_decode",    il);
                 cb(dec.score_state, "dsv4_attn_score_state_decode", il);
                 dsv4_log_tensor_shape("dsv4_attn_kv_state_decode",    dec.kv_state);
@@ -618,7 +632,8 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                             rope_cfg.attn_factor,
                             rope_cfg.beta_fast,
                             rope_cfg.beta_slow,
-                            norm_rms_eps);
+                            norm_rms_eps,
+                            comp_pos);
                     cb(index_dec.kv_state,    "dsv4_index_kv_state_decode",    il);
                     cb(index_dec.score_state, "dsv4_index_score_state_decode", il);
                     dsv4_log_tensor_shape("dsv4_index_kv_state_decode",    index_dec.kv_state);
@@ -665,6 +680,72 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
                     ggml_build_forward_expand(gf, out);
                     return out;
                 }
+
+                GGML_ASSERT(dsv4_cache.attn_k != nullptr);
+                GGML_ASSERT(kv_self.k_l[il] != nullptr);
+                GGML_ASSERT(hparams.n_head_kv(il) == 1);
+
+                ggml_tensor * k_raw = ggml_view_3d(ctx0, kv_self.k_l[il],
+                        n_embd_head_k, 1, n_kv,
+                        kv_self.k_l[il]->nb[1],
+                        kv_self.k_l[il]->nb[1],
+                        0);
+                cb(k_raw, "dsv4_decode_k_raw", il);
+                dsv4_log_tensor_shape("dsv4_decode_k_raw", k_raw);
+
+                ggml_tensor * kv_comp_cache = ggml_view_3d(ctx0, dsv4_cache.attn_k,
+                        n_embd_head_k, 1, n_comp_visible,
+                        dsv4_cache.attn_k->nb[1],
+                        dsv4_cache.attn_k->nb[1],
+                        0);
+                cb(kv_comp_cache, "dsv4_decode_kv_comp_cache", il);
+                dsv4_log_tensor_shape("dsv4_decode_kv_comp_cache", kv_comp_cache);
+
+                // GGML only executes non-F32 concat along dim 0. Promote the F16
+                // cache views for the dim-2 append; flash attention casts the
+                // combined K/V back to F16 below, so cached values are preserved.
+                ggml_tensor * k_raw_cat = k_raw->type == GGML_TYPE_F32 ? k_raw : ggml_cast(ctx0, k_raw, GGML_TYPE_F32);
+                ggml_tensor * kv_comp_cat = kv_comp_cache->type == GGML_TYPE_F32 ? kv_comp_cache : ggml_cast(ctx0, kv_comp_cache, GGML_TYPE_F32);
+                ggml_tensor * k_all = ggml_concat(ctx0, k_raw_cat, kv_comp_cat, 2);
+                ggml_tensor * v_all = k_all;
+                cb(k_all, "dsv4_decode_k_all", il);
+                dsv4_log_tensor_shape("dsv4_decode_k_all", k_all);
+
+                const int64_t n_tokens_attn = cparams.flash_attn ? GGML_PAD(n_tokens, GGML_KQ_MASK_PAD) : n_tokens;
+                ggml_tensor * raw_mask = ggml_view_2d(ctx0, KQ_mask_swa,
+                        n_kv, n_tokens_attn,
+                        KQ_mask_swa->nb[1],
+                        0);
+                raw_mask = raw_mask->type == GGML_TYPE_F32 ? raw_mask : ggml_cast(ctx0, raw_mask, GGML_TYPE_F32);
+                cb(raw_mask, "dsv4_decode_raw_mask", il);
+                dsv4_log_tensor_shape("dsv4_decode_raw_mask", raw_mask);
+
+                ggml_tensor * comp_mask = nullptr;
+                if (compress_ratio == 4) {
+                    if (n_comp_visible <= hparams.indexer_top_k) {
+                        comp_mask = build_dsv4_mask_input(
+                                llama_dsv4_mask_kind::COMPRESS_CAUSAL,
+                                n_comp_visible, n_tokens_attn,
+                                0, n_comp_visible, 0, compress_ratio,
+                                "dsv4_decode_attn_compress_mask", il);
+                    } else {
+                        throw std::runtime_error("DeepSeek V4 decode indexer top-k compressed mask not implemented yet");
+                    }
+                } else {
+                    comp_mask = build_dsv4_mask_input(
+                            llama_dsv4_mask_kind::COMPRESS_CAUSAL,
+                            n_comp_visible, n_tokens_attn,
+                            0, n_comp_visible, 0, compress_ratio,
+                            "dsv4_decode_attn_compress_mask", il);
+                }
+                cb(comp_mask, "dsv4_decode_attn_compress_mask", il);
+                dsv4_log_tensor_shape("dsv4_decode_attn_compress_mask", comp_mask);
+
+                ggml_tensor * attn_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+                cb(attn_mask, "dsv4_decode_attn_mask", il);
+                dsv4_log_tensor_shape("dsv4_decode_attn_mask", attn_mask);
+
+                return build_compressed_attn_update(layer_inp, q, k_all, v_all, attn_mask, mix, rope_cfg, il);
             } else {
                 LLAMA_LOG_INFO("%s: DeepSeek4 decode cache state unavailable: layer=%d pos=%d ratio=%u nextn_tail=%d\n",
                         __func__, il, first_pos, compress_ratio, int(il >= int(hparams.n_layer - hparams.nextn_predict_layers)));

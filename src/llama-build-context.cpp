@@ -115,6 +115,7 @@ void llm_build_context::init() {
     lctx.inp_embd_enc      = nullptr;
     lctx.inp_KQ_mask_cross = nullptr;
     lctx.inp_dsv4_masks.clear();
+    lctx.inp_dsv4_i32.clear();
 }
 
 void llm_build_context::free() {
