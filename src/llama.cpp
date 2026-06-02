@@ -171,6 +171,182 @@ static std::vector<std::string> string_split(const std::string& str, const std::
     return parts;
 }
 
+static std::vector<std::string> dsv4_debug_tensor_filters() {
+    const char * env = std::getenv("DSV4_DEBUG_TENSOR_STATS");
+    if (env == nullptr) {
+        return {};
+    }
+
+    std::vector<std::string> filters;
+    std::string value(env);
+    if (value.empty() || value == "1") {
+        return {
+            "inp_embd",
+            "hc_residual_init",
+            "hc_attn_pre-0",
+            "hc_attn_pre_mixes-0",
+            "hc_attn_pre_weights-0",
+            "attn_norm-0",
+            "q_lora-0",
+            "q_lora_norm-0",
+            "Qnorm-0",
+            "Qcur-0",
+            "KVnorm-0",
+            "KVrope-0",
+            "KVcur-0",
+            "dsv4_local_attn_out-0",
+            "attn_out_unrope-0",
+            "attn_out-0",
+            "hc_attn_post-0",
+            "hc_ffn_pre-0",
+            "ffn_norm-0",
+            "ffn_moe_hash_topk-0",
+            "ffn_moe_out-0",
+            "ffn_shexp-0",
+            "ffn_out-0",
+            "hc_ffn_post-0",
+            "result_hc",
+            "result_norm",
+            "result_output",
+        };
+    }
+
+    size_t pos = 0;
+    while (pos <= value.size()) {
+        const size_t comma = value.find(',', pos);
+        std::string item = value.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        item = trim(item);
+        if (!item.empty()) {
+            filters.push_back(item);
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+
+    return filters;
+}
+
+static bool dsv4_debug_tensor_matches(const char * name) {
+    static const std::vector<std::string> filters = dsv4_debug_tensor_filters();
+    if (filters.empty()) {
+        return false;
+    }
+
+    const std::string s(name);
+    for (const std::string & filter : filters) {
+        if (s.find(filter) != std::string::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static float dsv4_debug_tensor_get_value(
+        const uint8_t * data,
+        ggml_type       type,
+        const size_t *  nb,
+        int64_t         i0,
+        int64_t         i1,
+        int64_t         i2,
+        int64_t         i3) {
+    const size_t i = i3*nb[3] + i2*nb[2] + i1*nb[1] + i0*nb[0];
+    switch (type) {
+        case GGML_TYPE_F32: return *(const float *) &data[i];
+        case GGML_TYPE_F16: return ggml_fp16_to_fp32(*(const ggml_fp16_t *) &data[i]);
+        case GGML_TYPE_I32: return (float) *(const int32_t *) &data[i];
+        case GGML_TYPE_I64: return (float) *(const int64_t *) &data[i];
+        case GGML_TYPE_I16: return (float) *(const int16_t *) &data[i];
+        case GGML_TYPE_I8:  return (float) *(const int8_t *)  &data[i];
+        default:            return NAN;
+    }
+}
+
+static bool dsv4_debug_tensor_stats_cb(ggml_tensor * t, bool ask, void * user_data) {
+    (void) user_data;
+    if (!dsv4_debug_tensor_matches(t->name)) {
+        return false;
+    }
+    if (ask) {
+        return true;
+    }
+
+    const size_t nbytes = ggml_nbytes(t);
+    std::vector<uint8_t> data(nbytes);
+    ggml_backend_tensor_get(t, data.data(), 0, nbytes);
+
+    const int64_t nelem = ggml_nelements(t);
+    double sum = 0.0;
+    double abs_sum = 0.0;
+    float min_v = INFINITY;
+    float max_v = -INFINITY;
+    int64_t nonfinite = 0;
+    std::array<float, 4> first = { 0.0f, 0.0f, 0.0f, 0.0f };
+    int n_first = 0;
+
+    std::array<int, 5> top_id = { -1, -1, -1, -1, -1 };
+    std::array<float, 5> top_v = { -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY };
+    const bool collect_top = std::string(t->name).find("result_output") != std::string::npos && t->type == GGML_TYPE_F32;
+
+    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                    const float v = dsv4_debug_tensor_get_value(data.data(), t->type, t->nb, i0, i1, i2, i3);
+                    if (n_first < (int) first.size()) {
+                        first[n_first++] = v;
+                    }
+                    if (!std::isfinite(v)) {
+                        ++nonfinite;
+                        continue;
+                    }
+                    sum += v;
+                    abs_sum += std::fabs(v);
+                    min_v = std::min(min_v, v);
+                    max_v = std::max(max_v, v);
+                    if (collect_top && i1 == 0 && i2 == 0 && i3 == 0) {
+                        for (int k = 0; k < 5; ++k) {
+                            if (v > top_v[k]) {
+                                for (int j = 4; j > k; --j) {
+                                    top_v[j] = top_v[j - 1];
+                                    top_id[j] = top_id[j - 1];
+                                }
+                                top_v[k] = v;
+                                top_id[k] = (int) i0;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    LLAMA_LOG_INFO("DSV4_TENSOR_STATS name=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+            "] n=%" PRId64 " sum=%.9g abs_sum=%.9g min=%.9g max=%.9g nonfinite=%" PRId64
+            " first=[%.9g,%.9g,%.9g,%.9g]\n",
+            t->name, ggml_type_name(t->type), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            nelem, sum, abs_sum, min_v, max_v, nonfinite, first[0], first[1], first[2], first[3]);
+
+    if (collect_top) {
+        LLAMA_LOG_INFO("DSV4_TENSOR_TOP name=%s top5=%d:%.9g,%d:%.9g,%d:%.9g,%d:%.9g,%d:%.9g\n",
+                t->name, top_id[0], top_v[0], top_id[1], top_v[1], top_id[2], top_v[2],
+                top_id[3], top_v[3], top_id[4], top_v[4]);
+    }
+
+    return true;
+}
+
+static ggml_backend_sched_eval_callback dsv4_debug_cb_eval(ggml_backend_sched_eval_callback fallback) {
+    return std::getenv("DSV4_DEBUG_TENSOR_STATS") != nullptr ? dsv4_debug_tensor_stats_cb : fallback;
+}
+
+static void * dsv4_debug_cb_eval_user_data(void * fallback) {
+    return std::getenv("DSV4_DEBUG_TENSOR_STATS") != nullptr ? nullptr : fallback;
+}
+
 // extract ip and port from RPC[ip:port] for rpc and keep other device names
 static std::vector<rpc_device>  extract_device_from_rpc_device(std::vector<std::string> devices) {
     std::vector<rpc_device> rpc_servers;
@@ -5460,7 +5636,9 @@ static int llama_decode_internal(
         ggml_cgraph * gf = nullptr;
         if (!lctx.can_reuse_graph(u_batch)) {
             lctx.reset_scheduler();
-            ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+            ggml_backend_sched_set_eval_callback(lctx.sched,
+                    dsv4_debug_cb_eval(lctx.cparams.cb_eval),
+                    dsv4_debug_cb_eval_user_data(lctx.cparams.cb_eval_user_data));
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_reset(...): %d us\n", int(tim2-tim1));
@@ -5614,6 +5792,7 @@ static int llama_decode_internal(
                     } else {
                         ggml_backend_tensor_get_async(backend_res, res, logits_out, 0, n_outputs_new*n_vocab*sizeof(float));
                     }
+
                 }
             }
 #if IK_PRINT_TIMING
@@ -5809,7 +5988,9 @@ static int llama_encode_internal(
     }
 
     lctx.reset_scheduler();
-    ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+    ggml_backend_sched_set_eval_callback(lctx.sched,
+            dsv4_debug_cb_eval(lctx.cparams.cb_eval),
+            dsv4_debug_cb_eval_user_data(lctx.cparams.cb_eval_user_data));
 
     ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, batch, false);
 

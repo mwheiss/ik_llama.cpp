@@ -672,3 +672,59 @@ This is expected to preserve cache values exactly:
 After the fix, Q4 `Hello -c 128 -b 128 -ub 128 -n 4` exits successfully and
 logs decode compressed replay through layer 42 plus final logits. Primitive
 parity against cchuter remains unchanged.
+
+## Sinked local attention must not use the IQK flash-attention shortcut
+
+### Finding
+
+The first Q4 `Hello` prompt comparison found a hard numerical cliff at layer 0
+local attention. Before the fix, ik's `dsv4_compressed_attn_out-0` was exactly
+the F16 cached `KVcur-0` repeated over 64 heads:
+
+```text
+KVcur-0                    first=[-0.625, 0.375, 0.5625, 0.25]
+dsv4_compressed_attn_out-0 first=[-0.625, 0.375, 0.5625, 0.25]
+```
+
+cchuter's sinked attention for the same tensor was not equal to V:
+
+```text
+kqv_out-0 first=[-0.604744434, 0.362846643, 0.544269979, 0.241897762]
+```
+
+This is not rounding error. With a single visible K/V row, attention sinks still
+participate in the softmax denominator, so the output should be V scaled by the
+non-sink probability. Returning V exactly means the sink contribution was
+dropped.
+
+### Cause
+
+ik's CPU flash-attention path can enter the IQK flash-attention shortcut before
+the scalar reference path. That shortcut accepts a sinks pointer in its public
+plumbing, but at least the small-cache path used by one-token DSV4 local
+attention did not preserve sink semantics. The scalar CPU fallback already
+handles sinks correctly.
+
+The DSV4 helper also needed to set `op_params[4] = hparams.n_swa`, matching ik's
+generic `llm_build_kv` attention helper. This keeps the sliding-window hint
+available to backend attention paths.
+
+### Resolution
+
+The IQK flash-attention shortcut is now skipped whenever `dst->src[4]` contains
+attention sinks, forcing the sink-aware scalar CPU path. DSV4's local and
+compressed attention helper now also sets the SWA hint and requests F32
+flash-attention accumulation.
+
+After the fix, layer 0 aligns with cchuter within the expected implementation
+drift:
+
+```text
+ik      dsv4_compressed_attn_out-0 sum=397.316409 first=[-0.604957283, 0.362974375, 0.544461548, 0.241982922]
+cchuter kqv_out-0                  sum=398.910369 first=[-0.604744434, 0.362846643, 0.544269979, 0.241897762]
+```
+
+Layers 1 and 2 were also checked after this fix and stayed close at the same
+scale. The first-token logits still diverge later in the graph, so the next
+porting step is to continue layer-by-layer numerical comparison until the next
+unexplained cliff is isolated.

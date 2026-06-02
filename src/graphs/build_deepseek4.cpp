@@ -53,6 +53,10 @@ static dsv4_rope_cfg dsv4_make_rope_cfg(
 }
 
 static void dsv4_log_tensor_shape(const char * name, const ggml_tensor * t) {
+    if (t == nullptr) {
+        LLAMA_LOG_INFO("%s: %-24s = <null>\n", __func__, name);
+        return;
+    }
     LLAMA_LOG_INFO("%s: %-24s = [%5" PRId64 ", %5" PRId64 ", %5" PRId64 ", %5" PRId64 "] %s\n",
             __func__, name, t->ne[0], t->ne[1], t->ne[2], t->ne[3], ggml_type_name(t->type));
 }
@@ -273,6 +277,10 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         ggml_tensor * attn_out = ggml_flash_attn_ext(ctx0, q_attn, k_attn, v_attn,
                 attn_mask_cnv, kq_scale, hparams.f_max_alibi_bias, 0.0f);
         ggml_flash_attn_ext_add_sinks(attn_out, layer.attn_sinks);
+        if (hparams.n_swa > 0) {
+            ((int32_t *) attn_out->op_params)[4] = hparams.n_swa;
+        }
+        ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
         cb(attn_out, "dsv4_compressed_attn_out", il);
         dsv4_log_tensor_shape("dsv4_compressed_attn_out", attn_out);
         ggml_build_forward_expand(gf, attn_out);
@@ -313,13 +321,11 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         const uint32_t compress_ratio = hparams.attn_compress_ratio[il];
         GGML_ASSERT(compress_ratio == 0);
         const dsv4_rope_cfg rope_cfg = dsv4_make_rope_cfg(hparams, cparams, compress_ratio);
-        const float kq_scale = 1.0f / std::sqrt(float(n_embd_head_k));
 
         LLAMA_LOG_INFO("%s: DeepSeek4 local graph slice: layer=%d n_embd=%" PRId64
                 " n_hc=%" PRId64 " n_tokens=%d sinkhorn_iters=%u hc_eps=%.9g\n",
                 __func__, il, n_embd, n_hc, n_tokens, hparams.hc_sinkhorn_iters, hparams.hc_eps);
 
-        ggml_tensor * residual = layer_inp;
         llm_deepseek4_hc_mix mix = llm_build_deepseek4_hc_pre(ctx0, layer_inp,
                 layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base,
                 n_embd, n_hc, n_tokens, norm_rms_eps, hparams.hc_sinkhorn_iters, hparams.hc_eps);
@@ -381,30 +387,15 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         dsv4_log_tensor_shape("kv_cache_v_local", kv_self.v_l[il]);
         llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, kv, n_tokens, kv_head, cb, il);
 
-        ggml_tensor * attn_out = llm_build_kv(ctx0, lctx, kv_self, gf,
-                nullptr, nullptr,
-                nullptr, nullptr,
-                q, KQ_mask_swa,
-                n_tokens, kv_head, n_kv, kq_scale, cb, il, layer.attn_sinks, hparams.n_swa);
-        cb(attn_out, "dsv4_local_attn_out", il);
-        dsv4_log_tensor_shape("dsv4_local_attn_out", attn_out);
+        ggml_tensor * k_cache = ggml_view_3d(ctx0, kv_self.k_l[il],
+                n_embd_head_k, 1, n_kv,
+                kv_self.k_l[il]->nb[1],
+                kv_self.k_l[il]->nb[1],
+                0);
+        cb(k_cache, "dsv4_local_k_cache", il);
+        dsv4_log_tensor_shape("dsv4_local_k_cache", k_cache);
 
-        cur = ggml_reshape_3d(ctx0, attn_out, n_embd_head_v, n_head, n_tokens);
-        cur = llm_build_deepseek4_rope_tail(ctx0, cur, inp_pos, nullptr, n_rot, rope_type,
-                rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.freq_scale,
-                rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow, true);
-        cb(cur, "attn_out_unrope", il);
-        dsv4_log_tensor_shape("attn_out_unrope", cur);
-
-        cur = llm_build_deepseek4_grouped_out(ctx0, cur, layer.attn_wo_a, layer.attn_wo_b,
-                n_embd_head_v, n_head, n_out_group, n_lora_o, n_tokens);
-        cb(cur, "attn_out", il);
-        dsv4_log_tensor_shape("attn_out", cur);
-
-        layer_inp = llm_build_deepseek4_hc_expand(ctx0, cur, residual, mix.post, mix.comb);
-        cb(layer_inp, "hc_attn_post", il);
-        dsv4_log_tensor_shape("hc_attn_post", layer_inp);
-
+        layer_inp = build_compressed_attn_update(layer_inp, q, k_cache, k_cache, KQ_mask_swa, mix, rope_cfg, il);
         return build_ffn_update(layer_inp, il);
     };
 
