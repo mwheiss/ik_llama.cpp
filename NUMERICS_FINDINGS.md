@@ -491,3 +491,31 @@ With these fixes:
 The cchuter CLI applies different chat/single-turn prompt handling in this
 smoke, so the generated text is a status sanity check only, not a logits/text
 parity result.
+
+## DeepSeek4 graph reuse must stay disabled until prefill/decode is input-driven
+
+After the one-token prefill fix, Q4/Q8 `-n 2` initially appeared to generate
+multiple tokens while logging `first_pos=0 is_prefill=1` for every one-token
+graph. The cause was ik graph reuse: the graph built for the first one-token
+prefill was reused for subsequent generated tokens. Since the current DSV4 graph
+topology branches at graph-build time on:
+
+```text
+first_pos == 0  -> prefill/raw local fallback
+first_pos > 0   -> decode/compressed cache replay
+```
+
+reusing the position-0 graph for later positions silently takes the wrong path.
+
+The retry branch now disables graph reuse for `LLM_ARCH_DEEPSEEK4` only. This is
+not a performance decision; it is a correctness guard until the DSV4 branch is
+made fully input-driven or until there are separate reusable prefill/decode
+graphs with compatible topology.
+
+With DSV4 graph reuse disabled:
+
+- Q4 `Hello -n 2` reaches `first_pos=1 is_prefill=0` and stops at
+  `DeepSeek V4 decode compressed cache replay not implemented yet`,
+- Q8 forced q8_0 KV reaches the same true decode boundary and still logs the
+  forced-F16 warning,
+- helper parity remains unchanged.

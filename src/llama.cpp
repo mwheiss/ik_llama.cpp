@@ -568,6 +568,12 @@ void llama_context::reset_scheduler() {
 
 bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
     if (!cparams.graph_reuse) return false;
+    // DeepSeek4 graph topology currently depends on the first token position:
+    // pos 0 is prefill, while later one-token batches must use decode/cache
+    // replay. Reusing the pos-0 graph for later positions silently takes the
+    // wrong path, so keep DSV4 graph rebuilds explicit until the branch is made
+    // fully input-driven.
+    if (model.arch == LLM_ARCH_DEEPSEEK4) return false;
     //if (kv_self.save_per_step_ssm) return false;
     if (model.arch == LLM_ARCH_GEMMA4_MTP && mtp_target_ctx != nullptr) return false;
     auto the_prev = cparams.mtp_op_type == MTP_OP_NONE ? prev.get() : prev_mtp.get();
