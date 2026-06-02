@@ -1094,6 +1094,31 @@ llm_expert_gating_func_type   gating_op,
         selection_probs = logits;
     }
 
+    if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 && lctx.model.hparams.n_expert_groups > 1 && n_tokens > 0) {
+        const auto & hparams = lctx.model.hparams;
+        const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
+
+        ggml_tensor * selection_groups = ggml_reshape_3d(ctx, selection_probs,
+                n_exp_per_group, hparams.n_expert_groups, n_tokens); // [n_exp_per_group, n_expert_groups, n_tokens]
+
+        ggml_tensor * group_scores = ggml_top_k(ctx, selection_groups, 2); // [2, n_expert_groups, n_tokens]
+        group_scores = ggml_get_rows(ctx,
+                ggml_reshape_4d(ctx, selection_groups, 1, selection_groups->ne[0], selection_groups->ne[1], selection_groups->ne[2]),
+                group_scores); // [1, 2, n_expert_groups, n_tokens]
+
+        group_scores = ggml_sum_rows(ctx,
+                ggml_reshape_3d(ctx, group_scores, group_scores->ne[1], group_scores->ne[2], group_scores->ne[3])); // [1, n_expert_groups, n_tokens]
+        group_scores = ggml_reshape_2d(ctx, group_scores, group_scores->ne[1], group_scores->ne[2]); // [n_expert_groups, n_tokens]
+
+        ggml_tensor * expert_groups = ggml_top_k(ctx, group_scores, hparams.n_group_used); // [n_group_used, n_tokens]
+        cb(expert_groups, "ffn_moe_group_topk", il);
+
+        selection_probs = ggml_get_rows(ctx, selection_groups, expert_groups); // [n_exp_per_group, n_group_used, n_tokens]
+        selection_probs = ggml_set_rows(ctx, ggml_fill(ctx, selection_groups, -INFINITY), selection_probs, expert_groups); // [n_exp_per_group, n_expert_groups, n_tokens]
+        selection_probs = ggml_reshape_2d(ctx, selection_probs, n_expert, n_tokens); // [n_expert, n_tokens]
+        cb(selection_probs, "ffn_moe_probs_masked", il);
+    }
+
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts != nullptr) {

@@ -831,15 +831,84 @@ to rule out partial top-k as the source of the layer-18 tail expert mismatch.
 
 ### Result
 
-The full-sort experiment did not change the layer-18 routed output. That means
-the layer-18 tail expert mismatch is not caused by ik's partial top-k path; it
-is a consequence of the already-present small upstream numerical drift crossing
-a close routing boundary.
+The full-sort experiment did not change the layer-18 routed output. That ruled
+out ik's partial top-k path as the cause of the layer-18 tail expert mismatch.
+The initial suspicion was that already-present numerical drift had crossed a
+close routing boundary; the follow-up below found the real missing semantic
+piece.
 
 Because the experiment did not improve parity, the implementation keeps ik's
 optimized `ggml_top_k` path rather than forcing a slower DSV4-only full sort.
 
-This mismatch is quantified and currently treated as expected routing
-sensitivity, not as the next hard semantic bug. The remaining first-token logits
-are still far from cchuter, so continue probing later layers with exact tensor
-filters and look for the next non-local cliff.
+### Update: actual cause was missing grouped expert routing
+
+The full-sort experiment correctly ruled out `ggml_top_k`'s partial-sort
+shortcut, but the earlier conclusion was incomplete. The next audit compared
+`ffn_moe_probs_biased-18` directly and showed that the globally high expert
+`193` should be masked out by DeepSeek4's grouped expert routing before the
+final expert top-k:
+
+```text
+cchuter biased top8 includes 193:
+83:11.3859177, 186:11.2452679, 152:11.0235682, 74:10.9243937,
+193:10.4812412, 137:10.41185, 99:10.410531, 31:10.3104744
+
+cchuter selected:
+[83, 186, 152, 74, 137, 99]
+
+ik before grouped routing:
+[83, 186, 152, 74, 193, 99]
+```
+
+The root cause was not a rounding-induced top-k instability. ik was not loading
+DeepSeek4's `expert_group_count` and `expert_group_used_count` hparams, so the
+DSV4 MoE path never applied the cchuter-compatible group mask. After loading
+those hparams and masking non-selected expert groups before expert top-k, layer
+18's selected experts match cchuter:
+
+```text
+ik after grouped routing:
+ffn_moe_topk-18 first=[83, 186, 152, 74, 137, 99]
+
+cchuter ffn_moe_weights-18 sum=8.37362206 first=[1.8665452, 1.74274993, 1.51910865, 1.42088258, 0.902513266, 0.921822429]
+ik      ffn_moe_weights-18 sum=8.37112325 first=[1.86551428, 1.74260259, 1.51953793, 1.42019749, 0.90174222, 0.921528757]
+
+cchuter ffn_out-18 sum=158.050339 first=[1.00673652, -1.44433689, 0.650724173, -0.228909552]
+ik      ffn_out-18 sum=156.045430 first=[1.0615468, -1.4615134, 0.695034981, -0.231062233]
+```
+
+The grouped-routing fix also keeps layers 19 and 20 on the same parity scale in
+the decode pass:
+
+```text
+layer 19 ffn_out: cchuter sum=28.9388789, ik sum=28.5153594
+layer 20 ffn_out: cchuter sum=811.206432, ik sum=796.154099
+```
+
+The post-layer logits recover the same greedy top token family:
+
+```text
+cchuter result_output top5=21133:20.0508041,14:19.7420158,2058:19.2284126,4495:18.430088,1780:18.2531509
+ik      result_output top5=21133:20.083292,14:19.7973118,2058:19.3809052,4495:18.5031319,1780:18.3664017
+```
+
+Keep the optimized `ggml_top_k` path. The required semantic fix is grouped
+expert masking, not full sorting.
+
+### Q8 metadata note
+
+The TeamBlobFish Q8_0 GGUF tested in this retry does not contain
+`deepseek4.expert_group_count` or `deepseek4.expert_group_used_count`, while the
+Q4_K_M-XL GGUF does. `gguf_dump` shows:
+
+```text
+Q4: deepseek4.expert_group_count = 8
+Q4: deepseek4.expert_group_used_count = 4
+Q8: group-count keys absent
+```
+
+cchuter loads those keys as optional and leaves `n_expert_groups == 0` when they
+are absent. ik should therefore not invent `8/4` defaults for the Q8 file unless
+the reference semantics change. Q8 validation remains useful for load/runtime
+safety and forced-F16 KV behavior, but Q4 is the authoritative grouped-routing
+parity case for this GGUF pair.

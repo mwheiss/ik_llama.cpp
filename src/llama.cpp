@@ -2416,6 +2416,8 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
         LLAMA_LOG_INFO("%s: n_attn_out_groups    = %d\n",     __func__, hparams.n_attn_out_groups);
         LLAMA_LOG_INFO("%s: n_ff_exp             = %d\n",     __func__, hparams.n_ff_exp);
         LLAMA_LOG_INFO("%s: n_expert_shared      = %d\n",     __func__, hparams.n_expert_shared);
+        LLAMA_LOG_INFO("%s: n_expert_groups      = %d\n",     __func__, hparams.n_expert_groups);
+        LLAMA_LOG_INFO("%s: n_group_used         = %d\n",     __func__, hparams.n_group_used);
         LLAMA_LOG_INFO("%s: n_hash_layers        = %d\n",     __func__, hparams.n_hash_layers);
         LLAMA_LOG_INFO("%s: n_hc                 = %d\n",     __func__, hparams.n_hc);
         LLAMA_LOG_INFO("%s: hc_sinkhorn_iters    = %d\n",     __func__, hparams.hc_sinkhorn_iters);
