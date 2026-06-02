@@ -10,6 +10,11 @@ struct llm_deepseek4_hc_mix {
     struct ggml_tensor * comb;
 };
 
+struct llm_deepseek4_state_pair {
+    struct ggml_tensor * kv;
+    struct ggml_tensor * score;
+};
+
 struct ggml_tensor * llm_build_deepseek4_rope_tail(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -94,6 +99,15 @@ struct ggml_tensor * llm_build_deepseek4_compressor_prefill(
         float                 beta_fast,
         float                 beta_slow,
         float                 norm_eps);
+
+struct llm_deepseek4_state_pair llm_build_deepseek4_compressor_prefill_state(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * wkv,
+        struct ggml_tensor  * wgate,
+        struct ggml_tensor  * ape,
+        int64_t               n_embd_head,
+        int64_t               compress_ratio);
 
 struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
         struct ggml_context * ctx,

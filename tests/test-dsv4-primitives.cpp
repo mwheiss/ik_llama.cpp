@@ -602,6 +602,80 @@ static void test_compressor_prefill_ratio4_helper() {
     ggml_free(ctx);
 }
 
+static void assert_inf(float actual, const char * what) {
+    if (!std::isinf(actual) || !std::signbit(actual)) {
+        fprintf(stderr, "%s: got %.9g, expected -inf\n", what, actual);
+        std::abort();
+    }
+}
+
+static void test_compressor_prefill_state_ratio4_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 8 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 2;
+    constexpr int64_t head_dim = 1;
+    constexpr int64_t ratio = 4;
+    constexpr int64_t width = 2 * head_dim;
+    constexpr int64_t n_tokens = 6;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * wkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * wgate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, width);
+    ggml_tensor * ape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, ratio);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        ggml_set_f32_nd(x, 0, t, 0, 0, 10.0f + (float) t);
+        ggml_set_f32_nd(x, 1, t, 0, 0, 20.0f + (float) t);
+    }
+    for (int64_t i = 0; i < n_embd; ++i) {
+        for (int64_t o = 0; o < width; ++o) {
+            ggml_set_f32_nd(wkv, i, o, 0, 0, 0.0f);
+            ggml_set_f32_nd(wgate, i, o, 0, 0, 0.0f);
+        }
+    }
+    ggml_set_f32_nd(wkv, 0, 0, 0, 0, 1.0f);
+    ggml_set_f32_nd(wkv, 1, 1, 0, 0, 1.0f);
+    ggml_set_f32_nd(wgate, 0, 0, 0, 0, 2.0f);
+    ggml_set_f32_nd(wgate, 1, 1, 0, 0, 3.0f);
+
+    for (int64_t c = 0; c < ratio; ++c) {
+        ggml_set_f32_nd(ape, 0, c, 0, 0, 0.1f * (float) c);
+        ggml_set_f32_nd(ape, 1, c, 0, 0, 1.0f + 0.1f * (float) c);
+    }
+
+    llm_deepseek4_state_pair state = llm_build_deepseek4_compressor_prefill_state(
+            ctx, x, wkv, wgate, ape, head_dim, ratio);
+    graph_compute(ctx, state.kv);
+    graph_compute(ctx, state.score);
+
+    const float expected_kv[2][8] = {
+        {10, 11, 12, 13, 14, 15, 0, 0},
+        {20, 21, 22, 23, 24, 25, 0, 0},
+    };
+    for (int64_t c = 0; c < 8; ++c) {
+        assert_close(ggml_get_f32_nd(state.kv, 0, c, 0, 0), expected_kv[0][c], "prefill_state_kv0", 0.0f);
+        assert_close(ggml_get_f32_nd(state.kv, 1, c, 0, 0), expected_kv[1][c], "prefill_state_kv1", 0.0f);
+    }
+
+    for (int64_t c = 0; c < 4; ++c) {
+        assert_close(ggml_get_f32_nd(state.score, 0, c, 0, 0), 2.0f * (10.0f + (float) c) + 0.1f * (float) c, "prefill_state_score_prev0", 1.0e-6f);
+        assert_close(ggml_get_f32_nd(state.score, 1, c, 0, 0), 3.0f * (20.0f + (float) c) + 1.0f + 0.1f * (float) c, "prefill_state_score_prev1", 1.0e-6f);
+    }
+    assert_close(ggml_get_f32_nd(state.score, 0, 4, 0, 0), 2.0f * 14.0f + 0.0f, "prefill_state_score_curr0", 1.0e-6f);
+    assert_close(ggml_get_f32_nd(state.score, 1, 4, 0, 0), 3.0f * 24.0f + 1.0f, "prefill_state_score_curr1", 1.0e-6f);
+    assert_close(ggml_get_f32_nd(state.score, 0, 5, 0, 0), 2.0f * 15.0f + 0.1f, "prefill_state_score_curr0b", 1.0e-6f);
+    assert_close(ggml_get_f32_nd(state.score, 1, 5, 0, 0), 3.0f * 25.0f + 1.1f, "prefill_state_score_curr1b", 1.0e-6f);
+    assert_inf(ggml_get_f32_nd(state.score, 0, 6, 0, 0), "prefill_state_score_pad0");
+    assert_inf(ggml_get_f32_nd(state.score, 1, 7, 0, 0), "prefill_state_score_pad1");
+
+    ggml_free(ctx);
+}
+
 static void test_indexer_scores_prefill_helper() {
     ggml_init_params params = {
         /* .mem_size   = */ 8 * 1024 * 1024,
@@ -816,6 +890,7 @@ int main() {
     test_hc_head_helper();
     test_grouped_out_helper();
     test_compressor_prefill_ratio4_helper();
+    test_compressor_prefill_state_ratio4_helper();
     test_indexer_scores_prefill_helper();
     test_compressed_mask_from_topk_helper();
     test_rope_tail_helper();

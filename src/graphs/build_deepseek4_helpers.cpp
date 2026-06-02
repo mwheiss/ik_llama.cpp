@@ -93,6 +93,14 @@ static struct ggml_tensor * llm_build_deepseek4_new_filled_3d(
     return ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n0, n1, n2), value);
 }
 
+static struct ggml_tensor * llm_build_deepseek4_new_filled_2d(
+        struct ggml_context * ctx,
+        int64_t               n0,
+        int64_t               n1,
+        float                 value) {
+    return ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n0, n1), value);
+}
+
 
 struct ggml_tensor * llm_build_deepseek4_rope_tail(
         struct ggml_context * ctx,
@@ -440,6 +448,89 @@ struct ggml_tensor * llm_build_deepseek4_compressor_prefill(
     return llm_build_deepseek4_rope_tail(ctx, kv, pos, nullptr, n_rot, rope_type,
             n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
             beta_fast, beta_slow, false);
+}
+
+struct llm_deepseek4_state_pair llm_build_deepseek4_compressor_prefill_state(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * wkv,
+        struct ggml_tensor  * wgate,
+        struct ggml_tensor  * ape,
+        int64_t               n_embd_head,
+        int64_t               compress_ratio) {
+    GGML_ASSERT(compress_ratio > 0);
+    const int64_t n_tokens = x->ne[1];
+    const int64_t cutoff = (n_tokens / compress_ratio) * compress_ratio;
+    const int64_t remainder = n_tokens - cutoff;
+    const int64_t coff = compress_ratio == 4 ? 2 : 1;
+    const int64_t width = coff * n_embd_head;
+
+    GGML_ASSERT(wkv->ne[0] == x->ne[0]);
+    GGML_ASSERT(wkv->ne[1] == width);
+    GGML_ASSERT(wgate->ne[0] == x->ne[0]);
+    GGML_ASSERT(wgate->ne[1] == width);
+    GGML_ASSERT(ape->ne[0] == width);
+    GGML_ASSERT(ape->ne[1] == compress_ratio);
+
+    struct ggml_tensor * kv    = ggml_mul_mat(ctx, wkv,   x);
+    struct ggml_tensor * score = ggml_mul_mat(ctx, wgate, x);
+    struct ggml_tensor * ape_f = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
+
+    if (compress_ratio == 4) {
+        struct ggml_tensor * kv_prev    = llm_build_deepseek4_new_filled_2d(ctx, width, compress_ratio, 0.0f);
+        struct ggml_tensor * score_prev = llm_build_deepseek4_new_filled_2d(ctx, width, compress_ratio, -INFINITY);
+
+        if (cutoff >= compress_ratio) {
+            kv_prev = ggml_view_2d(ctx, kv, width, compress_ratio, kv->nb[1], (cutoff - compress_ratio) * kv->nb[1]);
+            score_prev = ggml_view_2d(ctx, score, width, compress_ratio, score->nb[1], (cutoff - compress_ratio) * score->nb[1]);
+            score_prev = ggml_add(ctx, score_prev, ape_f);
+        }
+
+        struct ggml_tensor * kv_curr    = llm_build_deepseek4_new_filled_2d(ctx, width, compress_ratio, 0.0f);
+        struct ggml_tensor * score_curr = llm_build_deepseek4_new_filled_2d(ctx, width, compress_ratio, -INFINITY);
+
+        if (remainder > 0) {
+            struct ggml_tensor * kv_rem = ggml_view_2d(ctx, kv, width, remainder, kv->nb[1], cutoff * kv->nb[1]);
+            struct ggml_tensor * sc_rem = ggml_view_2d(ctx, score, width, remainder, score->nb[1], cutoff * score->nb[1]);
+            sc_rem = ggml_add(ctx, sc_rem, ggml_view_2d(ctx, ape_f, width, remainder, ape_f->nb[1], 0));
+
+            if (remainder == compress_ratio) {
+                kv_curr = kv_rem;
+                score_curr = sc_rem;
+            } else {
+                kv_curr = ggml_concat(ctx, kv_rem,
+                        llm_build_deepseek4_new_filled_2d(ctx, width, compress_ratio - remainder, 0.0f), 1);
+                score_curr = ggml_concat(ctx, sc_rem,
+                        llm_build_deepseek4_new_filled_2d(ctx, width, compress_ratio - remainder, -INFINITY), 1);
+            }
+        }
+
+        return {
+            ggml_concat(ctx, kv_prev,    kv_curr,    1),
+            ggml_concat(ctx, score_prev, score_curr, 1),
+        };
+    }
+
+    struct ggml_tensor * kv_state    = llm_build_deepseek4_new_filled_2d(ctx, width, compress_ratio, 0.0f);
+    struct ggml_tensor * score_state = llm_build_deepseek4_new_filled_2d(ctx, width, compress_ratio, -INFINITY);
+
+    if (remainder > 0) {
+        struct ggml_tensor * kv_rem = ggml_view_2d(ctx, kv, width, remainder, kv->nb[1], cutoff * kv->nb[1]);
+        struct ggml_tensor * sc_rem = ggml_view_2d(ctx, score, width, remainder, score->nb[1], cutoff * score->nb[1]);
+        sc_rem = ggml_add(ctx, sc_rem, ggml_view_2d(ctx, ape_f, width, remainder, ape_f->nb[1], 0));
+
+        if (remainder == compress_ratio) {
+            kv_state = kv_rem;
+            score_state = sc_rem;
+        } else {
+            kv_state = ggml_concat(ctx, kv_rem,
+                    llm_build_deepseek4_new_filled_2d(ctx, width, compress_ratio - remainder, 0.0f), 1);
+            score_state = ggml_concat(ctx, sc_rem,
+                    llm_build_deepseek4_new_filled_2d(ctx, width, compress_ratio - remainder, -INFINITY), 1);
+        }
+    }
+
+    return { kv_state, score_state };
 }
 
 struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
