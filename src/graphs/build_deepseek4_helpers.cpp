@@ -106,6 +106,10 @@ static struct ggml_tensor * llm_build_deepseek4_arange_i32(
         int64_t               begin,
         int64_t               end) {
     GGML_ASSERT(end >= begin);
+    if (ggml_get_no_alloc(ctx)) {
+        return ggml_cast(ctx, ggml_arange(ctx, float(begin), float(end), 1.0f), GGML_TYPE_I32);
+    }
+
     struct ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, end - begin);
     for (int64_t i = begin; i < end; ++i) {
         ggml_set_i32_1d(t, i - begin, (int32_t) i);

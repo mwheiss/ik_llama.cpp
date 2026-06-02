@@ -410,6 +410,28 @@ multi-device scheduling is added to the ik DeepSeek4 path. For the current CPU
 reference path, `ggml_set_2d_inplace` is numerically equivalent and covered by
 cross-engine parity tests.
 
+### No-alloc decode compression position tensor
+
+The decode helper needs an I32 compression-position tensor only when a decode
+step actually emits a compressed row. In focused tests, a direct allocated I32
+tensor filled with `ggml_set_i32_1d` was the most stable parity path. In the
+full model graph, however, `ctx0` is a no-alloc graph-build context. Calling
+`ggml_set_i32_1d` there writes through a null tensor data pointer and segfaults
+as soon as `should_compress` becomes true. For ratio-4 layers, this first
+happens at decode position 3.
+
+The helper now selects the position tensor construction based on the GGML
+context:
+
+- allocated helper/test contexts keep the direct I32 tensor fill,
+- no-alloc model-graph contexts use `ggml_arange(...)->ggml_cast(I32)`.
+
+This keeps the existing helper parity path unchanged while making the model
+graph construction safe for the first compressed-row decode step. If the
+arange/cast path later shows numeric or backend trouble, add a runtime input
+for the scalar compression position instead of writing constants into a
+no-alloc graph context.
+
 ## Decode compressor graph boundary is not yet runtime-position validation
 
 The first ik graph wiring for decode compressor state updates reaches the
