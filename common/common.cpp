@@ -4006,6 +4006,30 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     throw std::runtime_error("Invalid cache type: " + s);
 }
 
+static bool common_model_path_is_deepseek4(const std::string & path_model) {
+    if (path_model.empty()) {
+        return false;
+    }
+
+    struct gguf_init_params gguf_params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ NULL,
+    };
+    gguf_context * ctx_gguf = gguf_init_from_file(path_model.c_str(), gguf_params);
+    if (ctx_gguf == nullptr) {
+        return false;
+    }
+
+    bool result = false;
+    const int key_arch = gguf_find_key(ctx_gguf, "general.architecture");
+    if (key_arch >= 0 && gguf_get_kv_type(ctx_gguf, key_arch) == GGUF_TYPE_STRING) {
+        result = strcmp(gguf_get_val_str(ctx_gguf, key_arch), "deepseek4") == 0;
+    }
+
+    gguf_free(ctx_gguf);
+    return result;
+}
+
 static std::pair<int, int> get_batch_ubatch(const gpt_params & params) {
     int n_batch = params.n_batch;
     int n_ubatch = params.n_ubatch;
@@ -4092,7 +4116,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
         GGML_ASSERT(params.tensor_buft_overrides.back().pattern == nullptr && "Tensor buffer overrides not terminated with empty pattern");
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
-    if (!mparams.flash_attn && ggml_is_quantized(mparams.type_v)) {
+    if (!mparams.flash_attn && ggml_is_quantized(mparams.type_v) && !common_model_path_is_deepseek4(params.model)) {
         throw std::runtime_error("Quantized V cache cannot be used without flash attention");
     }
     if (!params.fit_margin_array.empty()) {
@@ -4174,7 +4198,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.type_v = kv_cache_type_from_str(params.cache_type_v);
     cparams.type_reduce = ggml_type_from_str(params.reduce_type);
     cparams.type_graph_attn = ggml_type_from_str(params.graph_attn_precision);
-    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v)) {
+    const bool is_deepseek4 = common_model_path_is_deepseek4(params.model);
+    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v) && !is_deepseek4) {
         throw std::runtime_error("Quantized V cache cannot be used without flash attention");
     }
     cparams.type_k_first    = kv_cache_type_from_str(params.type_k_first);
@@ -4185,10 +4210,10 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.n_k_last        = params.n_k_last;
     cparams.n_v_first       = params.n_v_first;
     cparams.n_v_last        = params.n_v_last;
-    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v_first) && cparams.n_v_first > 0) {
+    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v_first) && cparams.n_v_first > 0 && !is_deepseek4) {
         throw std::runtime_error("Quantized V cache cannot be used without flash attention");
     }
-    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v_last) && cparams.n_v_last > 0) {
+    if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v_last) && cparams.n_v_last > 0 && !is_deepseek4) {
         throw std::runtime_error("Quantized V cache cannot be used without flash attention");
     }
 

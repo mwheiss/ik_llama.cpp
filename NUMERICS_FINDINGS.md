@@ -232,6 +232,38 @@ explicit gates against the cchuter F16 reference:
 
 Until those gates exist and pass, keep the forced F16 policy.
 
+### Validation-order bug fixed
+
+The retry branch briefly still rejected:
+
+```text
+--flash-attn off --cache-type-k q8_0 --cache-type-v q8_0
+```
+
+before model/context construction with:
+
+```text
+Quantized V cache cannot be used without flash attention
+```
+
+That shared guard is correct for ordinary architectures, but it fired before
+DeepSeek4's model-aware forced-F16 override could run. The fix is deliberately
+narrow: `common` now only lets a local GGUF with
+`general.architecture=deepseek4` pass the early quantized-V/no-FA check, and
+`llama_init_from_model` keeps the same exception using the loaded model arch.
+All non-DeepSeek4 models keep the mainline guard. The existing DSV4 override
+then logs the warning and initializes K/V as F16.
+
+Revalidated after the fix:
+
+```text
+Q8_0, ctx=128, -t 52 -tb 52, flash-attn off,
+--cache-type-k q8_0 --cache-type-v q8_0 --no-warmup:
+  rc=0
+  logs "DeepSeek4: forcing fp16 KV cache; requested K=q8_0, V=q8_0"
+  KV self size reports K (f16) and V (f16)
+```
+
 ## DSV4 prefill masks must be runtime inputs
 
 ### Context
@@ -1205,8 +1237,9 @@ Q4, ctx=8192, prompt="Hello " * 640, flash-attn off, threads=52:
 prompt eval time = 14334.94 ms / 641 tokens = 44.72 tok/s
 ```
 
-Without `--no-warmup`, both `llama-cli` and `llama-server` can crash during the
-startup warmup before the real request. A gdb backtrace shows the crash in:
+Previously, without `--no-warmup`, both `llama-cli` and `llama-server` could
+crash during the startup warmup before the real request. A gdb backtrace showed
+the crash in:
 
 ```text
 mul_mat_q8_1_r8_q8_2<8>
@@ -1214,16 +1247,24 @@ iqk_mul_mat_moe
 ggml_compute_forward_mul_mat_id
 ```
 
-This is currently classified as a warmup-only fused-MoE/IQK issue, not a DSV4
-graph numerics mismatch in the real request path. The engine harness now adds
-`--no-warmup` when a server advertises it, for both cchuter and ik. That keeps
-the dual-engine request comparison focused on the actual prompt/decode path
-while preserving a clear TODO to debug warmup separately.
+This no longer reproduces on the current retry branch for the focused CLI
+checks:
 
-Do not treat `--no-warmup` as a permanent performance solution. Before removing
-it from the final gate, isolate why the empty warmup graph selects or shapes
-the fused MoE path differently enough to crash, and add a focused regression
-test for that graph.
+```text
+Q4, ctx=128, -t 52 -tb 52, flash-attn off, no --no-warmup, -n 1:
+  rc=0
+
+Q4, ctx=8192, -b 512 -ub 512, prompt="Hello " * 640,
+flash-attn off, no --no-warmup, -t 52 -tb 52, -n 1:
+  rc=0
+  prompt eval time = 17869.10 ms / 641 tokens = 35.87 tok/s
+```
+
+The engine harness still adds `--no-warmup` when a server advertises it, for
+both cchuter and ik, so the benchmark remains focused on the real request path
+and avoids measuring backend warmup differences. Treat the old warmup crash as
+a historical stability note unless it reappears in server mode or a larger
+context; if it does, add a focused regression test for that graph.
 
 ### One-token decode is unstable above 16 graph threads
 
@@ -1963,6 +2004,49 @@ mean_abs_logprob_diff <= 5e-4
 The tighter warning band is unchanged (`1e-3` per row / max warning), so these
 runs still surface numeric drift for investigation without failing the final
 gate when text/tokens and the hard envelope are satisfied.
+
+Post forced-KV guard fix revalidation, still at full server threading
+(`-t 52 -tb 52`):
+
+```text
+command:
+  python3 scripts/engine_test_harness.py
+run:
+  dual-engine-flash_off-deepseek-20260603-215351
+result:
+  comparison_status    = PASS_WITH_WARNING
+  strict text/tokens   = matched for 180 rows
+  max_abs_logprob_diff = 0.009118126321486241
+  mean_abs_logprob_diff= 0.00015216998465962148
+  cchuter prefill      = 24.8169310914652 tok/s
+  cchuter decode       = 1.4910125724059455 tok/s
+  ik prefill           = 30.907792172892144 tok/s
+  ik decode            = 1.9145919554987472 tok/s
+  cchuter total wall   = 145.70627212524414 s
+  ik total wall        = 114.07447695732117 s
+```
+
+```text
+command:
+  python3 scripts/engine_test_harness.py --flash-attn
+run:
+  dual-engine-flash_on-deepseek-20260603-215917
+result:
+  comparison_status    = PASS_WITH_WARNING
+  strict text/tokens   = matched for 180 rows
+  max_abs_logprob_diff = 0.020019005508041622
+  mean_abs_logprob_diff= 0.0003682164911624511
+  cchuter prefill      = 34.11838334290029 tok/s
+  cchuter decode       = 1.5243132356833116 tok/s
+  ik prefill           = 33.50646759971639 tok/s
+  ik decode            = 2.405863050675122 tok/s
+  cchuter total wall   = 136.2579870223999 s
+  ik total wall        = 93.32111644744873 s
+```
+
+ik remains at least on par overall in both modes. The FA-on prefill rate is
+slightly lower than cchuter in this run, but the total wall time and decode
+throughput are materially better.
 
 Diagnostic note: cchuter's low-level GGML tensor-stat patch can report different
 intermediate aggregates depending on which tensors are traced. In particular,
