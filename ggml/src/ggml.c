@@ -17302,6 +17302,11 @@ static int ggml_compute_forward_mul_mat(
 
 // ggml_compute_forward_mul_mat_id
 
+struct ggml_mmid_row_mapping {
+    int32_t i1;
+    int32_t i2;
+};
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -17343,13 +17348,9 @@ static void ggml_compute_forward_mul_mat_id(
             (char *) params->wdata :
             (char *) params->wdata + GGML_PAD(ggml_row_size(vec_dot_type, src1->ne[0])*ggml_nrows(src1), sizeof(int64_t));
 
-    struct mmid_row_mapping {
-        int32_t i1;
-        int32_t i2;
-    };
-
     int64_t * matrix_row_counts = (int64_t *) (wdata_src1_end); // [n_as]
-    struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][ne11]
+    const int64_t matrix_rows_per_expert = n_ids*ids->ne[1];
+    struct ggml_mmid_row_mapping * matrix_rows = (struct ggml_mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][n_ids*ids->ne[1]]
 
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
@@ -17372,7 +17373,11 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12 + (i1)]
+#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*matrix_rows_per_expert + (i1)]
+
+    const bool local_one_token_rows = ids->ne[1] == 1;
+    struct ggml_mmid_row_mapping * local_rows = local_one_token_rows ?
+        (struct ggml_mmid_row_mapping *) alloca(matrix_rows_per_expert*sizeof(struct ggml_mmid_row_mapping)) : NULL;
 
     GGML_ASSERT(ids->ne[1] == dst->ne[2]);
     for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
@@ -17386,7 +17391,7 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    if (ith == 0) {
+    if (!local_one_token_rows && ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
@@ -17398,7 +17403,7 @@ static void ggml_compute_forward_mul_mat_id(
                 if (i02 < 0 || i02 >= n_as) continue;
                 //assert(i02 >= 0 && i02 < n_as);
 
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct ggml_mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
         }
@@ -17408,7 +17413,20 @@ static void ggml_compute_forward_mul_mat_id(
 
     // compute each matrix multiplication in sequence
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-        const int64_t cne1 = matrix_row_counts[cur_a];
+        int64_t cne1 = 0;
+        const struct ggml_mmid_row_mapping * cur_matrix_rows = NULL;
+        if (local_one_token_rows) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+                if (i02 == cur_a) {
+                    local_rows[cne1++] = (struct ggml_mmid_row_mapping) { id, 0 };
+                }
+            }
+            cur_matrix_rows = local_rows;
+        } else {
+            cne1 = matrix_row_counts[cur_a];
+            cur_matrix_rows = matrix_rows + cur_a*matrix_rows_per_expert;
+        }
 
         if (cne1 == 0) {
             continue;
@@ -17421,15 +17439,14 @@ static void ggml_compute_forward_mul_mat_id(
 
         const int64_t nr0 = ne01; // src0 rows
         const int64_t nr1 = cne1; // src1 rows
-                                  //
 #if GGML_USE_IQK_MULMAT
         if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
            if (!iqk_mul_mat_moe(nr0, nr1, ne00, ne11,
-                       src0->type, (const char *)src0_cur, nb01, ///ggml_type_size(src0->type),
-                       vec_dot_type, (const char *)wdata, row_size, ///ggml_type_size(vec_dot_type),
-                       (float *)dst->data, nb1, nb2,
-                       matrix_rows + cur_a*ne12, ith, nth)) goto IQK_MulMat_Not_Available;
-                continue;
+	                       src0->type, (const char *)src0_cur, nb01, ///ggml_type_size(src0->type),
+	                       vec_dot_type, (const char *)wdata, row_size, ///ggml_type_size(vec_dot_type),
+	                       (float *)dst->data, nb1, nb2,
+	                       cur_matrix_rows, ith, nth)) goto IQK_MulMat_Not_Available;
+           continue;
         }
 IQK_MulMat_Not_Available:;
 #endif
@@ -17442,7 +17459,7 @@ IQK_MulMat_Not_Available:;
             if (src0_cur_start >= src0_cur_end) return;
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                struct ggml_mmid_row_mapping row_mapping = cur_matrix_rows[ir1];
                 const int id       = row_mapping.i1; // selected expert index
 
                 const int64_t  i11 = id % ne11;
@@ -17470,7 +17487,7 @@ IQK_MulMat_Not_Available:;
             if (src0_cur_start >= src0_cur_end) return;
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                struct ggml_mmid_row_mapping row_mapping = cur_matrix_rows[ir1];
                 const int id       = row_mapping.i1; // selected expert index
 
                 const int64_t  i11 = id % ne11;
@@ -17525,7 +17542,7 @@ IQK_MulMat_Not_Available:;
                 for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir111; ++ir1) {
                     const int64_t _i12 = ir1; // logical row index for this expert
 
-                    struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
+                    struct ggml_mmid_row_mapping row_mapping = cur_matrix_rows[_i12];
                     const int id       = row_mapping.i1; // selected expert index
 
                     const int64_t  i11 = id % ne11;
@@ -17610,13 +17627,9 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
             (char *) params->wdata :
             (char *) params->wdata + GGML_PAD(ggml_row_size(vec_dot_type, src1->ne[0])*ggml_nrows(src1), sizeof(int64_t));
 
-    struct mmid_row_mapping {
-        int32_t i1;
-        int32_t i2;
-    };
-
     int64_t * matrix_row_counts = (int64_t *) (wdata_src1_end); // [n_as]
-    struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][ne11]
+    const int64_t matrix_rows_per_expert = n_ids*ids->ne[1];
+    struct ggml_mmid_row_mapping * matrix_rows = (struct ggml_mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][n_ids*ids->ne[1]]
 
     if (src1->type != vec_dot_type) {
 
@@ -17642,7 +17655,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         }
     }
 
-#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12 + (i1)]
+#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*matrix_rows_per_expert + (i1)]
 
     GGML_ASSERT(ids->ne[1] == dst->ne[2]);
     for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
@@ -17668,7 +17681,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                 if (i02 < 0 || i02 >= n_as) continue;
                 //assert(i02 >= 0 && i02 < n_as);
 
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct ggml_mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
         }
@@ -17715,7 +17728,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                             vec_dot_type, (const char *)wdata, row_size,
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
-                            matrix_rows + cur_a*ne12, limit, ith, nth)) GGML_ABORT("fatal error");
+                            matrix_rows + cur_a*matrix_rows_per_expert, limit, ith, nth)) GGML_ABORT("fatal error");
 
     }
 
@@ -19080,6 +19093,23 @@ static void ggml_compute_forward_set_rows_f32(
 
                     const int64_t i1 = *(int64_t*) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+                    if (i1 < 0 || i1 >= ne1) {
+                        if (getenv("DSV4_DEBUG_SET_ROWS_BOUNDS")) {
+                            fprintf(stderr,
+                                    "ggml_set_rows bounds: dst=%s src0=%s src1=%s i1=%lld ne1=%lld "
+                                    "i=%lld i02=%lld i03=%lld i10=%lld i11=%lld i12=%lld "
+                                    "src0_ne=[%lld,%lld,%lld,%lld] src1_ne=[%lld,%lld,%lld,%lld] dst_ne=[%lld,%lld,%lld,%lld] "
+                                    "src1_nb=[%zu,%zu,%zu,%zu]\n",
+                                    dst->name, src0->name, src1->name,
+                                    (long long) i1, (long long) ne1,
+                                    (long long) i, (long long) i02, (long long) i03,
+                                    (long long) i10, (long long) i11, (long long) i12,
+                                    (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03,
+                                    (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+                                    (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3,
+                                    nb10, nb11, nb12, nb13);
+                        }
+                    }
                     GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
                     const float * src = (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03);
@@ -19104,6 +19134,23 @@ static void ggml_compute_forward_set_rows_f32(
 
                     const int64_t i1 = *(int32_t*) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+                    if (i1 < 0 || i1 >= ne1) {
+                        if (getenv("DSV4_DEBUG_SET_ROWS_BOUNDS")) {
+                            fprintf(stderr,
+                                    "ggml_set_rows bounds: dst=%s src0=%s src1=%s i1=%lld ne1=%lld "
+                                    "i=%lld i02=%lld i03=%lld i10=%lld i11=%lld i12=%lld "
+                                    "src0_ne=[%lld,%lld,%lld,%lld] src1_ne=[%lld,%lld,%lld,%lld] dst_ne=[%lld,%lld,%lld,%lld] "
+                                    "src1_nb=[%zu,%zu,%zu,%zu]\n",
+                                    dst->name, src0->name, src1->name,
+                                    (long long) i1, (long long) ne1,
+                                    (long long) i, (long long) i02, (long long) i03,
+                                    (long long) i10, (long long) i11, (long long) i12,
+                                    (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03,
+                                    (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+                                    (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3,
+                                    nb10, nb11, nb12, nb13);
+                        }
+                    }
                     GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
                     const float * src = (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03);
@@ -21750,6 +21797,37 @@ static void ggml_compute_forward_argsort(
         case GGML_TYPE_F32:
             {
                 iqk_argsort(dst, params->ith, params->nth);
+                if (params->ith == 0 && getenv("DSV4_DEBUG_ARGSORT_BOUNDS") && strstr(dst->name, "indexer_argsort") != NULL && ggml_nrows(src0) == 1) {
+                    int64_t src_nonfinite = 0;
+                    const float * src = (const float *) src0->data;
+                    for (int64_t i = 0; i < src0->ne[0]; ++i) {
+                        if (!isfinite(src[i])) {
+                            ++src_nonfinite;
+                        }
+                    }
+
+                    int64_t bad = 0;
+                    int32_t min_idx = INT32_MAX;
+                    int32_t max_idx = INT32_MIN;
+                    const int64_t n_check = MIN((int64_t) 512, dst->ne[0]);
+                    const int32_t * idx = (const int32_t *) dst->data;
+                    for (int64_t i = 0; i < n_check; ++i) {
+                        min_idx = MIN(min_idx, idx[i]);
+                        max_idx = MAX(max_idx, idx[i]);
+                        if (idx[i] < 0 || idx[i] >= src0->ne[0]) {
+                            ++bad;
+                        }
+                    }
+
+                    fprintf(stderr,
+                            "ggml_argsort debug: name=%s src_ne=[%lld,%lld,%lld,%lld] dst_ne=[%lld,%lld,%lld,%lld] "
+                            "nk=%d src_nonfinite=%lld first512_bad=%lld min_idx=%d max_idx=%d first=[%d,%d,%d,%d]\n",
+                            dst->name,
+                            (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+                            (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                            ggml_get_op_params_i32(dst, 1), (long long) src_nonfinite, (long long) bad,
+                            min_idx, max_idx, idx[0], idx[1], idx[2], idx[3]);
+                }
                 //ggml_compute_forward_argsort_f32(params, dst);
             } break;
         default:
@@ -26956,7 +27034,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     const int n_as = src0->ne[2];
                     cur += GGML_PAD(cur, sizeof(int64_t));       // align
                     cur += n_as * sizeof(int64_t);               // matrix_row_counts
-                    cur += n_as * src1->ne[2] * sizeof(int64_t); // matrix_rows
+                    cur += n_as * node->src[2]->ne[0] * node->src[2]->ne[1] * sizeof(int64_t); // matrix_rows
                 } break;
             case GGML_OP_MOE_FUSED_UP_GATE:
                 {
@@ -26971,7 +27049,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     const int n_as = src0->ne[2];
                     cur += GGML_PAD(cur, sizeof(int64_t));       // align
                     cur += n_as * sizeof(int64_t);               // matrix_row_counts
-                    cur += n_as * src2->ne[2] * sizeof(int64_t); // matrix_rows
+                    cur += n_as * node->src[3]->ne[0] * node->src[3]->ne[1] * sizeof(int64_t); // matrix_rows
                 } break;
             case GGML_OP_FUSED_UP_GATE:
                 {
@@ -27093,6 +27171,172 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
     return cplan;
 }
 
+static bool dsv4_debug_name_contains_n(const char * name, const char * needle, size_t needle_len) {
+    if (needle_len == 0) {
+        return false;
+    }
+
+    const size_t name_len = strlen(name);
+    if (needle_len > name_len) {
+        return false;
+    }
+
+    for (size_t i = 0; i + needle_len <= name_len; ++i) {
+        if (memcmp(name + i, needle, needle_len) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool dsv4_debug_ggml_tensor_matches(const char * name) {
+    const char * env = getenv("DSV4_DEBUG_GGML_TENSOR_STATS");
+    if (env == NULL || env[0] == '\0') {
+        return false;
+    }
+    if (strcmp(env, "1") == 0) {
+        return true;
+    }
+
+    const char * p = env;
+    while (*p != '\0') {
+        while (*p == ',' || *p == ' ' || *p == '\t') {
+            ++p;
+        }
+        bool exact = false;
+        if (*p == '=') {
+            exact = true;
+            ++p;
+        }
+
+        const char * start = p;
+        while (*p != '\0' && *p != ',') {
+            ++p;
+        }
+        const char * end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+            --end;
+        }
+
+        const size_t len = (size_t) (end - start);
+        if (len > 0) {
+            if (exact) {
+                if (strlen(name) == len && memcmp(name, start, len) == 0) {
+                    return true;
+                }
+            } else if (dsv4_debug_name_contains_n(name, start, len)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool dsv4_debug_ggml_get_value(
+        const struct ggml_tensor * t,
+        int64_t                    i0,
+        int64_t                    i1,
+        int64_t                    i2,
+        int64_t                    i3,
+        double *                   out) {
+    if (t->data == NULL) {
+        return false;
+    }
+
+    const uint8_t * data = (const uint8_t *) t->data;
+    const size_t off = (size_t) i3*t->nb[3] + (size_t) i2*t->nb[2] + (size_t) i1*t->nb[1] + (size_t) i0*t->nb[0];
+
+    switch (t->type) {
+        case GGML_TYPE_F32:
+            *out = (double) *(const float *) (data + off);
+            return true;
+        case GGML_TYPE_F16:
+            *out = (double) GGML_FP16_TO_FP32(*(const ggml_fp16_t *) (data + off));
+            return true;
+        case GGML_TYPE_I32:
+            *out = (double) *(const int32_t *) (data + off);
+            return true;
+        case GGML_TYPE_I64:
+            *out = (double) *(const int64_t *) (data + off);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void dsv4_debug_ggml_tensor_stats(const struct ggml_tensor * t) {
+    if (!dsv4_debug_ggml_tensor_matches(t->name)) {
+        return;
+    }
+
+    double sum = 0.0;
+    double abs_sum = 0.0;
+    double min_v = INFINITY;
+    double max_v = -INFINITY;
+    double first[4] = { 0.0, 0.0, 0.0, 0.0 };
+    int n_first = 0;
+    int64_t nonfinite = 0;
+    int64_t n = 0;
+
+    int top_id[5] = { -1, -1, -1, -1, -1 };
+    double top_v[5] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY };
+    const bool collect_top = strstr(t->name, "result_output") != NULL && t->type == GGML_TYPE_F32;
+
+    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                    double v = 0.0;
+                    if (!dsv4_debug_ggml_get_value(t, i0, i1, i2, i3, &v)) {
+                        return;
+                    }
+                    if (n_first < 4) {
+                        first[n_first++] = v;
+                    }
+                    ++n;
+                    if (!isfinite(v)) {
+                        ++nonfinite;
+                        continue;
+                    }
+                    sum += v;
+                    abs_sum += fabs(v);
+                    min_v = MIN(min_v, v);
+                    max_v = MAX(max_v, v);
+                    if (collect_top && i1 == 0 && i2 == 0 && i3 == 0) {
+                        for (int k = 0; k < 5; ++k) {
+                            if (v > top_v[k]) {
+                                for (int j = 4; j > k; --j) {
+                                    top_v[j] = top_v[j - 1];
+                                    top_id[j] = top_id[j - 1];
+                                }
+                                top_v[k] = v;
+                                top_id[k] = (int) i0;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fprintf(stderr, "DSV4_GGML_TENSOR_STATS name=%s type=%s op=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+            "] n=%" PRId64 " sum=%.9g abs_sum=%.9g min=%.9g max=%.9g nonfinite=%" PRId64
+            " first=[%.9g,%.9g,%.9g,%.9g]\n",
+            t->name, ggml_type_name(t->type), ggml_op_name(t->op),
+            t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            n, sum, abs_sum, min_v, max_v, nonfinite,
+            first[0], first[1], first[2], first[3]);
+    if (collect_top) {
+        fprintf(stderr, "DSV4_GGML_TENSOR_TOP name=%s top5=%d:%.9g,%d:%.9g,%d:%.9g,%d:%.9g,%d:%.9g\n",
+                t->name, top_id[0], top_v[0], top_id[1], top_v[1], top_id[2], top_v[2],
+                top_id[3], top_v[3], top_id[4], top_v[4]);
+    }
+    fflush(stderr);
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
@@ -27133,6 +27377,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         ggml_barrier(state->shared);
+
+        if (state->ith == 0) {
+            dsv4_debug_ggml_tensor_stats(node);
+        }
 
         if (state->shared->ec != GGML_STATUS_SUCCESS) {
             break;

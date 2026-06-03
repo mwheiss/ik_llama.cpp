@@ -1108,7 +1108,9 @@ llm_expert_gating_func_type   gating_op,
 
         group_scores = ggml_sum_rows(ctx,
                 ggml_reshape_3d(ctx, group_scores, group_scores->ne[1], group_scores->ne[2], group_scores->ne[3])); // [1, n_expert_groups, n_tokens]
+        cb(group_scores, "ffn_moe_group_scores_sum", il);
         group_scores = ggml_reshape_2d(ctx, group_scores, group_scores->ne[1], group_scores->ne[2]); // [n_expert_groups, n_tokens]
+        cb(group_scores, "ffn_moe_group_scores", il);
 
         ggml_tensor * expert_groups = ggml_top_k(ctx, group_scores, hparams.n_group_used); // [n_group_used, n_tokens]
         cb(expert_groups, "ffn_moe_group_topk", il);

@@ -531,6 +531,12 @@ struct llama_model {
         if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35) {
             return std::max<size_t>(n_tokens * 40, 32u * n_tensors);
         }
+        if (arch == LLM_ARCH_DEEPSEEK4) {
+            // DSV4 resumed-prompt chunks build many temporary graph objects for
+            // compressed/indexer cache replay. Match the cchuter clean-branch
+            // reservation rule so the metadata arena does not exhaust mid-layer.
+            return std::max<size_t>(524288u, n_tokens * 192 + 64u * n_tensors);
+        }
         //return std::max<size_t>(1024, 8*n_tensors);
         return 65536;
     }

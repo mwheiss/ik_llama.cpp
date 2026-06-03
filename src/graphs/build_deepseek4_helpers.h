@@ -21,6 +21,18 @@ struct llm_deepseek4_decode_compressor {
     struct ggml_tensor * kv_comp;
 };
 
+struct llm_deepseek4_indexer_decode_trace {
+    struct ggml_tensor * q_projected;
+    struct ggml_tensor * q_rope;
+    struct ggml_tensor * k_cache;
+    struct ggml_tensor * score_raw;
+    struct ggml_tensor * score_relu;
+    struct ggml_tensor * weights_projected;
+    struct ggml_tensor * weights_scaled;
+    struct ggml_tensor * score_weighted;
+    struct ggml_tensor * score_sum;
+};
+
 struct ggml_tensor * llm_build_deepseek4_rope_tail(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -115,6 +127,28 @@ struct llm_deepseek4_state_pair llm_build_deepseek4_compressor_prefill_state(
         int64_t               n_embd_head,
         int64_t               compress_ratio);
 
+struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode_projected(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv_cur,
+        struct ggml_tensor  * sc_cur,
+        struct ggml_tensor  * prev_kv_state,
+        struct ggml_tensor  * prev_score_state,
+        struct ggml_tensor  * norm,
+        int64_t               n_embd_head,
+        int64_t               n_rot,
+        int64_t               pos,
+        int64_t               compress_ratio,
+        int                   rope_type,
+        int32_t               n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 norm_eps,
+        struct ggml_tensor  * comp_pos = nullptr);
+
 struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -179,7 +213,8 @@ struct ggml_tensor * llm_build_deepseek4_indexer_scores_decode(
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow);
+        float                 beta_slow,
+        struct llm_deepseek4_indexer_decode_trace * trace = nullptr);
 
 struct ggml_tensor * llm_build_deepseek4_compressed_mask_from_topk(
         struct ggml_context * ctx,

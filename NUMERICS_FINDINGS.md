@@ -1097,3 +1097,815 @@ larger CPU prefill than the current atomic helper validation. The next runtime
 gate for this path should use a long prompt or a purpose-built cache-state
 fixture and compare the sparse mask/top-k tensor directly against cchuter before
 continuing to longer text quality checks.
+
+## Long-prompt engine harness bring-up
+
+### Context
+
+The user-provided `scripts/engine_test_harness.py` is now the high-level
+dual-engine gate. It runs cchuter's `llama-server` as the reference and ik's
+`llama-server` as the test engine, feeds the same long bundled prompt through
+both servers, and compares:
+
+- exact generated report text,
+- normalized token rows where available,
+- logprob differences over the strict expected region,
+- wall-clock prefill/decode throughput,
+- peak RSS.
+
+The first DeepSeek4 Q4 flash-off reference run with context 8192 completed on
+cchuter with:
+
+```text
+prompt_tokens=7519
+all_ok=true
+elapsed_seconds_for_whole_bundle=403.354
+time_to_first_content_seconds=272.264
+prefill_tps_wall=27.62
+decode_tps_wall_strict_region=1.373
+peak_rss_mib_process_group_sum~=169006
+```
+
+### Flash-off attention path must not use FlashAttention
+
+The first ik flash-off harness attempt failed before the server became healthy.
+There were two related issues:
+
+1. DSV4-specific attention masks were only padded when `cparams.flash_attn`
+   was true. Some graph paths can still require the padded mask shape, so DSV4
+   masks are now padded to `GGML_KQ_MASK_PAD` columns consistently.
+2. More importantly, the DSV4 compressed attention helper always called
+   `ggml_flash_attn_ext`, even when the user requested `--flash-attn off`.
+   With flash disabled, this produced all-NaN attention output for layer 0 in
+   the long prompt server warmup/probe.
+
+The helper now follows the main ik pattern:
+
+- `cparams.flash_attn == true`: cast K/V and mask as needed, call
+  `ggml_flash_attn_ext`, and keep F32 precision.
+- `cparams.flash_attn == false`: build KQ with `ggml_mul_mat`, apply
+  `ggml_soft_max_ext` plus sinks, multiply by V, then reshape the result.
+
+This is an implementation-path fix, not an intentional numerical relaxation.
+Flash-off should no longer run through a flash-attention operator by accident.
+
+### Prefill compressed-position tensors cannot use F32-to-I32 cast
+
+The long prompt also exposed the same class of I32 position issue previously
+seen in decode helpers. The prefill compressor originally built compressed row
+positions as:
+
+```c++
+comp_pos = ggml_arange(...);
+comp_pos = ggml_cast(comp_pos, GGML_TYPE_I32);
+```
+
+In ik, this reaches a F32-to-I32 `CPY`/`DUP` execution path that is not a valid
+CPU path for this graph. The failure appeared once the long prompt had enough
+tokens to enter compressed prefill.
+
+The model graph now registers small DeepSeek4 I32 input tensors for these
+position ranges and fills them through the existing input plumbing. This keeps
+graph construction no-alloc safe and avoids relying on an unsupported runtime
+cast.
+
+### Resumed-prompt compressor chunks must avoid per-token projection blowup
+
+Server requests at long context are processed as resumed prompt chunks. The
+initial retry graph projected compressor K/V and score tensors inside the
+per-token decode-compressor loop. That was correct enough for tiny chunks but
+created too many temporary graph objects for long resumed prompt chunks.
+
+The current graph projects the full chunk once:
+
+```c++
+kv_all = ggml_mul_mat(wkv, x)
+sc_all = ggml_mul_mat(wgate, x)
+```
+
+then views one token at a time while sequencing the state update. This matches
+the mathematical result of the old loop but greatly reduces graph metadata
+pressure. The DeepSeek4 graph reservation size was also raised to cchuter's
+clean-branch rule:
+
+```text
+max(524288, n_tokens * 192 + 64 * n_tensors)
+```
+
+That change is DeepSeek4-specific and avoids touching shared graph allocation
+logic for other architectures.
+
+### Warmup-only fused MoE crash
+
+After the graph fixes above, the same long prompt succeeds through `llama-cli`
+with `--no-warmup`:
+
+```text
+Q4, ctx=8192, prompt="Hello " * 640, flash-attn off, threads=52:
+prompt eval time = 14334.94 ms / 641 tokens = 44.72 tok/s
+```
+
+Without `--no-warmup`, both `llama-cli` and `llama-server` can crash during the
+startup warmup before the real request. A gdb backtrace shows the crash in:
+
+```text
+mul_mat_q8_1_r8_q8_2<8>
+iqk_mul_mat_moe
+ggml_compute_forward_mul_mat_id
+```
+
+This is currently classified as a warmup-only fused-MoE/IQK issue, not a DSV4
+graph numerics mismatch in the real request path. The engine harness now adds
+`--no-warmup` when a server advertises it, for both cchuter and ik. That keeps
+the dual-engine request comparison focused on the actual prompt/decode path
+while preserving a clear TODO to debug warmup separately.
+
+Do not treat `--no-warmup` as a permanent performance solution. Before removing
+it from the final gate, isolate why the empty warmup graph selects or shapes
+the fused MoE path differently enough to crash, and add a focused regression
+test for that graph.
+
+### One-token decode is unstable above 16 graph threads
+
+After the long-prompt graph issues were fixed, a separate one-token decode
+failure appeared with full Cascade Lake threading. The minimal Q4 repro was:
+
+```text
+llama-cli -ngl 0 -t 52 -c 128 -b 128 -ub 128 -n 4 -p Hello --flash-attn off --no-warmup
+```
+
+The crash was first seen in the IQK selected-expert `mul_mat_id` path. A real
+scratch accounting bug was found there: the per-expert row map must be sized by
+`n_ids * ids->ne[1]`, not only by the number of token rows. With
+`n_expert_used > 1`, the old layout can underallocate or alias selected-expert
+row mappings. That fix is implementation-independent and should remain.
+
+After correcting the row map, the hard crash changed into a deterministic NaN
+when the graph compute thread count exceeds 16. The boundary was:
+
+```text
+-t 16: finite through the first normal-router layer
+-t 17 and above: NaN in ffn_moe_group_scores_sum-3
+```
+
+Layer 0 and layer 1 tensor summaries match between `-t 16` and `-t 17`; the
+first observed NaN is at layer 3, which is the first non-hash routed FFN/MoE
+layer. A generic scalar/no-IQK fallback experiment for `mul_mat_id` was also
+tried and rejected because it produced NaNs for the Q4/Q6 selected-expert
+tensors, so this is not yet a safe recovery path.
+
+This was initially worked around with a temporary DeepSeek4-only one-token
+decode cap at 16 graph threads. That cap has since been removed. The later
+investigation showed that the remaining high-thread tiny-decode failure was not
+the router itself; the first bad step was the first compression-boundary token
+where `(pos + 1) % compress_ratio == 0`.
+
+Next debugging candidates for the earlier selected-expert suspicion remain:
+
+- add a low-overhead finite-value probe around layer-3 router inputs/outputs
+  that does not perturb graph scheduling as much as the current tensor-stat
+  callback;
+- compare `mul_mat_id` and `moe_fused_up_gate` worker partitioning at 16 vs 17
+  threads for the one-token Q4/Q6 path;
+- isolate whether the NaN originates in router logits/probabilities or in the
+  selected-expert output feeding the router normalization;
+- add a focused regression test that runs the affected one-token selected-expert
+  graph at 16 and 17+ CPU threads once the kernel fix is known.
+
+### Flash-off small-cache decode KQV should use primitive weighted sum
+
+After removing the one-token thread cap, the tiny high-thread repro:
+
+```text
+Q4, ctx=128, -t 32 or -t 52, flash-attn off, -n 4, prompt="Hello"
+```
+
+completed positions 0, 1, and 2 in roughly 300-365 ms per token, then stalled
+at position 3. Position 3 is the first compressed-cache update for the first
+compressed layer (`compress_ratio = 4`). An env-gated decode timer showed that
+graph build/allocation were normal and the stall was inside graph compute:
+
+```text
+t=32:
+  pos0 compute ~= 312 ms
+  pos1 compute ~= 308 ms
+  pos2 compute ~= 309 ms
+  pos3 did not complete before timeout
+```
+
+A tensor-stat trace localized the last completed node at layer 2 to
+`dsv4_attn_kq_softmax-2`; the next node was `dsv4_attn_kqv-2`. At this point
+the manual flash-off attention has one query and 33 keys:
+
+```text
+dsv4_attn_kq_softmax-2: ne=[33,1,64,1], finite
+next node: dsv4_attn_kqv-2 = V * softmax(KQ)
+```
+
+The existing primitive fallback only handled the one-key path and a tiny
+`K <= 8` path, so this shape still went through the F32 `ggml_mul_mat(v_attn,
+kq)` fallback. Extending the primitive decomposition to one-query `K <= 64`
+fixed the stall without reintroducing NaNs:
+
+```text
+t=32, K<=64 primitive path:
+  pos0 compute = 312.140 ms
+  pos1 compute = 307.767 ms
+  pos2 compute = 309.519 ms
+  pos3 compute = 345.227 ms
+  rc=0
+
+t=52, K<=64 primitive path:
+  pos0 compute = 365.162 ms
+  pos1 compute = 350.414 ms
+  pos2 compute = 357.140 ms
+  pos3 compute = 388.417 ms
+  rc=0
+```
+
+This path uses `repeat + mul + sum_rows` and is deliberately scoped to
+one-query, small-K decode. It may change the final few ulps compared with the
+matmul accumulation order, so the full engine harness must remain the gate.
+Do not raise this threshold blindly for long-cache decode: large K would expand
+V to a much larger temporary tensor and could hurt both memory and speed.
+
+### Flash-off long-cache decode needs F32 V*KQ matmul
+
+After the one-token thread cap, the full harness still failed for long prompts
+with flash attention disabled. The first generated token was produced, but the
+second decode crashed in a downstream MoE sum-row finite check. Tensor stats
+localized the first non-finite values to layer 2 compressed attention:
+
+```text
+prompt "Hello " * 5500, Q4, ctx=8192, -t 52, flash-attn off, -n 2
+decode pos=5501, layer=2:
+Qcur, KVcur, raw K cache, compressed K cache, indexer scores, top-k and masks:
+  finite except expected -inf mask entries
+dsv4_compressed_attn_out:
+  nonfinite=31616 / 32768
+attn_out and hc_attn_post:
+  all NaN
+```
+
+This showed that the FFN/MoE assert was only the first checker to notice a bad
+value; the source was the non-flash attention output. The prompt/chunk path
+already cast the V cache view to F32 before the manual `V * softmax(KQ)` matmul,
+because the F16 CPU matmul had previously produced infinities on sparse resumed
+chunks. One-token decode had kept the long F16 V cache in that same non-flash
+matmul. Extending the existing DSV4-local F32 cast to decode fixed the long
+cache NaNs without changing the F16 KV-cache storage contract.
+
+An attempted narrower policy, casting only the one-token decode path and
+restoring F16 V for prompt/resumed chunks, regressed the same 5500-token repro
+to layer-2 NaNs. For now the whole DSV4 flash-off compressed-attention manual
+path needs the F32 V matmul guard.
+
+An attempted replacement using the optimized F16 V input with
+`ggml_mul_mat_set_prec(kqv, GGML_PREC_F32)` also regressed the same repro. The
+bad path is therefore not avoided by the GGML precision flag alone; the V input
+must currently be materialized as F32 before the matmul.
+
+A second attempted replacement decomposed the F16 V*KQ multiply into per-head
+2D `ggml_mul_mat` calls and concatenated the outputs. This avoided the single
+4D broadcast matmul, but still produced NaNs in the 5500-token repro, later in
+the layer stack (`ffn_moe_group_scores_sum-4`). It was also materially slower.
+That rules out the 4D broadcast shape as the only trigger; the unsafe piece is
+broader than that specific call layout.
+
+A temporary diagnostic bypass of IQK for only the tensor named
+`dsv4_attn_kqv` made the same 5500-token repro finite with F16 V. That isolates
+the non-finite failure to ik's IQK-accelerated F16 V*KQ path rather than the
+generic GGML fallback. It was not a viable final path:
+
+```text
+5500-token CLI repro, no-IQK dsv4_attn_kqv:
+  rc=0, prompt eval = 26.20 tok/s, decode = 1.36 tok/s
+
+full FA-off harness, no-IQK dsv4_attn_kqv:
+  text/tokens match cchuter
+  max logprob diff = 0.00389 > 0.002 hard threshold
+  ik prefill = 21.40 tok/s vs cchuter 29.65 tok/s
+```
+
+So the implementation is back on the F32 V materialization guard. The next real
+optimization is to fix or narrowly disable the IQK F16 V*KQ kernel path in a
+way that is finite, faster than F32 materialization, and no worse in logprob
+parity.
+
+Validated repros after the fix:
+
+```text
+Q4, ctx=8192, -t 52, flash-attn off, -n 2, prompt="Hello " * 5500:
+  rc=0, prompt eval = 28.82 tok/s, decode = 1.20 tok/s
+
+Q4, ctx=8192, -t 52, flash-attn off, -n 2, prompt="Hello " * 7000:
+  rc=0, prompt eval = 26.42 tok/s, decode = 1.06 tok/s
+```
+
+This is correctness-first and may cost decode speed in flash-off mode. Revisit
+after the full harness is stable:
+
+- compare ik's F16 `ggml_mul_mat(v_attn, kq)` numerics against cchuter's CPU
+  path on a small extracted long-cache decode graph;
+- determine whether the failure is a generic F16 matmul kernel issue, a
+  shape/stride corner case from the DSV4 compressed attention layout, or an IQK
+  backend selection issue;
+- if the optimized F16 path can be made finite and numerically close, remove
+  the decode F32 cast and keep a regression test for the 5500/7000-token
+  flash-off repros.
+
+### Rejected FA-off KQV experiments after the full harness gate
+
+The full `scripts/engine_test_harness.py` gate currently passes text/token
+parity in flash-off mode but fails the hard logprob threshold. At ctx=1024 the
+largest short-run delta is:
+
+```text
+command:
+  python3 scripts/engine_test_harness.py --ctx-size 1024
+
+result:
+  text/tokens match
+  max_abs_logprob_diff = 0.00872755 at token "Paris"
+  cchuter logprob = -0.0133262
+  ik logprob      = -0.00459863
+```
+
+Inspecting the reported top candidates shows this is not just a server
+probability formatting issue. The cchuter competitor `PAR` is about one logprob
+point closer to `Paris` than ik's competitor:
+
+```text
+cchuter Paris row: Paris=-0.0133262, PAR=-4.70722
+ik Paris row:      Paris=-0.0045986, PAR=-5.70189
+```
+
+Two small fixes were tested and rejected:
+
+- An env-gated experiment that skipped the DSV4 F32 V materialization and used
+  the F16 V*KQ path immediately diverged at ctx=1024:
+  `gold_a= {` instead of `gold_a=ALPHA-1138`. This confirms that simply
+  matching cchuter's apparent F16 V input is not safe with ik's current F16
+  matmul path.
+- A change to the one-query workaround that explicitly viewed the matching V
+  head before the per-head matmul produced only `gold_a=AL` and then failed the
+  strict completion. The existing 4D broadcast contract in that helper is ugly,
+  but this experiment shows the naive `[K,Vdim]` head view does not match ik's
+  tensor layout at that point.
+
+Both changes were reverted. The next investigation should extract or trace the
+one-query `V * softmax(KQ)` shape more directly, including `v_attn` strides and
+the output shape of `ggml_mul_mat(v_attn, kq_h)`, before attempting another
+kernel-policy change.
+
+A third controlled experiment removed ik's DSV4-specific prefill mask-column
+padding and built prefill masks with cchuter's unpadded `[keys, n_tokens]`
+shape. Decode padding was left unchanged. The short FA-off harness produced the
+same generated text and exactly the same logprob deltas:
+
+```text
+command:
+  python3 scripts/engine_test_harness.py --ctx-size 1024
+
+result after unpadding DSV4 prefill masks:
+  text/tokens match
+  max_abs_logprob_diff = 0.00872755 at token "Paris"
+  mean_abs_logprob_diff = 0.000187752
+```
+
+So the padded extra prefill mask columns are ignored by the active computation
+for this gate. The experiment was reverted because it did not improve parity
+and changed graph shapes without benefit.
+
+A fourth controlled experiment replaced ik's DeepSeek4 MoE group/expert
+selection with a cchuter-style local `argsort + view` top-k helper instead of
+the branch's optimized `ggml_top_k` partial-sort path. This was scoped to the
+DeepSeek4 MoE helper only and did not add a new GGML op. The short FA-off
+ctx=1024 harness produced exactly the same strict failure:
+
+```text
+command:
+  python3 scripts/engine_test_harness.py --ctx-size 1024
+
+result after DSV4-local argsort+view top-k:
+  text/tokens match
+  max_abs_logprob_diff = 0.00872755 at token "Paris"
+  mean_abs_logprob_diff = 0.000187752
+```
+
+The experiment was reverted, per the optimized-sort rule. The remaining
+ctx=1024 FA-off drift is not caused by ik's partial `ggml_top_k` path.
+
+A fifth controlled experiment routed DeepSeek4 `compress_ratio == 0` local
+layers through ik's standard `llm_build_kv` helper instead of the DSV4
+compressed-attention helper. This looked attractive because cchuter's clean
+branch uses its standard `build_attn_mha` helper for local layers.
+
+The experiment was rejected. It made the short FA-off gate much worse:
+
+```text
+command:
+  python3 scripts/engine_test_harness.py --ctx-size 1024
+
+result after standard llm_build_kv local layers:
+  text/tokens still match
+  max_abs_logprob_diff = 0.443750 at token "-L"
+  mean_abs_logprob_diff = 0.00627222
+```
+
+Although this direction is appealing from a main-faithfulness perspective, ik's
+standard KV helper does not reproduce the current DSV4 local-layer numerics.
+The experiment was reverted. Any future attempt to make local layers use more
+of the standard attention helper must first compare the local-layer K/V cache
+views, mask orientation, and post-attention `kqv_out` tensor against cchuter in
+isolation; do not reapply the broad substitution.
+
+A sixth controlled experiment replaced the one-query FA-off KQV per-head
+matmul with a primitive `repeat + mul + sum_rows` weighted sum for key counts
+up to 1024. This directly tested whether the remaining short-run drift was
+caused by the F32 per-head `ggml_mul_mat(v, softmax(KQ))` accumulation order.
+
+The experiment was rejected:
+
+```text
+command:
+  python3 scripts/engine_test_harness.py --ctx-size 1024
+
+result after one-query KQV primitive weighted sum:
+  text/tokens still match
+  max_abs_logprob_diff = 0.00915787 at token "Paris"
+  mean_abs_logprob_diff = 0.000184685
+  ik decode_tps = 0.894 vs cchuter decode_tps = 1.523
+```
+
+This rules out the simple primitive weighted-sum decomposition as the parity
+fix for the ctx=1024 FA-off `Paris` drift. It was both numerically worse and
+materially slower, so the optimized per-head matmul path was restored.
+
+A seventh controlled experiment changed only the DeepSeek4 shared expert path
+from ik's generic `llm_build_ffn(..., LLM_FFN_PAR)` call to the explicit
+cchuter expression:
+
+```text
+up      = matmul(ffn_up_shexp,   x)
+gate    = matmul(ffn_gate_shexp, x)
+swiglu  = ggml_swiglu_split(gate, up)
+out     = matmul(ffn_down_shexp, swiglu)
+```
+
+This avoids ik's generic fused up/gate routes for this DSV4 subgraph while
+leaving the generic helper untouched. The short FA-off harness changed only
+slightly:
+
+```text
+baseline after rebuild:
+  max_abs_logprob_diff = 0.00872755 at token "Paris"
+  mean_abs_logprob_diff = 0.000187752
+
+after cchuter-style shared expert:
+  max_abs_logprob_diff = 0.00859072 at token "Paris"
+  mean_abs_logprob_diff = 0.000188195
+```
+
+The top-level gate still fails, so this is not the root cause of the remaining
+drift. However, a comparable low-level tensor-stat trace at the aligned
+`Paris` step showed that layer-13 `ffn_shexp` is no longer the large outlier
+seen before this change; routed MoE and shared expert summaries are now close
+at that local boundary. Keep the explicit DSV4 shared-expert expression for
+now because it is more faithful to cchuter and improves local trace parity.
+Reconsider it later only if a full FA-off parity pass shows a measurable speed
+regression.
+
+An eighth controlled experiment tried to match cchuter's routed-expert
+aggregation order by replacing ik's DSV4 `ggml_multi_add` expert reduction with
+explicit ordered `view + add` nodes. This was DSV4-only and left the generic ik
+MoE path unchanged.
+
+The experiment produced exactly the same short FA-off strict deltas as the
+shared-expert-only run:
+
+```text
+after DSV4 ordered expert reduction:
+  max_abs_logprob_diff = 0.00859072 at token "Paris"
+  mean_abs_logprob_diff = 0.000188195
+```
+
+The ordered reduction was reverted. The remaining ctx=1024 FA-off drift is not
+explained by the final selected-expert accumulation order, and the optimized
+`ggml_multi_add` path should remain in place unless a later, narrower tensor
+parity check proves otherwise.
+
+A ninth controlled experiment forced `GGML_PREC_F32` on the final
+`output.weight` matmul only:
+
+```text
+result_norm -> output.weight -> result_output
+```
+
+This tested whether the remaining strict logprob drift was caused primarily by
+the final logits GEMM accumulation mode. The short FA-off gate was unchanged:
+
+```text
+after final-output F32 precision:
+  max_abs_logprob_diff = 0.00859072 at token "Paris"
+  mean_abs_logprob_diff = 0.000188195
+```
+
+The precision flag was reverted. The remaining drift is already present in the
+hidden state or earlier graph inputs to the logits projection, not in the final
+output matmul precision selection.
+
+### Server top-logprob normalization is main-faithful but affects comparisons
+
+During the short FA-off parity work, ik's server probability reporting was
+checked against `origin/main` because this is shared server logic rather than
+DeepSeek4 graph code. Current mainline ik keeps a tail accumulation after the
+main loop:
+
+```text
+for i in [n_sorted, n_vocab):
+    cum_sum += exp(logit[i] - max_logit)
+```
+
+The surrounding loop already iterates over `n_vocab`, so this appears to double
+count the tail tokens mathematically. However, the user explicitly requested
+that non-DSV4 main logic remain faithful to main. Therefore this port should not
+silently "fix" the shared server probability helper as part of DSV4 bring-up.
+Any change there belongs in a separate upstream/server patch with its own tests.
+
+With the main-faithful server behavior, the short ctx=1024 FA-off harness
+produced the same generated text and tokens, but strict reported logprob drift
+is:
+
+```text
+command:
+  python3 scripts/engine_test_harness.py --ctx-size 1024
+
+result:
+  max_abs_logprob_diff = 0.0107598 at row 6 token "\n"
+  mean_abs_logprob_diff = 0.000214229
+  rows above hard threshold = 3
+  rows above warning threshold = 4
+```
+
+This supersedes the earlier `0.00859072` short-gate number for strict
+top-logprob comparisons. The duplicate-tail server behavior contributes to some
+rows, especially early rows with visible tail mass, but it does not explain all
+drift: the `Paris` row still differs even where both engines report top-10 mass
+above 0.9999. Future acceptance gates should keep the server-reporting caveat in
+mind while still treating remaining large rows as model/logit parity signals.
+
+### Fused MoE/up-gate/multi-add are not the short FA-off drift source
+
+A diagnostic wrapper ran the ctx=1024 FA-off harness with ik's fused MoE, fused
+up-gate, and fused mul-multiadd flags disabled:
+
+```text
+ik extra flags:
+  -no-fmoe -no-fug -no-mmad
+
+command:
+  python3 scripts/engine_test_harness.py --ctx-size 1024 \
+    --ik-server-bin dsv4-traces/ik-server-no-fused-wrapper.sh
+```
+
+The run produced the exact same strict logprob deltas as the baseline:
+
+```text
+max_abs_logprob_diff  = 0.01075980015290149
+mean_abs_logprob_diff = 0.00021422851820767678
+rows_above_hard       = 3
+```
+
+Generated text and token rows still matched. This rules out ik's fused
+MoE/up-gate/multi-add helpers as the current ctx=1024 FA-off strict-parity
+source. Keep those optimized paths enabled while investigating the remaining
+drift.
+
+### F16 V input in FA-off prefill is still unsafe
+
+A second attention diagnostic added an env-gated option to skip the DSV4-local
+F32 V materialization for non-flash prefill attention and feed the F16 V tensor
+to `ggml_mul_mat(v_attn, kq)`, closer to cchuter's apparent non-flash MHA
+expression.
+
+```text
+temporary env:
+  DSV4_DEBUG_F16_PREFILL_ATTN=1
+
+command:
+  DSV4_DEBUG_F16_PREFILL_ATTN=1 \
+    python3 scripts/engine_test_harness.py --ctx-size 1024
+```
+
+The ik side diverged immediately:
+
+```text
+expected:
+  gold_a=ALPHA-1138
+
+observed:
+  gold_a= { "spec_id": "ORBITAL-LIME-7429", ... }
+```
+
+This confirms that the F32 V materialization in the current ik FA-off DSV4
+attention path is a correctness guard, not merely an over-precise source of
+small logprob drift. The probe was reverted. Any future attempt to recover
+cchuter's F16-input behavior must first fix the underlying ik F16/IQK
+`V * softmax(KQ)` path rather than removing the guard.
+
+### FA-off server-logprob normalization and decode-attention probes
+
+The ctx=1024 FA-off harness was rerun after restoring the mainline
+`sum_rows` finite assert. With default server probability reporting, text and
+token rows matched, but strict reported logprob parity still failed:
+
+```text
+command:
+  python3 scripts/engine_test_harness.py --ctx-size 1024
+
+result:
+  max_abs_logprob_diff  = 0.01075980015290149
+  mean_abs_logprob_diff = 0.00021422851820767678
+  rows_above_hard       = 3
+```
+
+A temporary ik-server diagnostic removed ik's duplicate tail contribution in
+`get_token_probabilities`, matching cchuter's full-softmax probability
+normalization more closely. That reduced but did not eliminate the failure:
+
+```text
+temporary env:
+  IK_LLAMA_SERVER_FULL_SOFTMAX_PROBS=1
+
+result:
+  max_abs_logprob_diff  = 0.008590715827371115
+  mean_abs_logprob_diff = 0.0001881952703257985
+  max row               = token "Paris"
+```
+
+So part of the harness delta is probability-reporting API drift, but the
+remaining `"Paris"` and newline rows are real logits/model parity signals.
+Do not change the default server helper inside the DSV4 port just to make this
+comparison pass; if the server probability bug is fixed, do it as a separate
+mainline-faithful patch.
+
+Two more attention diagnostics were rejected:
+
+```text
+temporary env:
+  IK_LLAMA_SERVER_FULL_SOFTMAX_PROBS=1
+  DSV4_DEBUG_F16_PREFILL_ATTN=1
+  DSV4_DEBUG_NO_IQK_ATTN_KQV=1
+
+result:
+  text/token rows matched, but max_abs_logprob_diff worsened to 0.009380021846897811
+```
+
+This shows that bypassing the IQK shortcut is enough to avoid the immediate
+F16-input text divergence, but it does not recover cchuter parity and is slower.
+The current F32 V materialization remains the better correctness-first path.
+
+```text
+temporary env:
+  IK_LLAMA_SERVER_FULL_SOFTMAX_PROBS=1
+  DSV4_DEBUG_DIRECT_DECODE_ATTN=1
+
+result:
+  ik emitted the first token "AL" and then hit the restored ggml sum_rows
+  finite assert during the next decode step.
+```
+
+The direct one-query `ggml_mul_mat(v_attn, kq)` path is therefore unsafe in ik
+for DSV4 FA-off decode. Keep the per-head one-query workaround until the
+underlying 4D matmul path is fixed and proven finite.
+
+### Real-graph HC weighted-sum layout bug
+
+The original primitive-only `HC_WEIGHTED_SUM` replacement used a loop over
+2D HC views:
+
+```text
+x_h = view_2d(x[:, h, :])
+w_h = repeat(view_2d(weights[h, :]), x_h)
+acc = acc + x_h * w_h
+```
+
+The tiny contiguous synthetic test passed, but the real DSV4 graph did not.
+With cchuter and ik prompt chunking aligned to `104 + 512 + 4`, layer 0 showed
+that the upstream inputs to the helper were already close:
+
+```text
+final 4-token prompt chunk, layer 0:
+  hc_attn_pre_mixes   ref=-5577.04433  ik=-5576.16304
+  hc_attn_pre_weights ref=16.0000153   ik=16.0000153
+```
+
+But the weighted sum itself diverged badly before the fix:
+
+```text
+  hc_attn_pre         ref=-0.707920968 ik=23.0057234
+```
+
+cchuter's custom op reads the original 3D tensor with explicit strides:
+
+```text
+y[d, t] = sum_h x[d, h, t] * weights[h, t]
+```
+
+The ik helper now expresses that contract as primitive broadcast/multiply plus a
+permute that makes HC the row dimension:
+
+```text
+w    = repeat(reshape(weights, [1, n_hc, n_tokens]), x)
+prod = x * w
+prod = cont(permute(prod, [n_hc, n_embd, n_tokens]))
+out  = reshape_2d(sum_rows(reshape_2d(prod, n_hc, n_embd*n_tokens)),
+                  n_embd, n_tokens)
+```
+
+A new non-contiguous synthetic helper test covers this layout class. After the
+fix, the short fixed-prompt FA-off first-token comparison improved from:
+
+```text
+before:
+  max_abs_logprob_diff row 0 = 0.009560063246532557
+```
+
+to:
+
+```text
+after:
+  max_abs_logprob_diff row 0 = 0.0017288078831171512
+```
+
+The 16-token short FA-off gate still fails at the decode newline row:
+
+```text
+command:
+  python3 scripts/engine_test_harness.py --ctx-size 1024 --n-predict 16 --filler-lines 0
+
+result after HC weighted-sum fix:
+  max_abs_logprob_diff  = 0.003786294629069478
+  mean_abs_logprob_diff = 0.00047190442770155813
+  max row               = row 6 token "\n"
+```
+
+This remaining delta is no longer the HC weighted-sum layout bug.
+
+### DSV4 prompt tail chunking affects parity
+
+cchuter's server/context path consistently leaves the final `n_hc = 4` prompt
+tokens as a separate DSV4 prefill ubatch. For a 620-token fixed prompt with
+`n_ubatch = 512`, cchuter's traced prompt chunks are:
+
+```text
+104 + 512 + 4
+```
+
+The retry branch initially used ordinary ik batching:
+
+```text
+512 + 108
+```
+
+After fixing real-layout HC weighted sum, the DSV4-specific final-tail split was
+tested both ways:
+
+```text
+with DSV4 n_hc tail split:
+  max_abs_logprob_diff  = 0.003786294629069478
+  mean_abs_logprob_diff = 0.00047190442770155813
+  max row               = row 6 token "\n"
+
+without DSV4 n_hc tail split:
+  max_abs_logprob_diff  = 0.008808338051418728
+  mean_abs_logprob_diff = 0.0010106518449314926
+  max row               = row 0 token "AL"
+```
+
+The tail split is therefore kept as a DSV4-specific parity rule. It should not
+be generalized to other architectures, and future speed work should treat it as
+a correctness constraint unless cchuter/reference semantics are changed.
+
+### Rechecked cchuter-style F16 V input after weighted-sum fix
+
+After fixing the real-layout HC weighted sum, the cchuter-style FA-off attention
+experiment was repeated by temporarily removing ik's F32 materialization of the
+multi-token V attention tensor while keeping the one-query decode workaround.
+
+The same short gate crashed during ik prefill:
+
+```text
+command:
+  python3 scripts/engine_test_harness.py --ctx-size 1024 --n-predict 16 --filler-lines 0
+
+ik failure:
+  Remote end closed connection without response
+  Oops(ggml_compute_forward_sum_rows_f32, node_345183):
+      found nan for i1 = 2080768, i2 = 0, i3 = 0. ne00 = 4
+```
+
+The temporary change was reverted. The F32 V materialization remains required
+for FA-off stability until the underlying ik F16/IQK `V * softmax(KQ)` path is
+fixed.

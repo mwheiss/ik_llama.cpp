@@ -312,6 +312,53 @@ static void test_hc_weighted_sum_helper() {
     ggml_free(ctx);
 }
 
+static void test_hc_weighted_sum_noncontiguous_helper() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 4 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_embd = 7;
+    constexpr int64_t n_hc = 4;
+    constexpr int64_t n_tokens = 5;
+
+    ggml_tensor * x_storage = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc + 2, n_tokens);
+    ggml_tensor * x = ggml_view_3d(ctx, x_storage,
+            n_embd, n_hc, n_tokens,
+            x_storage->nb[1], x_storage->nb[2],
+            x_storage->nb[1]);
+    ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_tokens);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t h = 0; h < n_hc + 2; ++h) {
+            for (int64_t e = 0; e < n_embd; ++e) {
+                const float v = 0.013f * (float) (17*e - 11*h + 5*t);
+                ggml_set_f32_nd(x_storage, e, h, t, 0, v);
+            }
+        }
+        for (int64_t h = 0; h < n_hc; ++h) {
+            ggml_set_f32_nd(weights, h, t, 0, 0, 0.2f - 0.04f * (float) h + 0.015f * (float) t);
+        }
+    }
+
+    ggml_tensor * out = llm_build_deepseek4_hc_weighted_sum(ctx, x, weights);
+    graph_compute(ctx, out);
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t e = 0; e < n_embd; ++e) {
+            float ref = 0.0f;
+            for (int64_t h = 0; h < n_hc; ++h) {
+                ref += tensor_get_3d(x, e, h, t) * ggml_get_f32_nd(weights, h, t, 0, 0);
+            }
+            assert_close(ggml_get_f32_nd(out, e, t, 0, 0), ref, "hc_weighted_sum_noncontiguous_helper", 1.0e-6f);
+        }
+    }
+
+    ggml_free(ctx);
+}
+
 static void test_hc_expand_helper() {
     ggml_init_params params = {
         /* .mem_size   = */ 4 * 1024 * 1024,
@@ -1164,6 +1211,40 @@ static void test_compressed_mask_from_topk_helper() {
     ggml_free(ctx);
 }
 
+static void test_indexer_topk_indices_with_nan_scores() {
+    ggml_init_params params = {
+        /* .mem_size   = */ 4 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    constexpr int64_t n_comp = 1880;
+    constexpr int64_t top_k = 512;
+
+    ggml_tensor * scores = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_comp, 1);
+    for (int64_t i = 0; i < n_comp; ++i) {
+        const float v = i < 160 ? 1000.0f - (float) i : NAN;
+        ggml_set_f32_1d(scores, i, v);
+    }
+
+    ggml_tensor * sorted = ggml_argsort(ctx, scores, GGML_SORT_ORDER_DESC);
+    ggml_tensor * topk = ggml_view_2d(ctx, sorted, top_k, 1, sorted->nb[1], 0);
+    topk = ggml_cont(ctx, topk);
+    graph_compute(ctx, topk);
+
+    for (int64_t i = 0; i < top_k; ++i) {
+        const int32_t idx = ggml_get_i32_1d(topk, i);
+        if (idx < 0 || idx >= n_comp) {
+            fprintf(stderr, "indexer_topk_nan_scores: slot=%lld idx=%d expected [0,%lld)\n",
+                    (long long) i, idx, (long long) n_comp);
+            std::abort();
+        }
+    }
+
+    ggml_free(ctx);
+}
+
 static float ref_rope_standard(float x0, float x1, int32_t pos, int64_t pair, int64_t n_rot, bool second) {
     const float theta_scale = std::pow(10000.0f, -2.0f / (float) n_rot);
     const float theta = (float) pos * std::pow(theta_scale, (float) pair);
@@ -1228,6 +1309,7 @@ int main() {
     test_hc_split_sinkhorn();
     test_fp8_kv_quantize();
     test_hc_weighted_sum_helper();
+    test_hc_weighted_sum_noncontiguous_helper();
     test_hc_expand_helper();
     test_hc_head_helper();
     test_grouped_out_helper();
@@ -1239,6 +1321,7 @@ int main() {
     test_indexer_scores_prefill_helper();
     test_indexer_scores_decode_helper();
     test_compressed_mask_from_topk_helper();
+    test_indexer_topk_indices_with_nan_scores();
     test_rope_tail_helper();
     return 0;
 }

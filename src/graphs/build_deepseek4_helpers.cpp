@@ -217,22 +217,14 @@ struct ggml_tensor * llm_build_deepseek4_hc_weighted_sum(
     const int64_t n_hc     = x->ne[1];
     const int64_t n_tokens = x->ne[2];
 
-    struct ggml_tensor * acc = nullptr;
+    struct ggml_tensor * w = ggml_reshape_3d(ctx, weights, 1, n_hc, n_tokens);
+    w = ggml_repeat(ctx, w, x);
 
-    for (int64_t ih = 0; ih < n_hc; ++ih) {
-        struct ggml_tensor * xh = ggml_view_2d(ctx, x,
-                n_embd, n_tokens,
-                x->nb[2], ih*x->nb[1]);
-        struct ggml_tensor * wh = ggml_view_2d(ctx, weights,
-                1, n_tokens,
-                weights->nb[1], ih*weights->nb[0]);
-        wh = ggml_repeat(ctx, wh, xh);
-
-        struct ggml_tensor * term = ggml_mul(ctx, xh, wh);
-        acc = acc ? ggml_add(ctx, acc, term) : term;
-    }
-
-    return acc;
+    struct ggml_tensor * prod = ggml_mul(ctx, x, w);                         // [n_embd, n_hc, n_tokens]
+    prod = ggml_cont(ctx, ggml_permute(ctx, prod, 1, 0, 2, 3));              // [n_hc, n_embd, n_tokens]
+    prod = ggml_reshape_2d(ctx, prod, n_hc, n_embd*n_tokens);                // [n_hc, n_embd*n_tokens]
+    prod = ggml_sum_rows(ctx, prod);                                         // [1, n_embd*n_tokens]
+    return ggml_reshape_2d(ctx, prod, n_embd, n_tokens);
 }
 
 struct llm_deepseek4_hc_mix llm_build_deepseek4_hc_pre(
@@ -588,14 +580,12 @@ struct llm_deepseek4_state_pair llm_build_deepseek4_compressor_prefill_state(
     return { kv_state, score_state };
 }
 
-struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
+struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode_projected(
         struct ggml_context * ctx,
-        struct ggml_tensor  * x,
+        struct ggml_tensor  * kv_cur,
+        struct ggml_tensor  * sc_cur,
         struct ggml_tensor  * prev_kv_state,
         struct ggml_tensor  * prev_score_state,
-        struct ggml_tensor  * wkv,
-        struct ggml_tensor  * wgate,
-        struct ggml_tensor  * ape,
         struct ggml_tensor  * norm,
         int64_t               n_embd_head,
         int64_t               n_rot,
@@ -621,13 +611,10 @@ struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
     const int64_t row = compress_ratio == 4 ? compress_ratio + pos_mod : pos_mod;
     const bool should_compress = (pos + 1) % compress_ratio == 0;
 
-    GGML_ASSERT(x->ne[1] == 1);
-    GGML_ASSERT(wkv->ne[0] == x->ne[0]);
-    GGML_ASSERT(wkv->ne[1] == width);
-    GGML_ASSERT(wgate->ne[0] == x->ne[0]);
-    GGML_ASSERT(wgate->ne[1] == width);
-    GGML_ASSERT(ape->ne[0] == width);
-    GGML_ASSERT(ape->ne[1] == compress_ratio);
+    GGML_ASSERT(kv_cur->ne[0] == width);
+    GGML_ASSERT(kv_cur->ne[1] == 1);
+    GGML_ASSERT(sc_cur->ne[0] == width);
+    GGML_ASSERT(sc_cur->ne[1] == 1);
     GGML_ASSERT(norm->ne[0] == n_embd_head);
     GGML_ASSERT(prev_kv_state->type == GGML_TYPE_F32);
     GGML_ASSERT(prev_score_state->type == GGML_TYPE_F32);
@@ -637,17 +624,12 @@ struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
     GGML_ASSERT(prev_score_state->ne[1] == rows);
     GGML_ASSERT(row < rows);
 
-    struct ggml_tensor * kv_cur = ggml_mul_mat(ctx, wkv, x);
-    struct ggml_tensor * sc_cur = ggml_mul_mat(ctx, wgate, x);
-    struct ggml_tensor * ape_f  = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
-    sc_cur = ggml_add(ctx, sc_cur, ggml_view_2d(ctx, ape_f, width, 1, ape_f->nb[1], pos_mod*ape_f->nb[1]));
-
     auto set_row = [&](struct ggml_tensor * dst, struct ggml_tensor * row_src) -> struct ggml_tensor * {
-        // cchuter uses a cpy-into-view dependency workaround for multi-GPU
-        // scheduling. ik's CPU bring-up can use the structured SET primitive,
-        // which preserves the same row-update semantics without relying on a
-        // bare destination-view CPY as an intermediate graph output.
-        return ggml_set_2d_inplace(ctx, dst, row_src, dst->nb[1], row * dst->nb[1]);
+        // cchuter reads the previous recurrent state as a graph input and
+        // stores the updated state back separately. Avoid mutating the cache
+        // view in-place here; otherwise later decode consumers can observe a
+        // partially updated state inside the same graph.
+        return ggml_set_2d(ctx, dst, row_src, dst->nb[1], row * dst->nb[1]);
     };
 
     struct ggml_tensor * kv_state    = set_row(prev_kv_state,    kv_cur);
@@ -688,6 +670,71 @@ struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
     }
 
     return { kv_state, score_state, kv_comp };
+}
+
+struct llm_deepseek4_decode_compressor llm_build_deepseek4_compressor_decode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * prev_kv_state,
+        struct ggml_tensor  * prev_score_state,
+        struct ggml_tensor  * wkv,
+        struct ggml_tensor  * wgate,
+        struct ggml_tensor  * ape,
+        struct ggml_tensor  * norm,
+        int64_t               n_embd_head,
+        int64_t               n_rot,
+        int64_t               pos,
+        int64_t               compress_ratio,
+        int                   rope_type,
+        int32_t               n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 norm_eps,
+        struct ggml_tensor  * comp_pos) {
+    GGML_ASSERT(compress_ratio > 0);
+    GGML_ASSERT(pos >= 0);
+
+    const int64_t pos_mod = pos % compress_ratio;
+    const int64_t coff = compress_ratio == 4 ? 2 : 1;
+    const int64_t width = coff * n_embd_head;
+
+    GGML_ASSERT(x->ne[1] == 1);
+    GGML_ASSERT(wkv->ne[0] == x->ne[0]);
+    GGML_ASSERT(wkv->ne[1] == width);
+    GGML_ASSERT(wgate->ne[0] == x->ne[0]);
+    GGML_ASSERT(wgate->ne[1] == width);
+    GGML_ASSERT(ape->ne[0] == width);
+    GGML_ASSERT(ape->ne[1] == compress_ratio);
+
+    struct ggml_tensor * kv_cur = ggml_mul_mat(ctx, wkv, x);
+    struct ggml_tensor * sc_cur = ggml_mul_mat(ctx, wgate, x);
+    struct ggml_tensor * ape_f  = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
+    sc_cur = ggml_add(ctx, sc_cur, ggml_view_2d(ctx, ape_f, width, 1, ape_f->nb[1], pos_mod*ape_f->nb[1]));
+
+    return llm_build_deepseek4_compressor_decode_projected(ctx,
+            kv_cur,
+            sc_cur,
+            prev_kv_state,
+            prev_score_state,
+            norm,
+            n_embd_head,
+            n_rot,
+            pos,
+            compress_ratio,
+            rope_type,
+            n_ctx_orig,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow,
+            norm_eps,
+            comp_pos);
 }
 
 struct ggml_tensor * llm_build_deepseek4_indexer_scores_prefill(
@@ -767,7 +814,8 @@ struct ggml_tensor * llm_build_deepseek4_indexer_scores_decode(
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) {
+        float                 beta_slow,
+        struct llm_deepseek4_indexer_decode_trace * trace) {
     GGML_ASSERT(x->ne[1] == 1);
     GGML_ASSERT(qr->ne[1] == 1);
     GGML_ASSERT(index_kv->ne[0] == n_index_head_size);
@@ -777,27 +825,54 @@ struct ggml_tensor * llm_build_deepseek4_indexer_scores_decode(
     GGML_ASSERT(pos->ne[0] == 1);
 
     struct ggml_tensor * q = ggml_mul_mat(ctx, wq_b, qr);
+    if (trace) {
+        trace->q_projected = q;
+    }
     q = ggml_reshape_3d(ctx, q, n_index_head_size, n_index_head, 1);
     q = llm_build_deepseek4_rope_tail(ctx, q, pos, nullptr, n_rot, rope_type,
             n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
             beta_fast, beta_slow, false);
+    if (trace) {
+        trace->q_rope = q;
+    }
 
     struct ggml_tensor * k = ggml_reshape_3d(ctx, index_kv, n_index_head_size, 1, n_comp);
+    if (trace) {
+        trace->k_cache = k;
+    }
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
 
     struct ggml_tensor * score = ggml_mul_mat(ctx, k, q);
+    if (trace) {
+        trace->score_raw = score;
+    }
     score = ggml_relu(ctx, score);
+    if (trace) {
+        trace->score_relu = score;
+    }
 
     struct ggml_tensor * weights = ggml_mul_mat(ctx, wproj, x);
+    if (trace) {
+        trace->weights_projected = weights;
+    }
     const float scale = 1.0f/std::sqrt((float) n_index_head_size*(float) n_index_head);
     weights = llm_build_deepseek4_mul_scalar(ctx, weights, scale);
+    if (trace) {
+        trace->weights_scaled = weights;
+    }
     weights = ggml_reshape_3d(ctx, weights, 1, n_index_head, 1);
     weights = ggml_permute(ctx, weights, 0, 2, 1, 3);
 
     score = ggml_mul(ctx, score, weights);
+    if (trace) {
+        trace->score_weighted = score;
+    }
     score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 2, 0, 3));
     score = ggml_sum_rows(ctx, score);
+    if (trace) {
+        trace->score_sum = score;
+    }
     return ggml_reshape_2d(ctx, score, n_comp, 1);
 }
 
@@ -812,12 +887,18 @@ struct ggml_tensor * llm_build_deepseek4_compressed_mask_from_topk(
     GGML_ASSERT(topk->ne[1] == n_tokens);
 
     struct ggml_tensor * scores_rows = ggml_reshape_3d(ctx, scores, 1, n_comp, n_tokens);
-    struct ggml_tensor * selected_scores = ggml_get_rows(ctx, scores_rows, topk);
+    // Keep the gather and scatter index tensors independent. On the large DSV4
+    // decode graph the same compact I32 top-k tensor is consumed by get_rows and
+    // set_rows; giving each consumer its own materialized view avoids allocator
+    // aliasing between the selected-score value path and the later mask scatter.
+    struct ggml_tensor * topk_gather = ggml_cont(ctx, topk);
+    struct ggml_tensor * selected_scores = ggml_get_rows(ctx, scores_rows, topk_gather);
     struct ggml_tensor * valid = ggml_step(ctx, llm_build_deepseek4_add_scalar(ctx, selected_scores, 1.0e30f));
     struct ggml_tensor * values = llm_build_deepseek4_mul_scalar(ctx,
             llm_build_deepseek4_add_scalar(ctx, valid, -1.0f), 1.0e9f);
 
     struct ggml_tensor * mask = llm_build_deepseek4_new_filled_3d(ctx, 1, n_comp, n_tokens, -INFINITY);
-    mask = ggml_set_rows(ctx, mask, values, topk);
+    struct ggml_tensor * topk_scatter = ggml_cont(ctx, topk);
+    mask = ggml_set_rows(ctx, mask, values, topk_scatter);
     return ggml_reshape_2d(ctx, mask, n_comp, n_tokens);
 }

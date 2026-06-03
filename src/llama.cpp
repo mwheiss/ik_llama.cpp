@@ -90,6 +90,7 @@ void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_conte
 //#endif
 #define LU8(x) (const char*)(u8##x)
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cassert>
 #include <cctype>
@@ -236,6 +237,12 @@ static bool dsv4_debug_tensor_matches(const char * name) {
 
     const std::string s(name);
     for (const std::string & filter : filters) {
+        if (!filter.empty() && filter[0] == '=') {
+            if (s == filter.substr(1)) {
+                return true;
+            }
+            continue;
+        }
         if (s.find(filter) != std::string::npos) {
             return true;
         }
@@ -5497,6 +5504,25 @@ static int llama_decode_internal(
         auto tim1 = ggml_time_us();
 #endif
         uint32_t n_tokens = std::min(n_ubatch, n_tokens_all - cur_token);
+        if (model.arch == LLM_ARCH_DEEPSEEK4 && n_outputs == 1 && n_tokens_all > hparams.n_hc) {
+            // cchuter's DSV4 context path leaves the final hyperconnection group
+            // as a separate prompt ubatch. Match that DSV4-specific split so the
+            // compressed/frontier state update sequence is numerically comparable
+            // to the reference engine while leaving generic batching untouched.
+            const uint32_t n_hc_tail = hparams.n_hc;
+            const uint32_t n_prefix  = n_tokens_all - n_hc_tail;
+            if (cur_token < n_prefix) {
+                const uint32_t n_prefix_rem = n_prefix - cur_token;
+                if (n_prefix_rem > n_ubatch) {
+                    const uint32_t n_first = n_prefix_rem % n_ubatch;
+                    n_tokens = n_first != 0 ? n_first : n_ubatch;
+                } else {
+                    n_tokens = n_prefix_rem;
+                }
+            } else {
+                n_tokens = n_tokens_all - cur_token;
+            }
+        }
         if (llm_arch_is_hybrid(model.arch) &&
                 n_tokens > 1 &&
                 batch_all.n_seq_id != nullptr &&
@@ -5572,6 +5598,14 @@ static int llama_decode_internal(
 
         int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
         GGML_ASSERT(n_threads > 0);
+
+        const bool dsv4_debug_decode_timing =
+            lctx.model.arch == LLM_ARCH_DEEPSEEK4 && std::getenv("DSV4_DEBUG_DECODE_TIMING") != nullptr;
+        const int64_t dsv4_timing_start = dsv4_debug_decode_timing ? ggml_time_us() : 0;
+        int64_t dsv4_timing_after_build = 0;
+        int64_t dsv4_timing_after_alloc = 0;
+        int64_t dsv4_timing_after_inputs = 0;
+        int64_t dsv4_timing_after_compute = 0;
 
         // helpers for smoother batch API transition
         // after deprecating the llama_eval calls, these will be removed
@@ -5650,6 +5684,9 @@ static int llama_decode_internal(
             tim1 = ggml_time_us();
 #endif
             gf = llm_build_context::llama_build_graph(lctx, u_batch, false);
+            if (dsv4_debug_decode_timing) {
+                dsv4_timing_after_build = ggml_time_us();
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("build_graph(...): %d us\n", int(tim2-tim1));
@@ -5659,6 +5696,9 @@ static int llama_decode_internal(
             tim1 = ggml_time_us();
 #endif
             ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            if (dsv4_debug_decode_timing) {
+                dsv4_timing_after_alloc = ggml_time_us();
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
@@ -5727,6 +5767,9 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         llama_set_inputs(lctx, u_batch);
+        if (dsv4_debug_decode_timing) {
+            dsv4_timing_after_inputs = ggml_time_us();
+        }
 #if IK_PRINT_TIMING == 1
         tim2 = ggml_time_us();
         printf("set_inputs(...): %d us\n", int(tim2-tim1));
@@ -5736,6 +5779,21 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         llama_graph_compute(lctx, gf, n_threads);
+        if (dsv4_debug_decode_timing) {
+            llama_synchronize(&lctx);
+            dsv4_timing_after_compute = ggml_time_us();
+            LLAMA_LOG_INFO("%s: DSV4_DECODE_TIMING pos0=%d n_tokens=%u n_outputs=%d n_threads=%d nodes=%d build=%.3fms alloc=%.3fms inputs=%.3fms compute=%.3fms\n",
+                    __func__,
+                    u_batch.pos ? u_batch.pos[0] : u_batch.all_pos_0,
+                    n_tokens,
+                    lctx.n_outputs,
+                    n_threads,
+                    gf->n_nodes,
+                    (dsv4_timing_after_build - dsv4_timing_start) / 1000.0,
+                    (dsv4_timing_after_alloc - dsv4_timing_after_build) / 1000.0,
+                    (dsv4_timing_after_inputs - dsv4_timing_after_alloc) / 1000.0,
+                    (dsv4_timing_after_compute - dsv4_timing_after_inputs) / 1000.0);
+        }
 #if IK_PRINT_TIMING
         llama_synchronize(&lctx);
         tim2 = ggml_time_us();

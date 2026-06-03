@@ -141,6 +141,9 @@ flake.lock
 /hellaswag_val_full.txt
 /winogrande-debiased-eval.csv
 /wikitext-2-raw/
+/dual-engine-*/
+/scripts/dual-engine-*/
+/dsv4-traces/
 
 # Test models for lora adapters
 
