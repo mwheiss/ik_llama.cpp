@@ -126,6 +126,8 @@ def baseline_cache_key(args: argparse.Namespace) -> str:
         "prompt_version": "golden_canary_knowledge_v1",
         "expected_generated": EXPECTED_GENERATED,
     }
+    if args.run_time_repack:
+        key_obj["run_time_repack"] = True
     payload = json.dumps(key_obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -427,6 +429,12 @@ def build_server_command(args: argparse.Namespace, engine: str, server_bin: str,
         add_if(cmd, plan, help_text, "numa", ["--numa", numa], "--numa")
     else:
         plan.append({"name": "numa", "status": "omitted_default"})
+
+    run_time_repack = args.ik_run_time_repack if engine == "opt_ik" and args.ik_run_time_repack else args.run_time_repack
+    if run_time_repack:
+        add_if(cmd, plan, help_text, "run_time_repack", ["--run-time-repack"], "--run-time-repack")
+    else:
+        plan.append({"name": "run_time_repack", "status": "omitted_default"})
 
     add_if(cmd, plan, help_text, "no_repack", ["--no-repack"], "--no-repack")
     add_if(cmd, plan, help_text, "no_warmup", ["--no-warmup"], "--no-warmup")
@@ -1263,6 +1271,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--batch-size", type=int, default=None, help="Optional server -b/--batch-size override for diagnostic chunking runs.")
     ap.add_argument("--ubatch-size", type=int, default=None, help="Optional server -ub/--ubatch-size override for diagnostic chunking runs.")
     ap.add_argument("--cache-ram", type=int, default=None, help="Optional server --cache-ram override, e.g. 0 to disable cache RAM where supported.")
+    ap.add_argument("--run-time-repack", action="store_true", help="Pass --run-time-repack to the baseline server when supported.")
+    ap.add_argument("--ik-run-time-repack", action="store_true", help="Pass --run-time-repack to the optimized/test server when supported.")
     ap.add_argument("--ctx-checkpoints", type=int, default=None, help="Optional server --ctx-checkpoints override.")
     ap.add_argument("--ctx-checkpoints-interval", type=int, default=None, help="Optional server --ctx-checkpoints-interval override.")
     ap.add_argument("--ctx-checkpoints-tolerance", type=int, default=None, help="Optional server --ctx-checkpoints-tolerance override.")
@@ -1311,6 +1321,8 @@ def main() -> int:
         "test_server_prefix": args.ik_server_prefix if args.ik_server_prefix is not None else args.server_prefix,
         "reference_numa": args.numa,
         "test_numa": args.ik_numa if args.ik_numa is not None else args.numa,
+        "reference_run_time_repack": args.run_time_repack,
+        "test_run_time_repack": args.ik_run_time_repack or args.run_time_repack,
         "baseline_cache_enabled": not args.no_baseline_cache,
         "baseline_cache_entry": str(cache_entry),
         "baseline_cache_refresh": args.refresh_baseline_cache,
@@ -1342,6 +1354,8 @@ def main() -> int:
     print("test prefix:", (args.ik_server_prefix if args.ik_server_prefix is not None else args.server_prefix) or "<none>")
     print("baseline numa:", args.numa or "<none>")
     print("test numa:", (args.ik_numa if args.ik_numa is not None else args.numa) or "<none>")
+    print("baseline run-time-repack:", args.run_time_repack)
+    print("test run-time-repack:", args.ik_run_time_repack or args.run_time_repack)
     print("baseline cache:", "disabled" if args.no_baseline_cache else cache_entry)
     print("out root:", out_root)
 

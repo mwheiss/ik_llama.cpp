@@ -26,6 +26,7 @@ run_case "t52_tb52" --ik-threads 52 --ik-threads-batch 52
 run_case "t104_tb104" --ik-threads 104 --ik-threads-batch 104
 run_case "ik_numa_distribute_t52_tb52" --ik-numa distribute --ik-threads 52 --ik-threads-batch 52
 run_case "ik_numa_isolate_t52_tb52" --ik-numa isolate --ik-threads 52 --ik-threads-batch 52
+run_case "ik_numa_distribute_t32_tb52_repack" --ik-numa distribute --ik-threads 32 --ik-threads-batch 52 --ik-run-time-repack
 
 if command -v numactl >/dev/null 2>&1; then
     run_case "numa0_phys_t26_tb26" \

@@ -201,6 +201,10 @@ Expected payoff: medium-to-high for Q4 prefill.
 
 Risk: medium, but isolated to upstream-proven kernels.
 
+Status: already present. `6d4cdef5` is an ancestor of `deepseek-v4-cpu-opt`,
+and the local tree contains the `HAVE_FANCY_SIMD` AVX-512 implementation of
+`mul_mat_q8_1_r8_q8_2` plus the `GGML_TYPE_Q8_1` row-count change.
+
 ### 4. Look for DSV4 HC helper fusion opportunities
 
 Current primitive HC helpers use repeat/mul/sum/view patterns and special F32
@@ -302,6 +306,15 @@ memory pressure.
 
 Risk: low if measured in isolation, but do not make it the default until Q4 and
 Q8 load behavior is understood.
+
+Status: tested and rejected for the current DSV4 Q4_K_M-XL CPU path. Running
+the optimized build with `--run-time-repack` allocated one large CPU buffer of
+about 166 GiB and aborted during server initialization in
+`iqk_gemm_legacy_quants.cpp` with `GGML_ASSERT(nrc_x%16 == 0) failed`, reached
+from `common_speculative_is_compat(llama_context *)`. The optimization harness
+now has `--run-time-repack` and `--ik-run-time-repack` switches so this can be
+retested later, but runtime repack must not be part of the default DSV4 CPU
+policy until the IQK shape constraint and memory footprint are understood.
 
 ## Immediate Next Atomic Step
 
