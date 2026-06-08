@@ -232,6 +232,41 @@ explicit gates against the cchuter F16 reference:
 
 Until those gates exist and pass, keep the forced F16 policy.
 
+## Parallel scheduling drift envelope
+
+For optimization work, the most defensible numerical anchor is a single-thread
+run of the same reference binary. A 52-thread run is not a perfect truth source:
+parallel reductions and different worker placement can move logprobs slightly
+even when the model graph, weights, generated text, and selected tokens are the
+same.
+
+Measured with `build-cpu-clx` against itself, Q4_K_M-XL, FA-off, ctx=1024,
+n_predict=192, filler_lines=0:
+
+```text
+schedule                     max_abs_logprob_diff  mean_abs_logprob_diff
+52/52 threads                0.0064106201          0.0001467117
+32/52 threads                0.0064106201          0.0001467117
+104/104 threads              0.0094827684          0.0001349938
+NUMA distribute, 32/52       0.0064106201          0.0001467117
+NUMA distribute, 52/52       0.0064106201          0.0001467117
+node0 physical cores, 26/26  0.0131351781          0.0001699866
+```
+
+Interpretation:
+
+- logprob drift around `0.0064` is normal reference-binary parallel drift for
+  this FA-off case;
+- full SMT oversubscription and node-local binding are still within a broad
+  correctness envelope, but they drift more and are slower;
+- warning/fail thresholds should be calibrated against this same-binary
+  envelope, while text and chosen-token equality remain strict.
+
+The current harness therefore warns above `0.007` max FA-off logprob drift and
+hard-fails above `0.02` or mean drift above `5e-4`. Recalibrate before using
+those numbers as evidence for a different context length, attention mode, model
+quantization, or compiler/runtime policy.
+
 ### Validation-order bug fixed
 
 The retry branch briefly still rejected:

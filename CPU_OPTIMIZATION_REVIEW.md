@@ -48,6 +48,41 @@ opt_ik decode      = 1.8396 tok/s
 
 The two builds are still source-equivalent, so exact parity is expected.
 
+## Numerical Reference Policy
+
+The optimization harness can now use a single-threaded baseline as the
+numerical anchor and compare parallel/runtime policies against it. This is a
+better reference than treating an arbitrary 52-thread run as "truth", because
+parallel reductions and scheduling can legitimately move logprobs by small
+amounts while leaving token/text output unchanged.
+
+Reference-binary calibration, Q4_K_M-XL, FA-off, ctx=1024, n_predict=192,
+filler_lines=0:
+
+```text
+case                         max_abs_logprob_diff  mean_abs_logprob_diff  decode tok/s
+ref_t52_tb52                 0.0064106201          0.0001467117           1.8784
+ref_t32_tb52                 0.0064106201          0.0001467117           2.5107
+ref_t104_tb104               0.0094827684          0.0001349938           1.2833
+ref_numa_distribute_t32_tb52 0.0064106201          0.0001467117           2.4998
+ref_numa_distribute_t52_tb52 0.0064106201          0.0001467117           2.3547
+ref_numa0_phys_t26_tb26      0.0131351781          0.0001699866           2.0916
+```
+
+Based on that reference-only envelope, FA-off hard failure is now reserved for
+`max_abs_logprob_diff > 0.02` or mean drift beyond `5e-4`, while warnings start
+above `0.007`. Text/token equality remains strict. The warning band intentionally
+marks full-SMT and single-socket-local schedules for review without confusing
+them with correctness failures.
+
+Calibration command:
+
+```bash
+scripts/calibrate-dsv4-reference-drift.sh build-cpu-clx 1024 192 0 off
+```
+
+The same script accepts `on` as the fifth argument for FA-on calibration.
+
 ## External And Upstream Clues
 
 - ik upstream documents that quantized GEMM hot paths live in
@@ -176,6 +211,14 @@ Expected payoff: medium and quick, especially if decode is memory-bound.
 
 Risk: low. This can first be harness-only before any code change.
 
+Initial measured result: `--numa distribute -t 32 -tb 52` is the best short
+Q4_K_M-XL policy so far, with exact text/token parity and reference-envelope
+logprob behavior. Full SMT oversubscription (`-t 104 -tb 104`) is much slower
+and drifts more. Binding the run to node 0 physical cores plus local memory is
+also slower and drifts more, so the useful NUMA direction is likely balanced
+page/thread placement across sockets rather than forcing this model onto one
+socket.
+
 ### 7. Build-flag experiments
 
 Current `build-cpu-opt` keeps the Cascade Lake-safe flags:
@@ -241,4 +284,3 @@ python3 scripts/engine_test_harness.py --flash-attn
 Only commit a speed change if it preserves cached-baseline text/token/logprob
 parity and improves at least one relevant throughput metric without a hidden
 regression in the other FA mode.
-

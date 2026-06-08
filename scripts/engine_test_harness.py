@@ -8,6 +8,7 @@ import json
 import math
 import os
 import signal
+import shlex
 import shutil
 import socket
 import subprocess
@@ -105,12 +106,14 @@ def baseline_cache_key(args: argparse.Namespace) -> str:
             "mtime_ns": model_st.st_mtime_ns,
         },
         "server": file_fingerprint(args.server_bin),
+        "server_prefix": args.server_prefix,
+        "numa": args.numa,
         "ctx_size": args.ctx_size,
         "flash_attn": args.flash_attn,
         "n_predict": args.n_predict,
         "n_probs": N_PROBS,
-        "threads": THREADS,
-        "threads_batch": THREADS_BATCH,
+        "threads": args.threads,
+        "threads_batch": args.threads_batch,
         "filler_lines": args.filler_lines,
         "batch_size": args.batch_size,
         "ubatch_size": args.ubatch_size,
@@ -392,7 +395,15 @@ def build_server_command(args: argparse.Namespace, engine: str, server_bin: str,
     resolved = resolve_server_bin(server_bin)
     help_text = server_help_text(resolved)
     plan: list[dict[str, Any]] = []
-    cmd = [resolved, "-m", args.model]
+    prefix = args.ik_server_prefix if engine == "opt_ik" and args.ik_server_prefix is not None else args.server_prefix
+    prefix_tokens = shlex.split(prefix) if prefix else []
+    cmd = [*prefix_tokens, resolved, "-m", args.model]
+    threads = args.ik_threads if engine == "opt_ik" and args.ik_threads is not None else args.threads
+    threads_batch = args.ik_threads_batch if engine == "opt_ik" and args.ik_threads_batch is not None else args.threads_batch
+    if prefix_tokens:
+        plan.append({"name": "command_prefix", "status": "added", "tokens": prefix_tokens})
+    else:
+        plan.append({"name": "command_prefix", "status": "omitted_default"})
     plan.append({"name": "model", "status": "added", "tokens": ["-m", args.model]})
 
     if has_flag(help_text, "--ctx-size"):
@@ -411,6 +422,12 @@ def build_server_command(args: argparse.Namespace, engine: str, server_bin: str,
     else:
         plan.append({"name": "flash_attn", "status": "omitted_boolean_off_or_unsupported", "enabled": args.flash_attn})
 
+    numa = args.ik_numa if engine == "opt_ik" and args.ik_numa is not None else args.numa
+    if numa:
+        add_if(cmd, plan, help_text, "numa", ["--numa", numa], "--numa")
+    else:
+        plan.append({"name": "numa", "status": "omitted_default"})
+
     add_if(cmd, plan, help_text, "no_repack", ["--no-repack"], "--no-repack")
     add_if(cmd, plan, help_text, "no_warmup", ["--no-warmup"], "--no-warmup")
     add_if(cmd, plan, help_text, "single_turn", ["--single-turn"], "--single-turn")
@@ -426,12 +443,12 @@ def build_server_command(args: argparse.Namespace, engine: str, server_bin: str,
     else:
         plan.append({"name": "no_cont_batching", "status": "omitted_default"})
 
-    cmd += ["--host", HOST, "--port", str(port), "-t", str(THREADS)]
-    plan.append({"name": "host_port_threads", "status": "added", "tokens": ["--host", HOST, "--port", str(port), "-t", str(THREADS)]})
+    cmd += ["--host", HOST, "--port", str(port), "-t", str(threads)]
+    plan.append({"name": "host_port_threads", "status": "added", "tokens": ["--host", HOST, "--port", str(port), "-t", str(threads)]})
 
     if has_flag(help_text, "-tb"):
-        cmd += ["-tb", str(THREADS_BATCH)]
-        plan.append({"name": "threads_batch", "status": "added", "tokens": ["-tb", str(THREADS_BATCH)]})
+        cmd += ["-tb", str(threads_batch)]
+        plan.append({"name": "threads_batch", "status": "added", "tokens": ["-tb", str(threads_batch)]})
     if has_flag(help_text, "-np"):
         cmd += ["-np", "1"]
         plan.append({"name": "parallel", "status": "added", "tokens": ["-np", "1"]})
@@ -981,17 +998,33 @@ def compare_thresholds(flash_attn: bool) -> dict[str, Any]:
             "warn_max_rows_above_logprob_diff": 0,
         }
     return {
-        # FA-off uses different CPU attention/GEMM implementation details in
-        # cchuter and ik. Keep text/token equality strict, but allow the
-        # measured near-deterministic-token logprob envelope while warning on
-        # the tighter diagnostic band below.
-        "max_logprob_diff": 1e-2,
+        # FA-off parallel schedules in the same reference binary differ from a
+        # single-thread anchor by ~0.0064 for ordinary 32/52 and 52/52 runs, by
+        # ~0.0095 for full SMT, and by ~0.0132 for node-local NUMA binding on
+        # the 1024/192 DSV4 calibration case. Keep text/token equality strict,
+        # but make the logprob envelope reflect measured reference drift.
+        "max_logprob_diff": 2e-2,
         "mean_logprob_diff": 5e-4,
         "min_logprob_coverage": 0.95,
-        "warn_max_logprob_diff": 1e-3,
-        "warn_row_logprob_diff": 1e-3,
+        "warn_max_logprob_diff": 7e-3,
+        "warn_row_logprob_diff": 7e-3,
         "warn_max_rows_above_logprob_diff": 0,
     }
+
+
+def apply_threshold_overrides(thresholds: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    result = dict(thresholds)
+    overrides = {
+        "max_logprob_diff": args.max_logprob_diff,
+        "mean_logprob_diff": args.mean_logprob_diff,
+        "warn_max_logprob_diff": args.warn_max_logprob_diff,
+        "warn_row_logprob_diff": args.warn_row_logprob_diff,
+        "warn_max_rows_above_logprob_diff": args.warn_max_rows_above_logprob_diff,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            result[key] = value
+    return result
 
 
 def compare_rows(ref: dict[str, Any], test: dict[str, Any], thresholds: dict[str, Any], out_root: Path) -> dict[str, Any]:
@@ -1215,9 +1248,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--model", default=DEFAULT_MODEL_DEEPSEEK, help="GGUF model file.")
     ap.add_argument("--server-bin", default=DEFAULT_LLAMA_SERVER, help="Baseline llama-server binary or bin directory.")
     ap.add_argument("--ik-server-bin", default=DEFAULT_IK_SERVER, help="Optimized/test llama-server binary or bin directory.")
+    ap.add_argument("--server-prefix", default="", help="Shell-style command prefix for the baseline server, e.g. numactl options.")
+    ap.add_argument("--ik-server-prefix", default=None, help="Shell-style command prefix for the optimized/test server. Defaults to --server-prefix.")
+    ap.add_argument("--numa", choices=["distribute", "isolate", "numactl"], default=None, help="Baseline --numa strategy.")
+    ap.add_argument("--ik-numa", choices=["distribute", "isolate", "numactl"], default=None, help="Optimized/test --numa strategy. Defaults to --numa.")
     ap.add_argument("--ctx-size", type=ctx_size_arg, default=MIN_CTX_SIZE, help=f"Context length. Minimum and default: {MIN_CTX_SIZE}.")
     ap.add_argument("--flash-attn", action="store_true", help="Enable flash attention comparison. Omit for no flash attention.")
     ap.add_argument("--n-predict", type=int, default=N_PREDICT, help=f"Number of generated tokens to request. Default: {N_PREDICT}.")
+    ap.add_argument("--threads", type=int, default=THREADS, help=f"Baseline generation threads. Default: {THREADS}.")
+    ap.add_argument("--threads-batch", type=int, default=THREADS_BATCH, help=f"Baseline prompt/batch threads. Default: {THREADS_BATCH}.")
+    ap.add_argument("--ik-threads", type=int, default=None, help="Optimized/test generation threads. Defaults to --threads.")
+    ap.add_argument("--ik-threads-batch", type=int, default=None, help="Optimized/test prompt/batch threads. Defaults to --threads-batch.")
     ap.add_argument("--filler-lines", type=int, default=None, help="Debug helper: use an exact filler line count instead of auto-sizing the prompt.")
     ap.add_argument("--batch-size", type=int, default=None, help="Optional server -b/--batch-size override for diagnostic chunking runs.")
     ap.add_argument("--ubatch-size", type=int, default=None, help="Optional server -ub/--ubatch-size override for diagnostic chunking runs.")
@@ -1227,6 +1268,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ctx-checkpoints-tolerance", type=int, default=None, help="Optional server --ctx-checkpoints-tolerance override.")
     ap.add_argument("--chunks", type=int, default=None, help="Optional server --chunks override where supported.")
     ap.add_argument("--no-cont-batching", action="store_true", help="Pass --no-cont-batching when both engines support it.")
+    ap.add_argument("--max-logprob-diff", type=float, default=None, help="Override hard max absolute logprob-diff threshold.")
+    ap.add_argument("--mean-logprob-diff", type=float, default=None, help="Override hard mean absolute logprob-diff threshold.")
+    ap.add_argument("--warn-max-logprob-diff", type=float, default=None, help="Override warning max absolute logprob-diff threshold.")
+    ap.add_argument("--warn-row-logprob-diff", type=float, default=None, help="Override per-row warning logprob-diff threshold.")
+    ap.add_argument("--warn-max-rows-above-logprob-diff", type=int, default=None, help="Override allowed rows above warning per-row logprob threshold.")
     ap.add_argument("--baseline-cache-dir", default=DEFAULT_BASELINE_CACHE_DIR, help="Directory used to cache baseline-engine results.")
     ap.add_argument("--refresh-baseline-cache", action="store_true", help="Rerun the baseline engine and replace the matching cache entry.")
     ap.add_argument("--no-baseline-cache", action="store_true", help="Disable baseline result caching for this run.")
@@ -1240,13 +1286,17 @@ def main() -> int:
         raise ValueError("--n-predict must be positive")
     if args.filler_lines is not None and args.filler_lines < 0:
         raise ValueError("--filler-lines must be non-negative")
+    for name in ("threads", "threads_batch", "ik_threads", "ik_threads_batch"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
     N_PREDICT = args.n_predict
     model_family = detect_model_family(args.model)
     flash_name = "flash_on" if args.flash_attn else "flash_off"
     out_root = Path(f"dual-engine-{flash_name}-{model_family}-{dt.datetime.now():%Y%m%d-%H%M%S}")
     out_root.mkdir(parents=True, exist_ok=True)
 
-    thresholds = compare_thresholds(args.flash_attn)
+    thresholds = apply_threshold_overrides(compare_thresholds(args.flash_attn), args)
     baseline_engine = "baseline_ik"
     test_engine = "opt_ik"
     cache_entry = Path(args.baseline_cache_dir) / baseline_cache_key(args)
@@ -1257,6 +1307,10 @@ def main() -> int:
         "test_engine": test_engine,
         "reference_server_bin": resolve_server_bin(args.server_bin),
         "test_server_bin": resolve_server_bin(args.ik_server_bin),
+        "reference_server_prefix": args.server_prefix,
+        "test_server_prefix": args.ik_server_prefix if args.ik_server_prefix is not None else args.server_prefix,
+        "reference_numa": args.numa,
+        "test_numa": args.ik_numa if args.ik_numa is not None else args.numa,
         "baseline_cache_enabled": not args.no_baseline_cache,
         "baseline_cache_entry": str(cache_entry),
         "baseline_cache_refresh": args.refresh_baseline_cache,
@@ -1267,8 +1321,10 @@ def main() -> int:
         "flash_attn": args.flash_attn,
         "n_predict": N_PREDICT,
         "n_probs": N_PROBS,
-        "threads": THREADS,
-        "threads_batch": THREADS_BATCH,
+        "threads": args.threads,
+        "threads_batch": args.threads_batch,
+        "ik_threads": args.ik_threads if args.ik_threads is not None else args.threads,
+        "ik_threads_batch": args.ik_threads_batch if args.ik_threads_batch is not None else args.threads_batch,
         "logprob_thresholds": thresholds,
         "parser_version": "streamlined_single_case_v1",
     })
@@ -1278,9 +1334,14 @@ def main() -> int:
     print("model_family:", model_family)
     print("ctx_size:", args.ctx_size)
     print("flash_attn:", args.flash_attn)
+    print(f"threads: baseline={args.threads}/{args.threads_batch} opt={(args.ik_threads if args.ik_threads is not None else args.threads)}/{(args.ik_threads_batch if args.ik_threads_batch is not None else args.threads_batch)}")
     print(f"ports: {baseline_engine}={LLAMA_PORT}, {test_engine}={IK_PORT}")
     print("baseline server:", resolve_server_bin(args.server_bin))
     print("test server:", resolve_server_bin(args.ik_server_bin))
+    print("baseline prefix:", args.server_prefix or "<none>")
+    print("test prefix:", (args.ik_server_prefix if args.ik_server_prefix is not None else args.server_prefix) or "<none>")
+    print("baseline numa:", args.numa or "<none>")
+    print("test numa:", (args.ik_numa if args.ik_numa is not None else args.numa) or "<none>")
     print("baseline cache:", "disabled" if args.no_baseline_cache else cache_entry)
     print("out root:", out_root)
 
