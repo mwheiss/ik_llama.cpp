@@ -143,6 +143,7 @@ flake.lock
 /wikitext-2-raw/
 /dual-engine-*/
 /scripts/dual-engine-*/
+/.dsv4-baseline-cache/
 /dsv4-traces/
 
 # Test models for lora adapters

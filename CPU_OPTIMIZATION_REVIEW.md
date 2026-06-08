@@ -1,0 +1,244 @@
+# DeepSeek V4 CPU Optimization Review
+
+Branch state:
+
+- Baseline branch/build: `deepseek-v4-cpu`, `build-cpu-clx`
+- Optimization branch/build: `deepseek-v4-cpu-opt`, `build-cpu-opt`
+- Target CPU: Cascade Lake, AVX2/FMA/F16C/AVX-512F/DQ/CD/BW/VL/VNNI, no AMX/BF16/FP16-native/VBMI
+
+## Harness Workflow
+
+`scripts/engine_test_harness.py` now defaults to comparing:
+
+- baseline: `build-cpu-clx/bin/llama-server`
+- test: `build-cpu-opt/bin/llama-server`
+
+The baseline run is cached under `.dsv4-baseline-cache/` using a key over the
+baseline binary, model, context, flash-attention mode, prompt/request knobs, and
+thread count. Use:
+
+```bash
+python3 scripts/engine_test_harness.py --refresh-baseline-cache
+python3 scripts/engine_test_harness.py
+python3 scripts/engine_test_harness.py --flash-attn
+```
+
+For quicker opt-loop checks:
+
+```bash
+python3 scripts/engine_test_harness.py --ctx-size 1024 --n-predict 192 --filler-lines 0 --refresh-baseline-cache
+python3 scripts/engine_test_harness.py --ctx-size 1024 --n-predict 192 --filler-lines 0
+```
+
+The second command reuses the cached baseline and runs only `build-cpu-opt`.
+
+## Current Baseline
+
+Short cached-baseline smoke, flash attention off:
+
+```text
+python3 scripts/engine_test_harness.py --ctx-size 1024 --n-predict 192 --filler-lines 0
+
+comparison_status = PASS
+max_abs_logprob_diff = 0
+mean_abs_logprob_diff = 0
+baseline_ik decode = 1.8400 tok/s
+opt_ik decode      = 1.8396 tok/s
+```
+
+The two builds are still source-equivalent, so exact parity is expected.
+
+## External And Upstream Clues
+
+- ik upstream documents that quantized GEMM hot paths live in
+  `ggml/src/iqk/iqk_gemm_*.cpp`, and that AVX-512 quantized matmul requires
+  `AVX512F/VNNI/VL/BW/DQ`; without those macros the build silently falls back to
+  AVX2. The docs also state that VNNI is responsible for most quantized-matmul
+  speedup. Source: https://github.com/ikawrakow/ik_llama.cpp/blob/main/docs/build.md
+- ik parameter docs keep fused MoE, fused up/gate, and fused mul-multiadd
+  enabled by default, and recommend runtime repack where interleaved variants
+  are available. Source: https://github.com/ikawrakow/ik_llama.cpp/blob/main/docs/parameters.md
+- ik token-generation performance notes emphasize that too many generation
+  threads can oversaturate CPU execution, so thread-count sweeps are a legitimate
+  optimization axis even when graph math is unchanged. Source:
+  https://github.com/ikawrakow/ik_llama.cpp/blob/main/docs/development/token_generation_performance_tips.md
+- TeamBlobFish recommends `--no-repack` for V4 GGUFs in cchuter's runtime path
+  because repack can materially increase load-time memory pressure. That is a
+  load/memory clue, not yet a proven steady-state speed clue for ik. Source:
+  https://huggingface.co/teamblobfish/DeepSeek-V4-Flash-GGUF
+- Fetched upstream ik history highlights recent CPU/MoE/attention work worth
+  mining:
+  - `6d4cdef5` optimizes `mul_mat_q8_1_r8_q8_2` with AVX-512 for Q4_K/Q5_K
+    prompt processing.
+  - `55d3c05b` adds a fused RMS-norm + RMS-norm + add op.
+  - `4fbd0c44` changes CPU Flash Attention mask handling.
+  - `0b81212d` broadens CPU FlashMLA quant coverage.
+  - `dd67a9fb` optimizes MLA tensor-parallel prompt processing.
+
+## Ranked Optimization Candidates
+
+### 1. Profile DSV4 graph hot nodes first
+
+Before changing graph math, add low-overhead timing or use existing server/graph
+timing to split DSV4 runtime into:
+
+- local/raw attention,
+- compressed attention,
+- compressor/indexer projections,
+- MoE routed up/gate/down,
+- hyperconnection helpers,
+- final logits/output.
+
+Expected payoff: high. It tells us whether to chase attention, MoE, HC, or
+loader/repack first.
+
+Risk: low if instrumentation is runtime-gated and off by default.
+
+### 2. Recover F16/IQK V*KQ for FA-off compressed attention
+
+`NUMERICS_FINDINGS.md` says FA-off currently materializes V as F32 before
+`V * softmax(KQ)` because the F16/IQK path produced NaNs on long-cache decode.
+This is correctness-first but likely costs memory traffic and decode speed.
+
+Next experiment:
+
+- isolate the DSV4 `dsv4_attn_kqv` shape into a focused numerical test,
+- compare generic GGML, IQK-enabled F16, and F32-materialized paths,
+- only remove or narrow the F32 cast if the focused repro is finite and the
+  cached-baseline harness stays on parity.
+
+Expected payoff: high for FA-off decode.
+
+Risk: high. Previous broad attempts diverged or slowed down.
+
+### 3. Check whether upstream AVX-512 Q4/Q5 IQK GEMM improvements are already present
+
+Upstream commit `6d4cdef5` targets Q4_K/Q5_K prompt processing. Q4_K_M-XL uses
+Q4_K/Q6_K tensors, so this can matter for prefill and some projections.
+
+Next experiment:
+
+- diff `ggml/src/iqk/iqk_gemm_legacy_quants.cpp` and
+  `ggml/src/iqk/iqk_mul_mat.cpp` against upstream,
+- if missing, port only that upstream kernel change,
+- validate with `test-dsv4-primitives`, VNNI check, and cached FA-off/FA-on
+  harness.
+
+Expected payoff: medium-to-high for Q4 prefill.
+
+Risk: medium, but isolated to upstream-proven kernels.
+
+### 4. Look for DSV4 HC helper fusion opportunities
+
+Current primitive HC helpers use repeat/mul/sum/view patterns and special F32
+row decomposition for HC-pre. They are numerically validated, but create many
+small graph nodes. Candidate fusions:
+
+- a DSV4-only fused HC weighted sum CPU kernel,
+- a safe optimized `ggml_mul_mat(hc_fn, flat)` replacement once the layout issue
+  in `NUMERICS_FINDINGS.md` is isolated,
+- reuse upstream fused norm/add style if HC update patterns map cleanly.
+
+Expected payoff: medium, especially decode where node overhead matters.
+
+Risk: medium. HC was a major parity trap; keep focused numerical tests before
+the full harness.
+
+### 5. Revisit DSV4 shared expert and MoE path
+
+The current DSV4 shared expert intentionally uses a cchuter-style explicit path
+because it improved local parity. The routed path already keeps ik fused MoE and
+`ggml_multi_add` enabled. Possible next steps:
+
+- profile whether shared expert or routed expert dominates decode,
+- inspect upstream MoE small-batch work even though commit `2973e809` is CUDA
+  only; the scheduling idea may still apply to CPU selected-expert work,
+- check whether any upstream CPU MoE/fused-mmad changes after our base can be
+  cherry-picked without DSV4-specific divergence.
+
+Expected payoff: medium.
+
+Risk: medium. Previous ordered-reduction and disabled-fusion experiments did
+not improve parity.
+
+### 6. Thread and batch sweep on Cascade Lake
+
+The harness currently uses full `-t 52 -tb 52`. Upstream docs warn that too many
+threads can oversaturate token generation. Run cached-baseline sweeps for opt:
+
+```text
+-t/-tb: 16, 24, 32, 40, 52
+flash-attn: off/on
+ctx: 1024 first, then long prompt
+```
+
+Expected payoff: medium and quick, especially if decode is memory-bound.
+
+Risk: low. This can first be harness-only before any code change.
+
+### 7. Build-flag experiments
+
+Current `build-cpu-opt` keeps the Cascade Lake-safe flags:
+
+```bash
+cmake -B build-cpu-opt -S . -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_NATIVE=OFF \
+  -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+  -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON \
+  -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_BF16=OFF \
+  -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_VULKAN=OFF -DGGML_OPENCL=OFF -DGGML_SYCL=OFF \
+  -DCMAKE_C_FLAGS=-march=cascadelake \
+  -DCMAKE_CXX_FLAGS=-march=cascadelake
+```
+
+Safe experiments:
+
+- add `-O3` only if it changes generated code and passes parity,
+- try `-flto`/thin LTO if build/link time is acceptable,
+- compare GCC vs Clang for this DSV4 path.
+
+Avoid:
+
+- `-march=native` if it enables non-Cascade-Lake features accidentally,
+- BF16, VBMI/VBMI2, AVX512-FP16, AMX.
+
+Expected payoff: low-to-medium.
+
+Risk: low if guarded by the VNNI artifact script.
+
+### 8. Runtime repack and row-interleaved packing
+
+ik docs recommend runtime repack where interleaved variants are available, but
+TeamBlobFish warns V4 repack can hurt load memory in cchuter. For ik, measure
+steady-state speed and peak RSS separately:
+
+- default repack behavior,
+- `--run-time-repack`,
+- if supported by this binary, no-repack equivalent or leaving repack off.
+
+Expected payoff: unknown. It may improve GEMM throughput but worsen load-time
+memory pressure.
+
+Risk: low if measured in isolation, but do not make it the default until Q4 and
+Q8 load behavior is understood.
+
+## Immediate Next Atomic Step
+
+Start with candidate 1: add gated DSV4 graph/tensor timing or use existing
+callbacks to produce a hot-node breakdown for the cached-baseline harness. Once
+we know the dominant cost, choose one narrow speed change and require:
+
+```bash
+git diff --check
+cmake --build build-cpu-opt --config Release -j104 --target llama-server test-dsv4-primitives
+./build-cpu-opt/bin/test-dsv4-primitives
+scripts/check-cascade-lake-vnni.sh build-cpu-opt
+python3 scripts/engine_test_harness.py --ctx-size 1024 --n-predict 192 --filler-lines 0
+python3 scripts/engine_test_harness.py
+python3 scripts/engine_test_harness.py --flash-attn
+```
+
+Only commit a speed change if it preserves cached-baseline text/token/logprob
+parity and improves at least one relevant throughput metric without a hidden
+regression in the other FA mode.
+

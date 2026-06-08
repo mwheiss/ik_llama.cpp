@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
 import signal
+import shutil
 import socket
 import subprocess
 import time
@@ -16,8 +18,9 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_MODEL_DEEPSEEK = "/home/mheiss/.cache/huggingface/hub/models--teamblobfish--DeepSeek-V4-Flash-GGUF/snapshots/b281094221a72c210a2b986709510b4c4b51b67e/Q4_K_M-XL/DeepSeek-V4-Flash-Q4_K_M-XL-00001-of-00004.gguf"
-DEFAULT_LLAMA_SERVER = "/data/nvme/no-backup/deepseek-v4-flash/llama.cpp.cchuter.v4-clean-base-fresh/build-cpu-clx/bin/llama-server"
-DEFAULT_IK_SERVER = "/data/nvme/no-backup/deepseek-v4-flash/ik_llama.cpp.dsv4-port-retry/build-cpu-clx/bin/llama-server"
+DEFAULT_LLAMA_SERVER = "/data/nvme/no-backup/deepseek-v4-flash/ik_llama.cpp.dsv4-port-retry/build-cpu-clx/bin/llama-server"
+DEFAULT_IK_SERVER = "/data/nvme/no-backup/deepseek-v4-flash/ik_llama.cpp.dsv4-port-retry/build-cpu-opt/bin/llama-server"
+DEFAULT_BASELINE_CACHE_DIR = ".dsv4-baseline-cache"
 
 HOST = "127.0.0.1"
 LLAMA_PORT = 43180
@@ -79,6 +82,75 @@ def resolve_server_bin(path: str) -> str:
         if cand.exists():
             return str(cand)
     return str(p)
+
+
+def file_fingerprint(path: str) -> dict[str, Any]:
+    p = Path(resolve_server_bin(path)).resolve()
+    st = p.stat()
+    return {
+        "path": str(p),
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+    }
+
+
+def baseline_cache_key(args: argparse.Namespace) -> str:
+    model = Path(args.model).resolve()
+    model_st = model.stat()
+    key_obj = {
+        "cache_version": 1,
+        "model": {
+            "path": str(model),
+            "size": model_st.st_size,
+            "mtime_ns": model_st.st_mtime_ns,
+        },
+        "server": file_fingerprint(args.server_bin),
+        "ctx_size": args.ctx_size,
+        "flash_attn": args.flash_attn,
+        "n_predict": args.n_predict,
+        "n_probs": N_PROBS,
+        "threads": THREADS,
+        "threads_batch": THREADS_BATCH,
+        "filler_lines": args.filler_lines,
+        "batch_size": args.batch_size,
+        "ubatch_size": args.ubatch_size,
+        "cache_ram": args.cache_ram,
+        "ctx_checkpoints": args.ctx_checkpoints,
+        "ctx_checkpoints_interval": args.ctx_checkpoints_interval,
+        "ctx_checkpoints_tolerance": args.ctx_checkpoints_tolerance,
+        "chunks": args.chunks,
+        "no_cont_batching": args.no_cont_batching,
+        "prompt_version": "golden_canary_knowledge_v1",
+        "expected_generated": EXPECTED_GENERATED,
+    }
+    payload = json.dumps(key_obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def save_cached_engine_result(cache_entry: Path, engine_out: Path, result: dict[str, Any]) -> None:
+    tmp = cache_entry.with_suffix(".tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+    shutil.copytree(engine_out, tmp / "files")
+    jdump(tmp / "result.json", result)
+    if cache_entry.exists():
+        shutil.rmtree(cache_entry)
+    tmp.rename(cache_entry)
+
+
+def load_cached_engine_result(cache_entry: Path, out_root: Path, engine: str) -> dict[str, Any] | None:
+    result_path = cache_entry / "result.json"
+    files_path = cache_entry / "files"
+    if not result_path.exists() or not files_path.exists():
+        return None
+    out = out_root / engine
+    if out.exists():
+        shutil.rmtree(out)
+    shutil.copytree(files_path, out)
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["out_dir"] = str(out)
+    return result
 
 
 def detect_model_family(model: str) -> str:
@@ -1139,10 +1211,10 @@ def ctx_size_arg(value: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Single-case dual-engine llama.cpp vs ik_llama.cpp DSv4/Qwen parity gate.")
+    ap = argparse.ArgumentParser(description="Single-case dual-engine DSV4/Qwen parity and performance gate.")
     ap.add_argument("--model", default=DEFAULT_MODEL_DEEPSEEK, help="GGUF model file.")
-    ap.add_argument("--server-bin", default=DEFAULT_LLAMA_SERVER, help="Reference llama-server binary or bin directory.")
-    ap.add_argument("--ik-server-bin", default=DEFAULT_IK_SERVER, help="Test ik_llama.cpp llama-server binary or bin directory.")
+    ap.add_argument("--server-bin", default=DEFAULT_LLAMA_SERVER, help="Baseline llama-server binary or bin directory.")
+    ap.add_argument("--ik-server-bin", default=DEFAULT_IK_SERVER, help="Optimized/test llama-server binary or bin directory.")
     ap.add_argument("--ctx-size", type=ctx_size_arg, default=MIN_CTX_SIZE, help=f"Context length. Minimum and default: {MIN_CTX_SIZE}.")
     ap.add_argument("--flash-attn", action="store_true", help="Enable flash attention comparison. Omit for no flash attention.")
     ap.add_argument("--n-predict", type=int, default=N_PREDICT, help=f"Number of generated tokens to request. Default: {N_PREDICT}.")
@@ -1155,6 +1227,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ctx-checkpoints-tolerance", type=int, default=None, help="Optional server --ctx-checkpoints-tolerance override.")
     ap.add_argument("--chunks", type=int, default=None, help="Optional server --chunks override where supported.")
     ap.add_argument("--no-cont-batching", action="store_true", help="Pass --no-cont-batching when both engines support it.")
+    ap.add_argument("--baseline-cache-dir", default=DEFAULT_BASELINE_CACHE_DIR, help="Directory used to cache baseline-engine results.")
+    ap.add_argument("--refresh-baseline-cache", action="store_true", help="Rerun the baseline engine and replace the matching cache entry.")
+    ap.add_argument("--no-baseline-cache", action="store_true", help="Disable baseline result caching for this run.")
     return ap.parse_args()
 
 
@@ -1172,11 +1247,19 @@ def main() -> int:
     out_root.mkdir(parents=True, exist_ok=True)
 
     thresholds = compare_thresholds(args.flash_attn)
+    baseline_engine = "baseline_ik"
+    test_engine = "opt_ik"
+    cache_entry = Path(args.baseline_cache_dir) / baseline_cache_key(args)
     jdump(out_root / "run_config.json", {
         "model": args.model,
         "model_family": model_family,
-        "reference_engine": "llama_cpp",
-        "test_engine": "ik_llama_cpp",
+        "reference_engine": baseline_engine,
+        "test_engine": test_engine,
+        "reference_server_bin": resolve_server_bin(args.server_bin),
+        "test_server_bin": resolve_server_bin(args.ik_server_bin),
+        "baseline_cache_enabled": not args.no_baseline_cache,
+        "baseline_cache_entry": str(cache_entry),
+        "baseline_cache_refresh": args.refresh_baseline_cache,
         "host": HOST,
         "llama_port": LLAMA_PORT,
         "ik_port": IK_PORT,
@@ -1195,11 +1278,30 @@ def main() -> int:
     print("model_family:", model_family)
     print("ctx_size:", args.ctx_size)
     print("flash_attn:", args.flash_attn)
-    print(f"ports: llama_cpp={LLAMA_PORT}, ik_llama_cpp={IK_PORT}")
+    print(f"ports: {baseline_engine}={LLAMA_PORT}, {test_engine}={IK_PORT}")
+    print("baseline server:", resolve_server_bin(args.server_bin))
+    print("test server:", resolve_server_bin(args.ik_server_bin))
+    print("baseline cache:", "disabled" if args.no_baseline_cache else cache_entry)
     print("out root:", out_root)
 
-    ref = run_engine(args, "llama_cpp", "reference", args.server_bin, LLAMA_PORT, out_root, model_family, prompt_override=None)
-    test = run_engine(args, "ik_llama_cpp", "test", args.ik_server_bin, IK_PORT, out_root, model_family, prompt_override=ref["prompt"])
+    ref = None
+    if not args.no_baseline_cache and not args.refresh_baseline_cache:
+        ref = load_cached_engine_result(cache_entry, out_root, baseline_engine)
+        if ref is not None:
+            print(f"\n================ USING CACHED {baseline_engine} ================")
+            print("cache entry:", cache_entry)
+            print("summary:", Path(ref["out_dir"]) / "summary.json")
+
+    if ref is None:
+        ref = run_engine(args, baseline_engine, "reference", args.server_bin, LLAMA_PORT, out_root, model_family, prompt_override=None)
+        if not args.no_baseline_cache:
+            if ref.get("summary", {}).get("all_ok"):
+                save_cached_engine_result(cache_entry, out_root / baseline_engine, ref)
+                print(f"[{baseline_engine}] cached result:", cache_entry)
+            else:
+                print(f"[{baseline_engine}] not caching incomplete or failing baseline result")
+
+    test = run_engine(args, test_engine, "test", args.ik_server_bin, IK_PORT, out_root, model_family, prompt_override=ref["prompt"])
     comp = compare_rows(ref, test, thresholds, out_root)
     summarize_comparison(comp, out_root)
     return 0 if comp.get("all_ok") else 1
