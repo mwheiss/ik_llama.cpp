@@ -347,11 +347,49 @@ static bool dsv4_debug_tensor_stats_cb(ggml_tensor * t, bool ask, void * user_da
 }
 
 static ggml_backend_sched_eval_callback dsv4_debug_cb_eval(ggml_backend_sched_eval_callback fallback) {
-    return std::getenv("DSV4_DEBUG_TENSOR_STATS") != nullptr ? dsv4_debug_tensor_stats_cb : fallback;
+    if (std::getenv("DSV4_DEBUG_TENSOR_STATS") != nullptr) {
+        return dsv4_debug_tensor_stats_cb;
+    }
+    if (std::getenv("DSV4_DEBUG_SECTION_TIMING") != nullptr) {
+        return [](ggml_tensor * t, bool ask, void *) -> bool {
+            auto is_marker = [](const char * name) {
+                return strncmp(name, "hc_attn_pre-", 12) == 0 ||
+                       strncmp(name, "Qcur-", 5) == 0 ||
+                       strncmp(name, "KVcur-", 6) == 0 ||
+                       strncmp(name, "dsv4_compressed_attn_out-", 25) == 0 ||
+                       strncmp(name, "dsv4_decode_raw_attn_out-", 25) == 0 ||
+                       strncmp(name, "attn_out-", 9) == 0 ||
+                       strncmp(name, "hc_attn_post-", 13) == 0 ||
+                       strncmp(name, "hc_ffn_pre-", 11) == 0 ||
+                       strncmp(name, "ffn_moe_out-", 12) == 0 ||
+                       strncmp(name, "ffn_shexp-", 10) == 0 ||
+                       strncmp(name, "ffn_out-", 8) == 0 ||
+                       strncmp(name, "hc_ffn_post-", 12) == 0 ||
+                       strcmp(name, "result_output") == 0;
+            };
+
+            const bool marker = is_marker(t->name);
+            if (ask) {
+                return marker;
+            }
+            if (marker) {
+                static thread_local int64_t last_us = 0;
+                const int64_t now_us = ggml_time_us();
+                const double dt_ms = last_us == 0 ? 0.0 : (now_us - last_us) / 1000.0;
+                last_us = now_us;
+                LLAMA_LOG_INFO("DSV4_SECTION_TIMING marker=%s op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] dt_prev=%.3fms\n",
+                        t->name, ggml_op_name(t->op), ggml_type_name(t->type),
+                        t->ne[0], t->ne[1], t->ne[2], t->ne[3], dt_ms);
+            }
+            return true;
+        };
+    }
+    return fallback;
 }
 
 static void * dsv4_debug_cb_eval_user_data(void * fallback) {
-    return std::getenv("DSV4_DEBUG_TENSOR_STATS") != nullptr ? nullptr : fallback;
+    return (std::getenv("DSV4_DEBUG_TENSOR_STATS") != nullptr ||
+            std::getenv("DSV4_DEBUG_SECTION_TIMING") != nullptr) ? nullptr : fallback;
 }
 
 // extract ip and port from RPC[ip:port] for rpc and keep other device names

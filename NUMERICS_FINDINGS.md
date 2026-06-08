@@ -267,6 +267,38 @@ hard-fails above `0.02` or mean drift above `5e-4`. Recalibrate before using
 those numbers as evidence for a different context length, attention mode, model
 quantization, or compiler/runtime policy.
 
+## Direct one-query KQV matmul remains unsafe
+
+The FA-off DeepSeek4 attention path intentionally decomposes one-query
+`V * softmax(KQ)` by head instead of using the direct 4D
+`ggml_mul_mat(v_attn, kq)` path. This is not just a conservatism left over from
+bring-up.
+
+Experiment:
+
+```bash
+DSV4_EXPERIMENT_DIRECT_ONE_QUERY_KQV=1 \
+python3 scripts/engine_test_harness.py \
+  --ctx-size 1024 --n-predict 192 --filler-lines 0 \
+  --threads 1 --threads-batch 1 \
+  --ik-numa distribute --ik-threads 32 --ik-threads-batch 52
+```
+
+Result:
+
+```text
+comparison_status       = FAIL
+generated text          = AL
+test strict rows        = 1 of expected 180
+mean_abs_logprob_diff   = 0.0064106201 for the single produced row
+opt decode throughput   = 0.364 tok/s
+```
+
+The direct path does not merely introduce acceptable parallel drift; it breaks
+generation almost immediately and is much slower in this harness. Keep the
+per-head KQV decomposition until the underlying 4D F32/F32 matmul behavior is
+understood and covered by a focused regression test.
+
 ### Validation-order bug fixed
 
 The retry branch briefly still rejected:

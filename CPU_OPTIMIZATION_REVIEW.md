@@ -129,6 +129,38 @@ loader/repack first.
 
 Risk: low if instrumentation is runtime-gated and off by default.
 
+Implemented debug tooling:
+
+```bash
+DSV4_DEBUG_DECODE_TIMING=1
+DSV4_DEBUG_SECTION_TIMING=1
+```
+
+For Q4_K_M-XL, FA-off, ctx=1024, n_predict=192,
+`--numa distribute -t 32 -tb 52`, true one-token decode is compute dominated:
+
+```text
+decode n=1 mean build  =  6.96 ms
+decode n=1 mean alloc  = 12.93 ms
+decode n=1 mean inputs =  0.08 ms
+decode n=1 mean compute=368.41 ms
+```
+
+The section-timing callback synchronizes at markers and therefore slows the
+run, but its proportions point to these large buckets:
+
+```text
+Qcur/query projection                 ~23.6 s total in debug run
+MoE routed output                     ~20.4 s
+attention output projection/update    ~17.6 s
+compressed attention output           ~15.7 s
+HC post helpers                       ~22.2 s combined
+```
+
+This says graph construction is not the main optimization target for decode;
+the next useful work should attack compute-heavy projection, attention, MoE,
+or HC helper paths.
+
 ### 2. Recover F16/IQK V*KQ for FA-off compressed attention
 
 `NUMERICS_FINDINGS.md` says FA-off currently materializes V as F32 before
@@ -145,6 +177,12 @@ Next experiment:
 Expected payoff: high for FA-off decode.
 
 Risk: high. Previous broad attempts diverged or slowed down.
+
+Tried and rejected so far: replacing the one-query per-head KQV decomposition
+with direct `ggml_mul_mat(v_attn, kq)` behind
+`DSV4_EXPERIMENT_DIRECT_ONE_QUERY_KQV=1`. It failed after producing only `AL`
+and slowed decode to `0.364 tok/s`. Keep the decomposition until the underlying
+4D F32/F32 matmul path is debugged with a focused regression test.
 
 ### 3. Check whether upstream AVX-512 Q4/Q5 IQK GEMM improvements are already present
 
