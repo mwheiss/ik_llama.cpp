@@ -2407,3 +2407,27 @@ The exact-parity result is stable, but the timing differences among BLIS thread
 counts are small and noisy. Use `BLIS_NUM_THREADS=1` as the conservative default
 for this server-generation workload unless a larger prefill-batch benchmark
 shows a repeatable benefit from internal BLIS threading.
+
+FlexiBLAS/OpenBLAS thread sweep:
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=2,4,8,16,26,52 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh gcc-flexiblas-openblas
+
+text/tokens/logprobs:
+  exact match for every listed run
+
+performance:
+  Flexi/OpenBLAS threads=1:  prefill 33.316648 tok/s, decode 2.859382 tok/s
+  Flexi/OpenBLAS threads=2:  prefill 33.142189 tok/s, decode 2.882331 tok/s
+  Flexi/OpenBLAS threads=4:  prefill 33.155461 tok/s, decode 2.906224 tok/s
+  Flexi/OpenBLAS threads=8:  prefill 33.279541 tok/s, decode 2.888779 tok/s
+  Flexi/OpenBLAS threads=16: prefill 33.283534 tok/s, decode 2.888862 tok/s
+  Flexi/OpenBLAS threads=26: prefill 32.672181 tok/s, decode 2.879872 tok/s
+  Flexi/OpenBLAS threads=52: prefill 32.867057 tok/s, decode 2.878591 tok/s
+```
+
+FlexiBLAS/OpenBLAS is numerically safe in these runs and competitive with BLIS,
+but the timing differences are again small/noisy. Keep direct BLIS as the
+cleaner current recommendation; keep FlexiBLAS/OpenBLAS as a valid fallback.

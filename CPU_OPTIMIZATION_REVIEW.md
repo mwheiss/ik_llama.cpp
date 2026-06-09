@@ -491,6 +491,29 @@ comparison: PASS with exact logprobs for all listed runs
 This suggests the BLIS win is from the linked BLAS path itself rather than from
 oversubscribing BLAS worker threads on top of ik's OpenMP execution.
 
+FlexiBLAS/OpenBLAS thread sweep result: exact parity also held for all tested
+thread counts. Performance is competitive with BLIS but similarly noisy, and the
+best single high-thread result did not repeat.
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=2,4,8,16,26,52 scripts/bench-dsv4-cascade-lake-matrix.sh gcc-flexiblas-openblas
+
+FA-on, ctx=1024, n_predict=192, --numa distribute -t 32 -tb 52
+Flexi/OpenBLAS threads=1:  prefill 33.3166 tok/s, decode 2.8594 tok/s, wall 81.5600 s
+Flexi/OpenBLAS threads=2:  prefill 33.1422 tok/s, decode 2.8823 tok/s, wall 81.1567 s
+Flexi/OpenBLAS threads=4:  prefill 33.1555 tok/s, decode 2.9062 tok/s, wall 80.6358 s
+Flexi/OpenBLAS threads=8:  prefill 33.2795 tok/s, decode 2.8888 tok/s, wall 80.9401 s
+Flexi/OpenBLAS threads=16: prefill 33.2835 tok/s, decode 2.8889 tok/s, wall 80.9361 s
+Flexi/OpenBLAS threads=26: prefill 32.6722 tok/s, decode 2.8799 tok/s, wall 81.4792 s
+Flexi/OpenBLAS threads=52: prefill 32.8671 tok/s, decode 2.8786 tok/s, wall 81.3945 s
+comparison: PASS with exact logprobs for all listed runs
+```
+
+FlexiBLAS/OpenBLAS remains a valid alternative, but the direct BLIS build is a
+cleaner recommendation for now because its conservative single-thread setting is
+simple and repeatably in the same performance band.
+
 Clang compiler-only result: `clang-native` gives a prefill gain and exact
 logprob parity, but decode regresses even more than IntelLLVM:
 
