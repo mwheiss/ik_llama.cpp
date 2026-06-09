@@ -311,6 +311,11 @@ logprobs: hard pass, warning band; max_abs=0.011420941, mean_abs=0.000164639
 Because total runtime is effectively flat and FA-on no longer has exact logprob
 parity, do not switch the default CPU optimization build to LTO.
 
+Clang/ICX comparison is not currently runnable on this host: only GCC 14.3.1 is
+available (`cc`/`c++`), and no `clang`, versioned `clang-*`, `icx`, or `icpx`
+binaries were found. Revisit compiler comparison only after a second compiler is
+installed.
+
 ### 8. Runtime repack and row-interleaved packing
 
 ik docs recommend runtime repack where interleaved variants are available, but
