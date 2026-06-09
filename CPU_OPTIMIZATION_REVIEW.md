@@ -408,6 +408,25 @@ comparison: PASS with exact logprobs
 Clang may be interesting for prefill-heavy microbenchmarks, but it should not
 replace GCC for DSV4 generation unless decode is fixed or separately routed.
 
+Clang + MKL result: `clang-mkl` preserves exact logits and keeps the Clang
+prefill gain, but decode remains far slower than the GCC native baseline:
+
+```text
+build:
+  DSV4_CPU_MATRIX_JOBS=104 scripts/build-dsv4-cascade-lake-matrix.sh clang-mkl
+
+benchmark:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 scripts/bench-dsv4-cascade-lake-matrix.sh clang-mkl
+
+FA-on, ctx=1024, n_predict=192, --numa distribute -t 32 -tb 52
+GCC native baseline: prefill 32.9625 tok/s, decode 2.6297 tok/s, wall 87.2581 s
+Clang + oneMKL:      prefill 34.2386 tok/s, decode 1.5586 tok/s, wall 133.5948 s
+comparison: PASS with exact logprobs
+```
+
+This confirms that the Clang prefill clue does not become a generation win by
+adding MKL. Keep GCC native as the generation default.
+
 Status: `Release` already compiles with `-O3 -DNDEBUG`, so there is no separate
 O3-only win to test. A separate GCC LTO build (`GGML_LTO=ON`) passed
 `test-dsv4-primitives` and the Cascade Lake VNNI artifact check, but did not

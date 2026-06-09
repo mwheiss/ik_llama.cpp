@@ -2250,3 +2250,30 @@ path even when the compiler remains GCC and numerics are exact. Keep the
 no-BLAS GCC build as the default. Revisit BLAS only for a separate prefill-batch
 workload or if DSV4 graph segments are refactored so large dense GEMMs dominate
 the measured path.
+
+## Clang + oneMKL is numerically exact but still decode-slow
+
+The Cascade Lake matrix tested `clang-mkl`, configured with Clang 21,
+`GGML_BLAS=ON`, and `GGML_BLAS_VENDOR=Intel10_64lp`. The build passed
+`test-dsv4-primitives` and the VNNI artifact check.
+
+FA-on harness result against the current GCC native optimized build:
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh clang-mkl
+
+text/tokens/logprobs:
+  exact match for 180 strict rows
+  max_abs_logprob_diff  = 0.0
+  mean_abs_logprob_diff = 0.0
+
+performance:
+  GCC native baseline: prefill 32.962534 tok/s, decode 2.629701 tok/s
+  Clang + oneMKL:      prefill 34.238573 tok/s, decode 1.558623 tok/s
+```
+
+This confirms that Clang can improve prefill while preserving exact FA-on
+logprobs, but the Clang/MKL combination still loses too much decode throughput
+for DSV4 generation. Keep it as a prefill-heavy clue, not as a default build.
