@@ -908,6 +908,11 @@ extern "C" {
 
     GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+    GGML_API bool    ggml_numa_should_replicate_weights(void);
+    GGML_API int     ggml_numa_get_replica_source_node(void);
+    GGML_API size_t  ggml_numa_replicate_tensor_data(struct ggml_tensor * tensor);
+    GGML_API void    ggml_numa_free_tensor_data(const struct ggml_tensor * tensor);
+    GGML_API const void * ggml_numa_get_tensor_data(const struct ggml_tensor * tensor);
 
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);

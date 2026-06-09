@@ -30,6 +30,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -38,7 +39,10 @@
 #include <stdarg.h>
 #include <signal.h>
 #if defined(__gnu_linux__)
+#include <sys/mman.h>
 #include <syscall.h>
+#include <unistd.h>
+#include <linux/mempolicy.h>
 #endif
 
 #define IK_PRINT_TIMING 0
@@ -4689,6 +4693,360 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
+}
+
+struct ggml_numa_tensor_replica {
+    const struct ggml_tensor * tensor;
+    const void * src_data;
+    size_t size;
+    size_t replicated_bytes;
+    size_t alloc_size[GGML_NUMA_MAX_NODES];
+    uint32_t source_node;
+    void * data[GGML_NUMA_MAX_NODES];
+};
+
+struct ggml_numa_replicas {
+    struct ggml_numa_tensor_replica * items;
+    size_t * table;
+    size_t n_items;
+    size_t capacity;
+    size_t table_capacity;
+    size_t min_bytes;
+    size_t replicated_bytes;
+    int source_node;
+    int initialized;
+    int enabled;
+};
+
+static struct ggml_numa_replicas g_numa_replicas;
+static __thread int g_numa_thread_node = -1;
+
+static int ggml_numa_parse_env_flag(const char * name) {
+    const char * value = getenv(name);
+    if (!value || value[0] == '\0') {
+        return 0;
+    }
+    return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 && strcasecmp(value, "off") != 0;
+}
+
+static size_t ggml_numa_parse_env_size(const char * name, size_t default_value) {
+    const char * value = getenv(name);
+    if (!value || value[0] == '\0') {
+        return default_value;
+    }
+    char * end = NULL;
+    const unsigned long long parsed = strtoull(value, &end, 10);
+    return end != value ? (size_t) parsed : default_value;
+}
+
+static uint32_t ggml_numa_current_node(void);
+
+static int ggml_numa_single_default_membind_node(void) {
+#if defined(__gnu_linux__) && defined(SYS_get_mempolicy)
+    int mode = 0;
+    unsigned long nodemask[(GGML_NUMA_MAX_NODES + sizeof(unsigned long)*CHAR_BIT - 1)/(sizeof(unsigned long)*CHAR_BIT)];
+    memset(nodemask, 0, sizeof(nodemask));
+
+    if (syscall(SYS_get_mempolicy, &mode, nodemask, GGML_NUMA_MAX_NODES, NULL, 0) != 0 || mode != MPOL_BIND) {
+        return -1;
+    }
+
+    int found = -1;
+    for (uint32_t node = 0; node < g_state.numa.n_nodes && node < GGML_NUMA_MAX_NODES; ++node) {
+        const bool selected = (nodemask[node / (sizeof(unsigned long)*CHAR_BIT)] & (1UL << (node % (sizeof(unsigned long)*CHAR_BIT)))) != 0;
+        if (!selected) {
+            continue;
+        }
+        if (found >= 0) {
+            return -1;
+        }
+        found = (int) node;
+    }
+    return found;
+#else
+    return -1;
+#endif
+}
+
+static void ggml_numa_replicas_init(void) {
+    if (g_numa_replicas.initialized) {
+        return;
+    }
+
+    g_numa_replicas.initialized = 1;
+    g_numa_replicas.enabled =
+        ggml_numa_parse_env_flag("GGML_NUMA_REPLICATE_WEIGHTS") ||
+        g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR;
+    g_numa_replicas.min_bytes = ggml_numa_parse_env_size("GGML_NUMA_REPLICATE_MIN_BYTES", 1024*1024);
+    g_numa_replicas.source_node = -1;
+
+    const char * source_node_env = getenv("GGML_NUMA_REPLICATE_SOURCE_NODE");
+    if (source_node_env && source_node_env[0] != '\0') {
+        char * end = NULL;
+        const long parsed = strtol(source_node_env, &end, 10);
+        if (end != source_node_env) {
+            g_numa_replicas.source_node = (int) parsed;
+        }
+    }
+
+    if (g_numa_replicas.source_node < 0) {
+        g_numa_replicas.source_node = ggml_numa_single_default_membind_node();
+    }
+    if (g_numa_replicas.source_node < 0) {
+        g_numa_replicas.source_node = (int) ggml_numa_current_node();
+    }
+}
+
+bool ggml_numa_should_replicate_weights(void) {
+    ggml_numa_replicas_init();
+    return g_numa_replicas.enabled && ggml_is_numa();
+}
+
+int ggml_numa_get_replica_source_node(void) {
+    ggml_numa_replicas_init();
+    return g_numa_replicas.source_node;
+}
+
+static uint32_t ggml_numa_current_node(void) {
+#if defined(__gnu_linux__)
+    if (!ggml_is_numa()) {
+        return 0;
+    }
+    if (g_numa_thread_node >= 0 && g_numa_thread_node < (int) g_state.numa.n_nodes) {
+        return (uint32_t) g_numa_thread_node;
+    }
+    uint32_t cpu = 0;
+    uint32_t node = g_state.numa.current_node;
+#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 28) || defined(__COSMOPOLITAN__)
+    if (getcpu(&cpu, &node) == 0 && node < g_state.numa.n_nodes) {
+        return node;
+    }
+#else
+#   if !defined(SYS_getcpu) && defined(SYS_get_cpu)
+#       define SYS_getcpu SYS_get_cpu
+#   endif
+    if (syscall(SYS_getcpu, &cpu, &node) == 0 && node < g_state.numa.n_nodes) {
+        return node;
+    }
+#endif
+#endif
+    return g_state.numa.current_node < g_state.numa.n_nodes ? g_state.numa.current_node : 0;
+}
+
+static void * ggml_numa_alloc_onnode(size_t size, uint32_t node, size_t * alloc_size) {
+#if defined(__gnu_linux__)
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const size_t rounded = GGML_PAD(size, (size_t) (page_size > 0 ? page_size : 4096));
+    void * ptr = mmap(NULL, rounded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        return NULL;
+    }
+
+    unsigned long nodemask[(GGML_NUMA_MAX_NODES + sizeof(unsigned long)*CHAR_BIT - 1)/(sizeof(unsigned long)*CHAR_BIT)];
+    memset(nodemask, 0, sizeof(nodemask));
+    nodemask[node / (sizeof(unsigned long)*CHAR_BIT)] |= 1UL << (node % (sizeof(unsigned long)*CHAR_BIT));
+
+    const long mbind_ret = syscall(SYS_mbind, ptr, rounded, MPOL_BIND, nodemask, GGML_NUMA_MAX_NODES, 0);
+    if (mbind_ret != 0) {
+        fprintf(stderr, "%s: failed to bind replica allocation to NUMA node %u: %s\n", __func__, node, strerror(errno));
+        munmap(ptr, rounded);
+        return NULL;
+    }
+
+    *alloc_size = rounded;
+    return ptr;
+#else
+    GGML_UNUSED(size);
+    GGML_UNUSED(node);
+    GGML_UNUSED(alloc_size);
+    return NULL;
+#endif
+}
+
+static struct ggml_numa_tensor_replica * ggml_numa_find_replica(const struct ggml_tensor * tensor) {
+    if (g_numa_replicas.table != NULL && g_numa_replicas.table_capacity > 0) {
+        const size_t mask = g_numa_replicas.table_capacity - 1;
+        size_t h = ((uintptr_t) tensor >> 4) * (size_t) 11400714819323198485ull;
+        for (size_t probe = 0; probe < g_numa_replicas.table_capacity; ++probe) {
+            const size_t pos = (h + probe) & mask;
+            const size_t index_plus_one = g_numa_replicas.table[pos];
+            if (index_plus_one == 0) {
+                return NULL;
+            }
+            struct ggml_numa_tensor_replica * replica = &g_numa_replicas.items[index_plus_one - 1];
+            if (replica->tensor == tensor) {
+                return replica;
+            }
+        }
+        return NULL;
+    }
+
+    for (size_t i = 0; i < g_numa_replicas.n_items; ++i) {
+        if (g_numa_replicas.items[i].tensor == tensor) {
+            return &g_numa_replicas.items[i];
+        }
+    }
+    return NULL;
+}
+
+static void ggml_numa_replica_table_insert(size_t index) {
+    const struct ggml_tensor * tensor = g_numa_replicas.items[index].tensor;
+    const size_t mask = g_numa_replicas.table_capacity - 1;
+    size_t h = ((uintptr_t) tensor >> 4) * (size_t) 11400714819323198485ull;
+    for (size_t probe = 0; probe < g_numa_replicas.table_capacity; ++probe) {
+        const size_t pos = (h + probe) & mask;
+        if (g_numa_replicas.table[pos] == 0) {
+            g_numa_replicas.table[pos] = index + 1;
+            return;
+        }
+    }
+}
+
+static void ggml_numa_rebuild_replica_table(void) {
+    size_t new_capacity = 1024;
+    while (new_capacity < 4*g_numa_replicas.n_items) {
+        new_capacity *= 2;
+    }
+
+    size_t * new_table = (size_t *) calloc(new_capacity, sizeof(size_t));
+    if (new_table == NULL) {
+        return;
+    }
+
+    free(g_numa_replicas.table);
+    g_numa_replicas.table = new_table;
+    g_numa_replicas.table_capacity = new_capacity;
+
+    for (size_t i = 0; i < g_numa_replicas.n_items; ++i) {
+        ggml_numa_replica_table_insert(i);
+    }
+}
+
+size_t ggml_numa_replicate_tensor_data(struct ggml_tensor * tensor) {
+    ggml_numa_replicas_init();
+
+    if (!g_numa_replicas.enabled || !ggml_is_numa() || tensor == NULL || tensor->data == NULL || tensor->view_src != NULL) {
+        return 0;
+    }
+
+    const size_t size = ggml_nbytes(tensor);
+    if (size < g_numa_replicas.min_bytes) {
+        return 0;
+    }
+
+    const uint32_t source_node = g_numa_replicas.source_node >= 0 && g_numa_replicas.source_node < (int) g_state.numa.n_nodes ?
+        (uint32_t) g_numa_replicas.source_node : 0;
+
+    ggml_critical_section_start();
+    if (ggml_numa_find_replica(tensor) != NULL) {
+        ggml_critical_section_end();
+        return 0;
+    }
+
+    if (g_numa_replicas.n_items == g_numa_replicas.capacity) {
+        const size_t new_capacity = g_numa_replicas.capacity ? 2*g_numa_replicas.capacity : 256;
+        struct ggml_numa_tensor_replica * new_items = (struct ggml_numa_tensor_replica *) realloc(
+                g_numa_replicas.items, new_capacity*sizeof(struct ggml_numa_tensor_replica));
+        if (new_items == NULL) {
+            ggml_critical_section_end();
+            fprintf(stderr, "%s: failed to grow NUMA replica registry\n", __func__);
+            return 0;
+        }
+        g_numa_replicas.items = new_items;
+        g_numa_replicas.capacity = new_capacity;
+    }
+
+    struct ggml_numa_tensor_replica replica;
+    memset(&replica, 0, sizeof(replica));
+    replica.tensor = tensor;
+    replica.src_data = tensor->data;
+    replica.size = size;
+    replica.source_node = source_node;
+
+    size_t bytes_replicated = 0;
+    for (uint32_t node = 0; node < g_state.numa.n_nodes && node < GGML_NUMA_MAX_NODES; ++node) {
+        if (node == source_node) {
+            replica.data[node] = tensor->data;
+            continue;
+        }
+        size_t alloc_size = 0;
+        void * copy = ggml_numa_alloc_onnode(size, node, &alloc_size);
+        if (copy == NULL) {
+            continue;
+        }
+        memcpy(copy, tensor->data, size);
+        replica.data[node] = copy;
+        replica.alloc_size[node] = alloc_size;
+        bytes_replicated += size;
+    }
+
+    if (bytes_replicated > 0) {
+        replica.replicated_bytes = bytes_replicated;
+        g_numa_replicas.items[g_numa_replicas.n_items++] = replica;
+        g_numa_replicas.replicated_bytes += bytes_replicated;
+        if (g_numa_replicas.table == NULL || 2*g_numa_replicas.n_items > g_numa_replicas.table_capacity) {
+            ggml_numa_rebuild_replica_table();
+        } else {
+            ggml_numa_replica_table_insert(g_numa_replicas.n_items - 1);
+        }
+    } else {
+        ggml_critical_section_end();
+        return 0;
+    }
+
+    ggml_critical_section_end();
+    return bytes_replicated;
+}
+
+void ggml_numa_free_tensor_data(const struct ggml_tensor * tensor) {
+    if (!g_numa_replicas.initialized || tensor == NULL) {
+        return;
+    }
+
+    ggml_critical_section_start();
+    for (size_t i = 0; i < g_numa_replicas.n_items; ++i) {
+        struct ggml_numa_tensor_replica * replica = &g_numa_replicas.items[i];
+        if (replica->tensor != tensor) {
+            continue;
+        }
+        for (uint32_t node = 0; node < g_state.numa.n_nodes && node < GGML_NUMA_MAX_NODES; ++node) {
+            if (node == replica->source_node || replica->data[node] == NULL || replica->alloc_size[node] == 0) {
+                continue;
+            }
+#if defined(__gnu_linux__)
+            munmap(replica->data[node], replica->alloc_size[node]);
+#else
+            free(replica->data[node]);
+#endif
+        }
+        g_numa_replicas.replicated_bytes -= g_numa_replicas.replicated_bytes >= replica->replicated_bytes ?
+            replica->replicated_bytes : g_numa_replicas.replicated_bytes;
+        g_numa_replicas.items[i] = g_numa_replicas.items[g_numa_replicas.n_items - 1];
+        --g_numa_replicas.n_items;
+        ggml_numa_rebuild_replica_table();
+        break;
+    }
+    ggml_critical_section_end();
+}
+
+const void * ggml_numa_get_tensor_data(const struct ggml_tensor * tensor) {
+    if (!g_numa_replicas.initialized || g_numa_replicas.n_items == 0 || tensor == NULL) {
+        return tensor ? tensor->data : NULL;
+    }
+
+    const struct ggml_tensor * lookup = tensor->view_src != NULL ? tensor->view_src : tensor;
+    const size_t view_offs = tensor->view_src != NULL ? tensor->view_offs : 0;
+
+    struct ggml_numa_tensor_replica * replica = ggml_numa_find_replica(lookup);
+    if (replica == NULL) {
+        return tensor->data;
+    }
+
+    const uint32_t node = ggml_numa_current_node();
+    if (node < GGML_NUMA_MAX_NODES && replica->data[node] != NULL) {
+        return (const char *) replica->data[node] + view_offs;
+    }
+    return tensor->data;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -16969,6 +17327,7 @@ static void ggml_compute_forward_group_norm(
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
+    const char * src0_data,
     const int64_t num_rows_per_vec_dot,
     const int64_t ir0_start,
     const int64_t ir0_end,
@@ -17029,7 +17388,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 const int64_t i2 = i12;
                 const int64_t i3 = i13;
 
-                const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
+                const char * src0_row = src0_data + (0 + i02 * nb02 + i03 * nb03);
 
                 // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
                 //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
@@ -17073,6 +17432,7 @@ static int ggml_compute_forward_mul_mat(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    const char * src0_data = (const char *) ggml_numa_get_tensor_data(src0);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -17114,7 +17474,7 @@ static int ggml_compute_forward_mul_mat(
     if (dst->type == GGML_TYPE_F32) {
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
-                    src0->type, src0->data, nb01,
+                    src0->type, src0_data, nb01,
                     src1->type, src1->data, nb11,
                     (float *)dst->data, nb1/sizeof(float), ith, nth)) return node_n;
     }
@@ -17182,7 +17542,7 @@ static int ggml_compute_forward_mul_mat(
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, row_size*ne11, row_size*ne11*ne12,
                     nb2/sizeof(float), nb3/sizeof(float),
-                    src0->type, src0->data, nb01,
+                    src0->type, src0_data, nb01,
                     vec_dot_type, wdata, row_size,
                     (float *)dst->data, nb1/sizeof(float), ith, nth)) {
             if (!cgraph) return node_n;
@@ -17198,7 +17558,7 @@ static int ggml_compute_forward_mul_mat(
                 if (!iqk_mul_mat_4d(src0_next->ne[1], ne11, ne00,
                     src0_next->ne[2], src0_next->ne[3], ne12, ne13, src0_next->nb[2], src0_next->nb[3], row_size*ne11, row_size*ne11*ne12,
                     dst_next->nb[2]/sizeof(float), dst_next->nb[3]/sizeof(float),
-                    src0_next->type, src0_next->data, src0_next->nb[1],
+                    src0_next->type, ggml_numa_get_tensor_data(src0_next), src0_next->nb[1],
                     vec_dot_type, wdata, row_size,
                     (float *)dst_next->data, dst_next->nb[1]/sizeof(float), ith, nth)) break;
                 ++node_n;
@@ -17264,12 +17624,12 @@ static int ggml_compute_forward_mul_mat(
 
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (gemm && (ne11 > 3)) {
-            gemm(ne00, (float *)((char *) dst->data) + src0_start, ne01, (const char *) src0->data + src0_start * nb01,
+            gemm(ne00, (float *)((char *) dst->data) + src0_start, ne01, src0_data + src0_start * nb01,
                  (const char *) src1_wdata, ne11 - ne11 % 4, src0_end - src0_start);
         }
         for (int iter = gemm ? ne11 - ne11 % 4 : 0; iter < ne11; iter++) {
             gemv(ne00, (float *)((char *) dst->data + (iter * nb1)) + src0_start, ne01,
-                 (const char *) src0->data + src0_start * nb01, (const char *) src1_wdata + (src1_col_stride * iter), 1,
+                 src0_data + src0_start * nb01, (const char *) src1_wdata + (src1_col_stride * iter), 1,
                  src0_end - src0_start);
         }
         return node_n;
@@ -17288,7 +17648,7 @@ static int ggml_compute_forward_mul_mat(
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0_data, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -17314,6 +17674,7 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+    const char * src0_data = (const char *) ggml_numa_get_tensor_data(src0);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -17432,7 +17793,7 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+        const char * src0_cur = src0_data + cur_a*nb02;
 
         const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
@@ -17595,6 +17956,10 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     const struct ggml_tensor * src0_1 = dst->src[0];
     const struct ggml_tensor * src0_2 = dst->src[1];
     const struct ggml_tensor * src0 = src0_1; // so GGML_TENSOR_BINARY_OP_LOCALS works
+    const char * src0_1_data = (const char *) ggml_numa_get_tensor_data(src0_1);
+    const char * src0_2_data = src0_2 ? (const char *) ggml_numa_get_tensor_data(src0_2) : NULL;
+    const char * up_b_data   = up_b   ? (const char *) ggml_numa_get_tensor_data(up_b)   : NULL;
+    const char * gate_b_data = gate_b ? (const char *) ggml_numa_get_tensor_data(gate_b) : NULL;
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -17703,16 +18068,16 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
         if (src0_2) {
-            src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
-            up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
-            gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
+            src0_1_cur = src0_1_data + cur_a*nb02;
+            src0_2_cur = src0_2_data + cur_a*nb02;
+            up_b_cur   = up_b   ? up_b_data + cur_a*nb41 : NULL;
+            gate_b_cur = gate_b ? gate_b_data + cur_a*nb51 : NULL;
         } else {
-            src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
+            src0_2_cur = src0_1_data + cur_a*nb02;
             src0_1_cur = src0_2_cur + nb02/2;
             if (up_b) {
                 GGML_ASSERT(!gate_b);
-                gate_b_cur = (const char *)up_b->data + cur_a*nb41;
+                gate_b_cur = up_b_data + cur_a*nb41;
                 up_b_cur   = gate_b_cur + nb41/2;
             }
         }
@@ -17747,6 +18112,8 @@ static void ggml_compute_forward_mul_mat_up_gate(
     const struct ggml_tensor * src0_1 = dst->src[0];
     const struct ggml_tensor * src0_2 = dst->src[1];
     const struct ggml_tensor * src0 = src0_1; // so GGML_TENSOR_BINARY_OP_LOCALS works
+    const char * src0_1_data = (const char *) ggml_numa_get_tensor_data(src0_1);
+    const char * src0_2_data = (const char *) ggml_numa_get_tensor_data(src0_2);
 
     GGML_ASSERT(ggml_is_quantized(src0_1->type) && src0_1->type == src0_2->type);
 
@@ -17798,7 +18165,7 @@ static void ggml_compute_forward_mul_mat_up_gate(
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
     if (!iqk_moe_fused_up_gate(ne01, ne11, ne00, ne11, dst->op_params[0],
-                         type, src0_1->data, src0_2->data, nb01,
+                         type, src0_1_data, src0_2_data, nb01,
                          vec_dot_type, (const char *)wdata, row_size,
                          NULL, NULL,
                          (float *)dst->data, nb1, nb2,
@@ -26652,6 +27019,7 @@ static void set_numa_thread_affinity(int thread_n) {
 
     switch(g_state.numa.numa_strategy) {
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
+        case GGML_NUMA_STRATEGY_MIRROR:
             // run thread on node_num thread_n / (threads per node)
             node_num = thread_n % g_state.numa.n_nodes;
             break;
@@ -26681,6 +27049,8 @@ static void set_numa_thread_affinity(int thread_n) {
     rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
     if (rv) {
             fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
+    } else {
+        g_numa_thread_node = node_num;
     }
 
     CPU_FREE(cpus);
@@ -26702,6 +27072,8 @@ static void clear_numa_thread_affinity(void) {
     int rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
     if (rv) {
         fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
+    } else {
+        g_numa_thread_node = -1;
     }
 
     CPU_FREE(cpus);

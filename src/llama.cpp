@@ -628,6 +628,9 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
 }
 
 llama_model::~llama_model() {
+    for (const auto & it : tensors_by_name) {
+        ggml_numa_free_tensor_data(it.second);
+    }
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
@@ -4371,6 +4374,27 @@ static bool llm_load_tensors(
             set_scale(l.wk, l.wk_scale);
             set_scale(l.wv, l.wv_scale);
             set_scale(l.wo, l.wo_scale);
+        }
+    }
+
+    if (!dry_run && ggml_numa_should_replicate_weights()) {
+        int n_replicated = 0;
+        size_t bytes_replicated = 0;
+        for (auto & it : model.tensors_by_name) {
+            ggml_tensor * tensor = it.second;
+            if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_host(tensor->buffer)) {
+                continue;
+            }
+            const size_t bytes = ggml_numa_replicate_tensor_data(tensor);
+            if (bytes > 0) {
+                ++n_replicated;
+                bytes_replicated += bytes;
+            }
+        }
+        LLAMA_LOG_INFO("%s: NUMA mirror source node = %d, replicated %d tensors, %.2f GiB of additional local weight copies\n",
+                __func__, ggml_numa_get_replica_source_node(), n_replicated, bytes_replicated / 1024.0 / 1024.0 / 1024.0);
+        if (n_replicated == 0) {
+            LLAMA_LOG_WARN("%s: NUMA mirror requested but no CPU weight tensors were replicated\n", __func__);
         }
     }
 

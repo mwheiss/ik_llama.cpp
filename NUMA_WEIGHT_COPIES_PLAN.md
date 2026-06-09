@@ -174,3 +174,71 @@ Reject or revert the prototype if it:
   hot tensors identified by section timing and `perf`?
 - Can ik's existing NUMA worker setup guarantee stable worker-to-node mapping,
   or do we need an explicit pinning mode before local pointer selection?
+
+## Prototype Results
+
+Implemented on branch `deepseek-v4-cpu-numa-weights`:
+
+- `--numa mirror` now enables opt-in per-node read-only weight replicas.
+- The loader replicates large CPU model tensors and logs the selected source
+  node plus replicated GiB.
+- Replica placement uses explicit `mbind`; source-node selection honors
+  `GGML_NUMA_REPLICATE_SOURCE_NODE` and single-node `numactl --membind`.
+- Matmul, selected-expert matmul, and fused up/gate paths resolve local replica
+  pointers, including view tensors.
+- The hot lookup path uses a small hash table and worker-local NUMA node tags.
+
+Single-slot validation:
+
+```text
+scripts/engine_test_harness.py ... --ik-numa mirror --ik-no-mmap
+comparison_status: PASS
+max_abs_logprob_diff: 0.0
+opt prefill_tps: 34.56
+opt decode_tps: 3.61
+peak RSS: 334249 MiB
+```
+
+The in-process mirrored single-slot path improves prefill and keeps exact
+quality parity, but it does not reach two independent node-local decode
+throughput. A representative CLI decode smoke stayed around 3.2-3.6 tok/s,
+while the two-process node-local aggregate baseline is around 7.1 tok/s.
+
+Two-slot validation:
+
+```text
+scripts/bench-dsv4-numa-mirror-dual-slot.py ... --parallel 2 --no-mmap
+```
+
+This currently aborts inside the DeepSeek4 graph at `ggml_reshape_2d` from
+`store_dsv4_cache_rows` when the server batches two active slots. The graph path
+still assumes a single logical sequence for DSV4 compressed/cache row storage.
+This is a DSV4 multi-sequence graph/cache limitation, not a NUMA replica
+placement problem.
+
+Practical throughput path:
+
+- Use `scripts/bench-dsv4-two-node-servers.py --no-mmap` for the current
+  two-copy serving topology.
+- That topology remains the target for request-level throughput until the DSV4
+  graph/cache code supports true multi-slot continuous batching.
+
+Validated command:
+
+```text
+scripts/bench-dsv4-two-node-servers.py --server-bin build-cpu-opt/bin/llama-server \
+  --model .../DeepSeek-V4-Flash-Q4_K_M-XL-00001-of-00004.gguf \
+  --ctx-size 1024 --n-predict 192 --filler-lines 0 --no-mmap \
+  --out dsv4-cascade-lake-results/two-node-servers-numa-weights
+```
+
+Result:
+
+```text
+all_ok: true
+aggregate_prompt_tps_to_all_first_tokens: 60.46
+aggregate_strict_decode_tps_after_first_content: 6.83
+aggregate_strict_tokens_per_total_wall: 4.92
+node0 decode_tps: 3.42
+node1 decode_tps: 3.65
+```
