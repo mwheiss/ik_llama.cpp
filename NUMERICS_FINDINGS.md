@@ -2209,6 +2209,12 @@ So the current IntelLLVM/OpenMP path is not just failing to benefit from MKL;
 it independently hurts DSV4 decode throughput and shifts FA-on logprobs into
 the warning band.
 
+`icx-mkl-ipo` did not reach a numeric benchmark. It configured successfully, but
+the `libggml.so` IPO link was still active after more than 14 minutes at ~100%
+CPU and was stopped manually. Since non-IPO `icx-native` and `icx-mkl` already
+regress decode throughput and move FA-on logprobs into the warning band, do not
+spend more time on Intel IPO without a specific compiler/codegen hypothesis.
+
 The `clang-native` build behaves differently: it has exact FA-on logprob parity
 with the GCC baseline and improves prefill, but still loses badly on decode.
 

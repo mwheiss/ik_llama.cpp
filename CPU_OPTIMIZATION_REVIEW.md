@@ -370,6 +370,25 @@ comparison: hard pass, warning band; max_abs=0.014243629, mean_abs=0.000231890
 Do not switch DSV4 CPU default builds to IntelLLVM unless a later focused
 profile identifies and fixes the decode slowdown.
 
+Intel IPO/MKL attempt: `icx-mkl-ipo` configured successfully, but the build was
+stopped after the `libggml.so` IPO link remained active for more than 14 minutes
+on Cascade Lake:
+
+```text
+build:
+  DSV4_CPU_MATRIX_JOBS=104 scripts/build-dsv4-cascade-lake-matrix.sh icx-mkl-ipo
+
+observed state:
+  /usr/bin/ld ... -plugin /opt/intel/oneapi/compiler/2026.0/.../icx-lto.so ...
+  target: ggml/src/libggml.so
+  elapsed on same link step: >14 minutes at ~100% CPU
+```
+
+Because both `icx-native` and `icx-mkl` already regressed decode throughput, IPO
+is not worth more iteration until a specific Intel compiler/codegen issue is
+identified. The matrix script now marks interrupted/incomplete builds as failed
+instead of allowing stale `PASS` status files.
+
 GCC + MKL result: linking MKL under GCC preserves exact logits, but hurts both
 prefill and decode in the FA-on DSV4 server harness:
 

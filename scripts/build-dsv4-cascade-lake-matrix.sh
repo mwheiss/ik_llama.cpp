@@ -69,6 +69,11 @@ require_cmd() {
     fi
 }
 
+targets_has() {
+    local target=$1
+    [[ " $targets " == *" $target "* ]]
+}
+
 source_oneapi() {
     if [[ ! -f /opt/intel/oneapi/setvars.sh ]]; then
         echo "missing /opt/intel/oneapi/setvars.sh" >&2
@@ -159,6 +164,7 @@ run_case() {
 
     local case_results="$results_dir/$case_id"
     mkdir -p "$case_results"
+    echo "RUNNING" >"$case_results/status.txt"
     {
         echo "case=$case_id"
         echo "build_dir=$build_dir"
@@ -184,7 +190,7 @@ run_case() {
 
     echo
     echo "===== configure $case_id ====="
-    (
+    if ! (
         cd "$root"
         cmake -S . -B "$build_dir" -G Ninja \
             -DCMAKE_C_COMPILER="$compiler_c" \
@@ -194,13 +200,19 @@ run_case() {
             -DGGML_LTO="$lto" \
             "${common_cmake_flags[@]}" \
             "${extra_flags[@]}"
-    ) 2>&1 | tee "$case_results/configure.log"
+    ) 2>&1 | tee "$case_results/configure.log"; then
+        echo "configure failed for $case_id" >&2
+        return 1
+    fi
 
     echo
     echo "===== build $case_id ====="
     # shellcheck disable=SC2086
-    cmake --build "$build_dir" --config Release -j"$jobs" --target $targets \
-        2>&1 | tee "$case_results/build.log"
+    if ! cmake --build "$build_dir" --config Release -j"$jobs" --target $targets \
+        2>&1 | tee "$case_results/build.log"; then
+        echo "build failed for $case_id" >&2
+        return 1
+    fi
 
     cp "$build_dir/CMakeCache.txt" "$case_results/CMakeCache.txt"
     if [[ -x "$build_dir/bin/llama-server" ]]; then
@@ -211,19 +223,43 @@ run_case() {
         ldd "$build_dir/bin/llama-bench" >"$case_results/ldd.llama-bench.txt" || true
     fi
 
-    echo
-    echo "===== primitive test $case_id ====="
-    "$build_dir/bin/test-dsv4-primitives" 2>&1 | tee "$case_results/test-dsv4-primitives.log"
+    if targets_has test-dsv4-primitives; then
+        if [[ ! -x "$build_dir/bin/test-dsv4-primitives" ]]; then
+            echo "missing expected test binary: $build_dir/bin/test-dsv4-primitives" >&2
+            return 1
+        fi
 
-    echo
-    echo "===== VNNI artifact check $case_id ====="
-    "$root/scripts/check-cascade-lake-vnni.sh" "$build_dir" 2>&1 | tee "$case_results/vnni.log"
+        echo
+        echo "===== primitive test $case_id ====="
+        if ! "$build_dir/bin/test-dsv4-primitives" 2>&1 | tee "$case_results/test-dsv4-primitives.log"; then
+            echo "primitive test failed for $case_id" >&2
+            return 1
+        fi
+    fi
 
-    objdump -d "$build_dir/bin/llama-server" "$build_dir/src/libllama.so" "$build_dir/ggml/src/libggml.so" \
-        >"$case_results/objdump-selected.asm" 2>/dev/null || true
-    if [[ -s "$case_results/objdump-selected.asm" ]]; then
-        rg -c '\bvpdp(busd|wssd)\b' "$case_results/objdump-selected.asm" \
-            >"$case_results/vnni-instruction-count.txt" || true
+    if targets_has llama-server; then
+        if [[ ! -x "$build_dir/bin/llama-server" ]]; then
+            echo "missing expected server binary: $build_dir/bin/llama-server" >&2
+            return 1
+        fi
+        if [[ ! -f "$build_dir/src/libllama.so" || ! -f "$build_dir/ggml/src/libggml.so" ]]; then
+            echo "missing expected shared libraries for VNNI check in $build_dir" >&2
+            return 1
+        fi
+
+        echo
+        echo "===== VNNI artifact check $case_id ====="
+        if ! "$root/scripts/check-cascade-lake-vnni.sh" "$build_dir" 2>&1 | tee "$case_results/vnni.log"; then
+            echo "VNNI artifact check failed for $case_id" >&2
+            return 1
+        fi
+
+        objdump -d "$build_dir/bin/llama-server" "$build_dir/src/libllama.so" "$build_dir/ggml/src/libggml.so" \
+            >"$case_results/objdump-selected.asm" 2>/dev/null || true
+        if [[ -s "$case_results/objdump-selected.asm" ]]; then
+            rg -c '\bvpdp(busd|wssd)\b' "$case_results/objdump-selected.asm" \
+                >"$case_results/vnni-instruction-count.txt" || true
+        fi
     fi
 
     echo "PASS" >"$case_results/status.txt"
