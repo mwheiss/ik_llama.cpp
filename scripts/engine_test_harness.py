@@ -128,6 +128,8 @@ def baseline_cache_key(args: argparse.Namespace) -> str:
     }
     if args.run_time_repack:
         key_obj["run_time_repack"] = True
+    if args.no_mmap:
+        key_obj["no_mmap"] = True
     payload = json.dumps(key_obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -435,6 +437,12 @@ def build_server_command(args: argparse.Namespace, engine: str, server_bin: str,
         add_if(cmd, plan, help_text, "run_time_repack", ["--run-time-repack"], "--run-time-repack")
     else:
         plan.append({"name": "run_time_repack", "status": "omitted_default"})
+
+    no_mmap = args.ik_no_mmap if engine == "opt_ik" and args.ik_no_mmap else args.no_mmap
+    if no_mmap:
+        add_if(cmd, plan, help_text, "no_mmap", ["--no-mmap"], "--no-mmap")
+    else:
+        plan.append({"name": "no_mmap", "status": "omitted_default"})
 
     add_if(cmd, plan, help_text, "no_repack", ["--no-repack"], "--no-repack")
     add_if(cmd, plan, help_text, "no_warmup", ["--no-warmup"], "--no-warmup")
@@ -1273,6 +1281,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--cache-ram", type=int, default=None, help="Optional server --cache-ram override, e.g. 0 to disable cache RAM where supported.")
     ap.add_argument("--run-time-repack", action="store_true", help="Pass --run-time-repack to the baseline server when supported.")
     ap.add_argument("--ik-run-time-repack", action="store_true", help="Pass --run-time-repack to the optimized/test server when supported.")
+    ap.add_argument("--no-mmap", action="store_true", help="Pass --no-mmap to the baseline server when supported.")
+    ap.add_argument("--ik-no-mmap", action="store_true", help="Pass --no-mmap to the optimized/test server when supported.")
     ap.add_argument("--ctx-checkpoints", type=int, default=None, help="Optional server --ctx-checkpoints override.")
     ap.add_argument("--ctx-checkpoints-interval", type=int, default=None, help="Optional server --ctx-checkpoints-interval override.")
     ap.add_argument("--ctx-checkpoints-tolerance", type=int, default=None, help="Optional server --ctx-checkpoints-tolerance override.")
@@ -1323,6 +1333,8 @@ def main() -> int:
         "test_numa": args.ik_numa if args.ik_numa is not None else args.numa,
         "reference_run_time_repack": args.run_time_repack,
         "test_run_time_repack": args.ik_run_time_repack or args.run_time_repack,
+        "reference_no_mmap": args.no_mmap,
+        "test_no_mmap": args.ik_no_mmap or args.no_mmap,
         "baseline_cache_enabled": not args.no_baseline_cache,
         "baseline_cache_entry": str(cache_entry),
         "baseline_cache_refresh": args.refresh_baseline_cache,
@@ -1356,6 +1368,8 @@ def main() -> int:
     print("test numa:", (args.ik_numa if args.ik_numa is not None else args.numa) or "<none>")
     print("baseline run-time-repack:", args.run_time_repack)
     print("test run-time-repack:", args.ik_run_time_repack or args.run_time_repack)
+    print("baseline no-mmap:", args.no_mmap)
+    print("test no-mmap:", args.ik_no_mmap or args.no_mmap)
     print("baseline cache:", "disabled" if args.no_baseline_cache else cache_entry)
     print("out root:", out_root)
 

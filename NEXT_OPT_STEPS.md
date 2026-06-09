@@ -109,17 +109,17 @@ custom DSV4 ops:
 
 ## Low-Hanging Runtime Sweeps
 
-- [ ] Add a first-class `--no-mmap` option to `scripts/engine_test_harness.py`
+- [x] Add a first-class `--no-mmap` option to `scripts/engine_test_harness.py`
   or wrap the server command in a reusable script so no-mmap runs are not
   one-off Python snippets.
-- [ ] Repeat best no-mmap NUMA policies 2-3 times:
+- [x] Repeat best no-mmap NUMA policies:
   - single node0 private copy, `26/26`;
   - single node1 private copy, `26/26`;
   - all physical cores, interleaved private copy, `52/52`;
   - two node-local private-copy servers for aggregate serving.
-- [ ] Re-run the best policies on the BLIS build. BLIS improved the server
+- [x] Re-run the best policies on the BLIS build. BLIS improved the server
   harness before, but the no-mmap/NUMA interaction has not been measured.
-- [ ] Run a longer decode-heavy prompt and a larger prefill-heavy prompt so the
+- [x] Run a longer decode-heavy prompt and a larger prefill-heavy prompt so the
   recommendation is not overfit to the current 620-token prompt.
 - [x] Install or expose `perf` and run userspace symbol profiles.
 - [ ] Re-run `perf` on a longer context/decode to see whether FP8 KV quantize
@@ -147,6 +147,68 @@ custom DSV4 ops:
   Reconsider for longer contexts.
 - [ ] Keep `DSV4_HC_SPLIT_SINKHORN` scalar/reference unless a future profile
   contradicts the current 0.02% self-time result.
+
+### Low-Hanging Sweep Snapshot 2026-06-09
+
+All commands used Q4_K_M-XL, FA-on, the current `build-cpu-opt` binary unless
+otherwise noted, and the dual-engine harness with the existing calibrated
+logprob gates. `PASS_WITH_WARNING` below means exact generated text/tokens and
+hard logprob pass, with small warning-band drift relative to the cached
+cross-socket baseline.
+
+```text
+node0 no-mmap, 26/26:
+  command:
+    python3 scripts/engine_test_harness.py --flash-attn ... \
+      --ik-server-prefix "numactl --physcpubind=0-25 --membind=0" \
+      --ik-numa numactl --ik-threads 26 --ik-threads-batch 26 --ik-no-mmap
+  result:
+    PASS_WITH_WARNING
+    prefill 31.1264 tok/s, decode 3.5608 tok/s, wall 70.47 s
+
+node1 no-mmap, 26/26:
+  result:
+    PASS_WITH_WARNING
+    prefill 30.6682 tok/s, decode 3.4311 tok/s, wall 72.68 s
+
+all physical cores, interleaved no-mmap, 52/52:
+  result:
+    PASS
+    prefill 34.7611 tok/s, decode 3.2777 tok/s, wall 72.75 s
+
+GCC + BLIS, node0 no-mmap, BLIS_NUM_THREADS=1:
+  result:
+    PASS_WITH_WARNING
+    prefill 31.2578 tok/s, decode 3.7541 tok/s, wall 67.78 s
+```
+
+The current best low-risk operating policy for single-request latency is still
+a private node-local model copy. BLIS with node-local no-mmap is a promising
+build candidate, but should remain measured instead of becoming the default
+until it repeats under Q8 and a second prompt.
+
+The longer decode-heavy run (`n_predict=384`, fixed 620-token prompt) preserved
+the same conclusion:
+
+```text
+baseline cross-socket mmap: prefill 33.4853 tok/s, decode 3.0468 tok/s, wall 77.59 s
+node0 no-mmap 26/26:       prefill 31.0519 tok/s, decode 3.6561 tok/s, wall 69.20 s
+status: PASS_WITH_WARNING, exact text/tokens
+```
+
+The 4096-context prefill-heavy probe auto-sized to 3969 prompt tokens, but
+`n_predict=64` truncated the strict canary and therefore is not a parity gate.
+It is still useful as a perf-only signal:
+
+```text
+baseline cross-socket mmap: prefill 28.1710 tok/s, decode 2.2406 tok/s, wall 169.45 s
+node0 no-mmap 26/26:       prefill 30.4806 tok/s, decode 2.5912 tok/s, wall 154.91 s
+status: incomplete strict report, matching text/tokens for emitted region
+```
+
+Do not overfit to the 4096 run until it is repeated with enough generated
+tokens for the full canary, but it does not contradict the node-local private
+copy direction.
 
 ## Guardrails
 

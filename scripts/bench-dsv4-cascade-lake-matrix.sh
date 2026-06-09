@@ -14,6 +14,8 @@ numa_policy=${DSV4_NUMA_POLICY:-distribute}
 blas_thread_list=${DSV4_BLAS_THREADS:-1}
 flash_modes=${DSV4_FLASH_MODES:-on,off}
 run_llama_bench=${DSV4_RUN_LLAMA_BENCH:-0}
+no_mmap=${DSV4_NO_MMAP:-0}
+ik_no_mmap=${DSV4_IK_NO_MMAP:-0}
 
 default_cases=(
     icx-native
@@ -46,6 +48,8 @@ Environment:
   DSV4_BLAS_THREADS      comma-separated BLAS thread counts, default 1
   DSV4_FLASH_MODES       comma-separated modes, default on,off
   DSV4_RUN_LLAMA_BENCH   set to 1 for optional llama-bench shapes
+  DSV4_NO_MMAP           set to 1 to pass --no-mmap to both engines
+  DSV4_IK_NO_MMAP        set to 1 to pass --no-mmap only to the candidate
 EOF
 }
 
@@ -98,6 +102,13 @@ run_harness() {
     local case_results="$results_dir/$case_id"
     mkdir -p "$case_results"
     local log="$case_results/harness-${mode_name}-blas${blas_threads}.log"
+    local mmap_args=()
+    if [[ "$no_mmap" == "1" ]]; then
+        mmap_args+=(--no-mmap)
+    fi
+    if [[ "$ik_no_mmap" == "1" ]]; then
+        mmap_args+=(--ik-no-mmap)
+    fi
 
     export MKL_NUM_THREADS=$blas_threads
     export OPENBLAS_NUM_THREADS=$blas_threads
@@ -123,6 +134,7 @@ run_harness() {
         --ik-threads "$threads" \
         --ik-threads-batch "$threads_batch" \
         --ik-numa "$numa_policy" \
+        "${mmap_args[@]}" \
         2>&1 | tee "$log"
 
     rg "comparison_status|max_abs_logprob_diff|mean_abs_logprob_diff|baseline_ik perf|opt_ik perf|root:" "$log" \

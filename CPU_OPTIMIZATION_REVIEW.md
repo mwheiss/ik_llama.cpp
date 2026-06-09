@@ -501,6 +501,62 @@ mostly remote memory. Corrected metrics for that run were about `4.22 tok/s`
 aggregate decode-only and `3.34 tok/s` generated tokens per total wall. So mmap
 can hurt this specific two-instance NUMA-local strategy.
 
+The harness now has first-class mmap controls:
+
+```text
+scripts/engine_test_harness.py --no-mmap     # baseline and candidate
+scripts/engine_test_harness.py --ik-no-mmap  # candidate only
+```
+
+The matrix and sweep wrappers expose the same through
+`DSV4_NO_MMAP=1`, `DSV4_IK_NO_MMAP=1`, `DSV4_BASELINE_NO_MMAP=1`, and
+`DSV4_SWEEP_NO_MMAP=1`.
+
+Follow-up harness repeats with these flags preserved the same conclusion:
+
+```text
+Q4_K_M-XL, FA-on, ctx=1024, n_predict=192, fixed 620-token prompt
+
+node0 no-mmap, 26/26:
+  PASS_WITH_WARNING, exact text/tokens
+  prefill 31.1264 tok/s, decode 3.5608 tok/s, wall 70.47 s
+
+node1 no-mmap, 26/26:
+  PASS_WITH_WARNING, exact text/tokens
+  prefill 30.6682 tok/s, decode 3.4311 tok/s, wall 72.68 s
+
+all physical cores, interleaved no-mmap, 52/52:
+  PASS, exact text/tokens and exact logprobs
+  prefill 34.7611 tok/s, decode 3.2777 tok/s, wall 72.75 s
+
+GCC + BLIS, node0 no-mmap, BLIS_NUM_THREADS=1:
+  PASS_WITH_WARNING, exact text/tokens
+  prefill 31.2578 tok/s, decode 3.7541 tok/s, wall 67.78 s
+```
+
+The longer decode-heavy run (`n_predict=384`, fixed 620-token prompt) also
+favored node-local no-mmap:
+
+```text
+baseline cross-socket mmap: prefill 33.4853 tok/s, decode 3.0468 tok/s, wall 77.59 s
+node0 no-mmap 26/26:       prefill 31.0519 tok/s, decode 3.6561 tok/s, wall 69.20 s
+status: PASS_WITH_WARNING, exact text/tokens
+```
+
+The 4096-context prefill-heavy probe auto-sized to 3969 prompt tokens but used
+only `n_predict=64`, so the strict canary was truncated and the harness reported
+failure. For the emitted region, generated text and tokens matched; treat this
+as perf-only:
+
+```text
+baseline cross-socket mmap: prefill 28.1710 tok/s, decode 2.2406 tok/s, wall 169.45 s
+node0 no-mmap 26/26:       prefill 30.4806 tok/s, decode 2.5912 tok/s, wall 154.91 s
+```
+
+These results strengthen the NUMA weight-copy hypothesis: local private weights
+help decode materially, while all physical cores can still help prefill. See
+`NUMA_WEIGHT_COPIES_PLAN.md` for the staged implementation plan.
+
 The simpler one-server `-np 2` comparison is not a valid performance baseline
 yet: it produced junk for one request and aborted in `build_deepseek4`. Treat
 multi-slot concurrent batching as a separate correctness item before comparing

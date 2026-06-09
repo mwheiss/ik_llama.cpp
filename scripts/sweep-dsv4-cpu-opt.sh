@@ -14,6 +14,8 @@ flash_modes="${DSV4_SWEEP_FLASH_MODES:-on}"
 baseline_threads=${DSV4_BASELINE_THREADS:-32}
 baseline_threads_batch=${DSV4_BASELINE_THREADS_BATCH:-52}
 baseline_numa=${DSV4_BASELINE_NUMA:-distribute}
+baseline_no_mmap=${DSV4_BASELINE_NO_MMAP:-0}
+sweep_no_mmap=${DSV4_SWEEP_NO_MMAP:-0}
 
 mkdir -p "$results_dir"
 
@@ -32,6 +34,8 @@ Environment:
   DSV4_BASELINE_THREADS      baseline generation threads, default 32
   DSV4_BASELINE_THREADS_BATCH baseline prompt threads, default 52
   DSV4_BASELINE_NUMA         baseline --numa policy, default distribute
+  DSV4_BASELINE_NO_MMAP      set to 1 to pass --no-mmap to the baseline
+  DSV4_SWEEP_NO_MMAP         set to 1 to pass --no-mmap to test candidates
 EOF
 }
 
@@ -62,6 +66,13 @@ run_case() {
 
     local log="$results_dir/${name}-fa-${flash}.log"
     local summary="$results_dir/${name}-fa-${flash}.summary"
+    local mmap_args=()
+    if [[ "$baseline_no_mmap" == "1" ]]; then
+        mmap_args+=(--no-mmap)
+    fi
+    if [[ "$sweep_no_mmap" == "1" ]]; then
+        mmap_args+=(--ik-no-mmap)
+    fi
 
     echo
     echo "===== ${name} fa-${flash} ====="
@@ -76,6 +87,7 @@ run_case() {
         --threads "$baseline_threads" \
         --threads-batch "$baseline_threads_batch" \
         --numa "$baseline_numa" \
+        "${mmap_args[@]}" \
         "$@" \
         2>&1 | tee "$log"
 
