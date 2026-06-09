@@ -276,6 +276,26 @@ Expected payoff: medium.
 Risk: medium. Previous ordered-reduction and disabled-fusion experiments did
 not improve parity.
 
+Latest source-level retry: replacing the explicit DSV4 shared expert expression
+with the generic ik `llm_build_ffn(..., LLM_FFN_PAR)` helper preserved exact
+FA-on logprob parity but did not improve the primary server-generation metric:
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh gcc-native
+
+FA-on, ctx=1024, n_predict=192, --numa distribute -t 32 -tb 52
+GCC native baseline:    prefill 32.9625 tok/s, decode 2.6297 tok/s, wall 87.2581 s
+generic FFN shared exp: prefill 33.3067 tok/s, decode 2.5959 tok/s, wall 87.9563 s
+comparison: PASS with exact logprobs
+```
+
+This is a small prefill-only gain with a decode/total-wall regression, so keep
+the explicit cchuter-style DSV4 shared expert path. Revisit only if a later
+profile shows a different shared-expert bottleneck or if upstream changes the
+generic FFN helper enough to require a fresh measurement.
+
 ### 6. Thread and batch sweep on Cascade Lake
 
 The harness currently uses full `-t 52 -tb 52`. Upstream docs warn that too many

@@ -1703,6 +1703,32 @@ explained by the final selected-expert accumulation order, and the optimized
 `ggml_multi_add` path should remain in place unless a later, narrower tensor
 parity check proves otherwise.
 
+A later CPU-optimization retry tested the opposite direction for the shared
+expert: replacing the explicit DSV4 shared-expert expression with ik's generic
+`llm_build_ffn(..., LLM_FFN_PAR)` helper. This was evaluated against the cached
+GCC native baseline with flash attention enabled, which is the primary runtime
+optimization target:
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh gcc-native
+
+text/tokens/logprobs:
+  exact match for 180 strict rows
+  max_abs_logprob_diff  = 0.0
+  mean_abs_logprob_diff = 0.0
+
+performance:
+  GCC native baseline:    prefill 32.962534 tok/s, decode 2.629701 tok/s
+  generic FFN shared exp: prefill 33.306728 tok/s, decode 2.595851 tok/s
+  wall time: 87.2581 s -> 87.9563 s
+```
+
+The helper path is numerically acceptable in this FA-on gate, but it is not a
+speed win for generation because decode and total wall time regress. Keep the
+explicit cchuter-style shared expert expression for now.
+
 A ninth controlled experiment forced `GGML_PREC_F32` on the final
 `output.weight` matmul only:
 
