@@ -370,6 +370,25 @@ comparison: hard pass, warning band; max_abs=0.014243629, mean_abs=0.000231890
 Do not switch DSV4 CPU default builds to IntelLLVM unless a later focused
 profile identifies and fixes the decode slowdown.
 
+GCC + MKL result: linking MKL under GCC preserves exact logits, but hurts both
+prefill and decode in the FA-on DSV4 server harness:
+
+```text
+build:
+  DSV4_CPU_MATRIX_JOBS=104 scripts/build-dsv4-cascade-lake-matrix.sh gcc-mkl
+
+benchmark:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 scripts/bench-dsv4-cascade-lake-matrix.sh gcc-mkl
+
+FA-on, ctx=1024, n_predict=192, --numa distribute -t 32 -tb 52
+GCC native baseline: prefill 32.9625 tok/s, decode 2.6297 tok/s, wall 87.2581 s
+GCC + oneMKL:        prefill 32.4363 tok/s, decode 1.5610 tok/s, wall 134.4268 s
+comparison: PASS with exact logprobs
+```
+
+This isolates the MKL/BLAS path as harmful for short DSV4 server generation
+even without changing compiler. Keep no-BLAS GCC as the default.
+
 Clang compiler-only result: `clang-native` gives a prefill gain and exact
 logprob parity, but decode regresses even more than IntelLLVM:
 
