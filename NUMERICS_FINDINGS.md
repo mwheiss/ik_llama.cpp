@@ -2277,3 +2277,49 @@ performance:
 This confirms that Clang can improve prefill while preserving exact FA-on
 logprobs, but the Clang/MKL combination still loses too much decode throughput
 for DSV4 generation. Keep it as a prefill-heavy clue, not as a default build.
+
+## GCC + FlexiBLAS/OpenBLAS preserves exact numerics and improves harness speed
+
+The Cascade Lake matrix tested `gcc-flexiblas-openblas`, configured with GCC 14,
+`GGML_BLAS=ON`, `GGML_BLAS_VENDOR=FlexiBLAS`, and benchmark-time
+`FLEXIBLAS=OPENBLAS-OPENMP` with `OPENBLAS_NUM_THREADS=1`. The build passed
+`test-dsv4-primitives` and the VNNI artifact check.
+
+FA-on harness result against the current GCC native optimized build:
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh gcc-flexiblas-openblas
+
+text/tokens/logprobs:
+  exact match for 180 strict rows
+  max_abs_logprob_diff  = 0.0
+  mean_abs_logprob_diff = 0.0
+
+performance:
+  GCC native baseline:      prefill 32.962534 tok/s, decode 2.629701 tok/s
+  GCC + FlexiBLAS/OpenBLAS: prefill 33.316648 tok/s, decode 2.859382 tok/s
+```
+
+FA-off regression gate:
+
+```text
+command:
+  DSV4_FLASH_MODES=off DSV4_BLAS_THREADS=1 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh gcc-flexiblas-openblas
+
+text/tokens/logprobs:
+  exact match for 180 strict rows
+  max_abs_logprob_diff  = 0.0
+  mean_abs_logprob_diff = 0.0
+
+performance:
+  GCC native baseline:      prefill 31.558419 tok/s, decode 2.193499 tok/s
+  GCC + FlexiBLAS/OpenBLAS: prefill 31.306701 tok/s, decode 2.489078 tok/s
+```
+
+This is the first compiler/library candidate with exact parity and a meaningful
+end-to-end DSV4 harness win. Treat it as promising but not final: repeat with
+BLAS thread sweeps, llama-bench, and possibly direct OpenBLAS linkage before
+making it the default build recommendation.

@@ -389,6 +389,36 @@ comparison: PASS with exact logprobs
 This isolates the MKL/BLAS path as harmful for short DSV4 server generation
 even without changing compiler. Keep no-BLAS GCC as the default.
 
+GCC + FlexiBLAS/OpenBLAS result: `gcc-flexiblas-openblas` is the first BLAS
+candidate that improves the DSV4 server harness while preserving exact logits.
+The build links `/usr/lib64/libflexiblas.so` and the benchmark script sets
+`FLEXIBLAS=OPENBLAS-OPENMP` with `OPENBLAS_NUM_THREADS=1`.
+
+```text
+build:
+  DSV4_CPU_MATRIX_JOBS=104 scripts/build-dsv4-cascade-lake-matrix.sh gcc-flexiblas-openblas
+
+FA-on benchmark:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 scripts/bench-dsv4-cascade-lake-matrix.sh gcc-flexiblas-openblas
+
+FA-on, ctx=1024, n_predict=192, --numa distribute -t 32 -tb 52
+GCC native baseline:      prefill 32.9625 tok/s, decode 2.6297 tok/s, wall 87.2581 s
+GCC + FlexiBLAS/OpenBLAS: prefill 33.3166 tok/s, decode 2.8594 tok/s, wall 81.5600 s
+comparison: PASS with exact logprobs
+
+FA-off regression benchmark:
+  DSV4_FLASH_MODES=off DSV4_BLAS_THREADS=1 scripts/bench-dsv4-cascade-lake-matrix.sh gcc-flexiblas-openblas
+
+FA-off, same prompt/policy
+GCC native baseline:      prefill 31.5584 tok/s, decode 2.1935 tok/s, wall 101.7068 s
+GCC + FlexiBLAS/OpenBLAS: prefill 31.3067 tok/s, decode 2.4891 tok/s, wall 92.1200 s
+comparison: PASS with exact logprobs
+```
+
+This is a promising build-path optimization. Before adopting it as the default,
+repeat with BLAS thread sweeps and llama-bench/prefill-focused runs to confirm
+the win is stable and not only a harness scheduling artifact.
+
 Clang compiler-only result: `clang-native` gives a prefill gain and exact
 logprob parity, but decode regresses even more than IntelLLVM:
 
