@@ -329,6 +329,27 @@ Expected payoff: low-to-medium.
 
 Risk: low if guarded by the VNNI artifact script.
 
+Intel compiler/MKL first result: `icx-mkl` builds and passes
+`test-dsv4-primitives` plus the Cascade Lake VNNI artifact check, but is not a
+good default for the current DSV4 FA-on server path:
+
+```text
+build:
+  DSV4_CPU_MATRIX_JOBS=104 scripts/build-dsv4-cascade-lake-matrix.sh icx-mkl
+
+benchmark:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 scripts/bench-dsv4-cascade-lake-matrix.sh icx-mkl
+
+FA-on, ctx=1024, n_predict=192, --numa distribute -t 32 -tb 52
+GCC native baseline: prefill 32.9625 tok/s, decode 2.6297 tok/s, wall 87.2581 s
+icx + oneMKL:        prefill 32.6452 tok/s, decode 1.5988 tok/s, wall 131.5751 s
+comparison: hard pass, warning band; max_abs=0.014243629, mean_abs=0.000231890
+```
+
+The text/token output matched, but the decode regression is large enough that
+`icx-mkl` should not replace the current GCC native build. Keep testing MKL only
+as a prefill-oriented side path or with different thread/runtime settings.
+
 Status: `Release` already compiles with `-O3 -DNDEBUG`, so there is no separate
 O3-only win to test. A separate GCC LTO build (`GGML_LTO=ON`) passed
 `test-dsv4-primitives` and the Cascade Lake VNNI artifact check, but did not
