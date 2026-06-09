@@ -191,6 +191,91 @@ This says graph construction is not the main optimization target for decode;
 the next useful work should attack compute-heavy projection, attention, MoE,
 or HC helper paths.
 
+Follow-up FA-on no-mmap profiling used Q4_K_M-XL, ctx 1024, fixed 620-token
+prompt, `n_predict=96`, and the best current private-copy NUMA shapes.
+
+Node-local private copy:
+
+```text
+command shape:
+  DSV4_DEBUG_SECTION_TIMING=1 DSV4_DEBUG_DECODE_TIMING=1
+  numactl --physcpubind=0-25 --membind=0 ... --no-mmap -t 26 -tb 26
+
+profile dir:
+  dsv4-cascade-lake-results/profile-node0-no-mmap-fa-on
+
+one-token decode:
+  build 4.58 ms, alloc 8.71 ms, inputs 0.07 ms, compute 323.61 ms
+
+top buckets:
+  ffn_moe_out              13.24 s
+  attn_out                  9.32 s
+  Qcur                      7.71 s
+  dsv4_compressed_attn_out  5.20 s
+  hc_attn_post              3.73 s
+  KVcur                     3.70 s
+  hc_ffn_post               3.60 s
+  hc_attn_pre               3.18 s
+```
+
+All physical cores with one interleaved private copy:
+
+```text
+command shape:
+  DSV4_DEBUG_SECTION_TIMING=1 DSV4_DEBUG_DECODE_TIMING=1
+  numactl --physcpubind=0-51 --interleave=all ... --no-mmap -t 52 -tb 52
+
+profile dir:
+  dsv4-cascade-lake-results/profile-allphys-no-mmap-interleave-fa-on
+
+one-token decode:
+  build 5.01 ms, alloc 8.83 ms, inputs 0.08 ms, compute 434.67 ms
+
+top buckets:
+  ffn_moe_out              11.06 s
+  Qcur                     10.36 s
+  attn_out                 10.22 s
+  hc_attn_post              7.16 s
+  hc_ffn_post               7.02 s
+  dsv4_compressed_attn_out  5.51 s
+  KVcur                     3.77 s
+  hc_attn_pre               3.47 s
+```
+
+The all-core interleaved profile improves the MoE bucket but makes Q projection
+and HC post helpers much worse, and overall one-token compute is slower. This
+matches the runtime result: a single node-local private model copy is better
+for decode-heavy latency than one split private copy across both sockets.
+
+Userspace `perf record -e cycles:u -g` on the node-local no-mmap request
+captured about 111k samples:
+
+```text
+profile dir:
+  dsv4-cascade-lake-results/perf-node0-no-mmap-fa-on
+
+top self samples:
+  gomp_team_barrier_wait_end                 23.88%
+  Q8_0_1_Unpacker mul_mat helper             16.02%
+  ggml_barrier                               11.29%
+  Q4K AVX2 selected-expert/matmul helper      9.05%
+  q8_0_r8_q8_2 helper                         4.86%
+  Q6K AVX2 selected-expert helper             2.66%
+  q8_1_r8_q8_2 helper                         2.38%
+  ggml_compute_forward_flash_attn_ext_f16     2.01%
+  ggml_compute_forward_mul_f32                1.32%
+  ggml_compute_forward_concat                 1.29%
+
+custom DSV4 ops:
+  ggml_compute_forward_dsv4_fp8_kv_quantize   0.72%
+  ggml_compute_forward_dsv4_hc_split_sinkhorn 0.02%
+```
+
+This deprioritizes vectorizing the two retained custom DSV4 ops for the current
+short-context FA-on path. The top code-level targets are selected-expert/IQK
+MoE matmul, ordinary projection matmul, and reducing synchronization around
+small primitive helper nodes, especially HC post helpers.
+
 ### 2. Recover F16/IQK V*KQ for FA-off compressed attention
 
 `NUMERICS_FINDINGS.md` says FA-off currently materializes V as F32 before
