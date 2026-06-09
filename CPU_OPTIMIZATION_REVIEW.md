@@ -291,6 +291,26 @@ Expected payoff: low-to-medium.
 
 Risk: low if guarded by the VNNI artifact script.
 
+Status: `Release` already compiles with `-O3 -DNDEBUG`, so there is no separate
+O3-only win to test. A separate GCC LTO build (`GGML_LTO=ON`) passed
+`test-dsv4-primitives` and the Cascade Lake VNNI artifact check, but did not
+produce a useful speedup:
+
+```text
+FA-off, ctx=1024, n_predict=192, --numa distribute -t 32 -tb 52
+non-LTO: prefill 31.2958 tok/s, decode 2.4976 tok/s, wall 91.8799 s
+LTO:     prefill 31.0562 tok/s, decode 2.5038 tok/s, wall 91.8549 s
+logprobs: exact match
+
+FA-on, same prompt/policy
+non-LTO: prefill 33.1224 tok/s, decode 2.5611 tok/s, wall 89.0002 s
+LTO:     prefill 33.2316 tok/s, decode 2.5584 tok/s, wall 89.0141 s
+logprobs: hard pass, warning band; max_abs=0.011420941, mean_abs=0.000164639
+```
+
+Because total runtime is effectively flat and FA-on no longer has exact logprob
+parity, do not switch the default CPU optimization build to LTO.
+
 ### 8. Runtime repack and row-interleaved packing
 
 ik docs recommend runtime repack where interleaved variants are available, but

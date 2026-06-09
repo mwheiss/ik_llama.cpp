@@ -2122,3 +2122,29 @@ nodes, but matched ik when traced in isolation and when checked via `inp_embd`
 / `hc_residual_init`. Do not use the low-level cchuter stats alone as semantic
 proof. Prefer final logits/logprobs, isolated traces, or a backend-level cchuter
 trace once the diagnostic callback is wired into the exact server graph path.
+
+## GCC LTO is not a clean numerical/performance win
+
+The CPU optimization branch tested a separate Cascade Lake-safe
+`build-cpu-opt-lto` configured with `GGML_LTO=ON`. The build passed
+`test-dsv4-primitives` and the VNNI artifact check. Compared directly against
+the current non-LTO optimized binary at `ctx=1024`, `n_predict=192`,
+`--numa distribute -t 32 -tb 52`:
+
+```text
+FA-off:
+  text/tokens/logprobs: exact match
+  non-LTO: prefill 31.295827 tok/s, decode 2.497610 tok/s, wall 91.879852 s
+  LTO:     prefill 31.056177 tok/s, decode 2.503786 tok/s, wall 91.854940 s
+
+FA-on:
+  text/tokens: match
+  logprobs: hard pass, warning band
+  max_abs_logprob_diff  = 0.011420940984938918
+  mean_abs_logprob_diff = 0.000164639174727855
+  non-LTO: prefill 33.122443 tok/s, decode 2.561118 tok/s, wall 89.000232 s
+  LTO:     prefill 33.231595 tok/s, decode 2.558374 tok/s, wall 89.014126 s
+```
+
+This is not a useful optimization: total wall time is effectively unchanged,
+and FA-on loses exact logprob parity. Keep the non-LTO build as the default.
