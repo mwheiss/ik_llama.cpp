@@ -2380,3 +2380,30 @@ performance:
 This is the current best exact-parity build/library candidate for the DSV4
 server harness. Before adopting it, run BLIS thread sweeps and llama-bench to
 separate real graph speedups from run-to-run or harness scheduling variation.
+
+BLIS thread sweep:
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=2,4,8,16,26,52 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh gcc-blis
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh gcc-blis
+
+text/tokens/logprobs:
+  exact match for every listed run
+
+performance:
+  BLIS threads=1:  prefill 33.125713 tok/s, decode 2.901948 tok/s
+  BLIS threads=2:  prefill 33.156637 tok/s, decode 2.863091 tok/s
+  BLIS threads=4:  prefill 33.114875 tok/s, decode 2.867667 tok/s
+  BLIS threads=8:  prefill 33.190516 tok/s, decode 2.897708 tok/s
+  BLIS threads=16: prefill 33.307238 tok/s, decode 2.877475 tok/s
+  BLIS threads=26: prefill 33.013307 tok/s, decode 2.877904 tok/s
+  BLIS threads=52: prefill 33.187386 tok/s, decode 2.865117 tok/s
+```
+
+The exact-parity result is stable, but the timing differences among BLIS thread
+counts are small and noisy. Use `BLIS_NUM_THREADS=1` as the conservative default
+for this server-generation workload unless a larger prefill-batch benchmark
+shows a repeatable benefit from internal BLIS threading.

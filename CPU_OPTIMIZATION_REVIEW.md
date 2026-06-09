@@ -467,6 +467,30 @@ This is the current best library/build candidate in the matrix. Next steps are
 BLIS thread sweeps, a direct comparison against FlexiBLAS/OpenBLAS variability,
 and llama-bench/prefill-heavy checks.
 
+BLIS thread sweep result: all FA-on runs preserved exact logits, but additional
+BLIS worker threads did not produce a stable improvement over one BLIS thread
+inside the already-threaded server. Best repeated/conservative setting remains
+`BLIS_NUM_THREADS=1`.
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=2,4,8,16,26,52 scripts/bench-dsv4-cascade-lake-matrix.sh gcc-blis
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 scripts/bench-dsv4-cascade-lake-matrix.sh gcc-blis
+
+FA-on, ctx=1024, n_predict=192, --numa distribute -t 32 -tb 52
+BLIS threads=1:  prefill 33.1257 tok/s, decode 2.9019 tok/s, wall 80.7439 s
+BLIS threads=2:  prefill 33.1566 tok/s, decode 2.8631 tok/s, wall 81.5682 s
+BLIS threads=4:  prefill 33.1149 tok/s, decode 2.8677 tok/s, wall 81.4915 s
+BLIS threads=8:  prefill 33.1905 tok/s, decode 2.8977 tok/s, wall 80.7981 s
+BLIS threads=16: prefill 33.3072 tok/s, decode 2.8775 tok/s, wall 81.1694 s
+BLIS threads=26: prefill 33.0133 tok/s, decode 2.8779 tok/s, wall 81.3258 s
+BLIS threads=52: prefill 33.1874 tok/s, decode 2.8651 tok/s, wall 81.5064 s
+comparison: PASS with exact logprobs for all listed runs
+```
+
+This suggests the BLIS win is from the linked BLAS path itself rather than from
+oversubscribing BLAS worker threads on top of ik's OpenMP execution.
+
 Clang compiler-only result: `clang-native` gives a prefill gain and exact
 logprob parity, but decode regresses even more than IntelLLVM:
 
