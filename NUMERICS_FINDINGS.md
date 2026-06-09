@@ -2149,6 +2149,12 @@ FA-on:
 This is not a useful optimization: total wall time is effectively unchanged,
 and FA-on loses exact logprob parity. Keep the non-LTO build as the default.
 
+The later Cascade Lake matrix run confirmed this with `gcc-lto`: FA-on matched
+text/tokens but stayed in the warning band (`max_abs=0.011420941`,
+`mean_abs=0.000164639`) and was slower overall than the cached GCC native
+baseline (88.192466 s vs 87.258077 s). Do not prioritize LTO again unless a
+different compiler or a much larger prefill-heavy workload changes the profile.
+
 ## Intel icx + oneMKL is slower and moves FA-on logprobs into warning band
 
 The Cascade Lake matrix tested `icx-mkl`, configured with IntelLLVM 2026,

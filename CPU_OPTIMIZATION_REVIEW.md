@@ -506,6 +506,11 @@ logprobs: hard pass, warning band; max_abs=0.011420941, mean_abs=0.000164639
 Because total runtime is effectively flat and FA-on no longer has exact logprob
 parity, do not switch the default CPU optimization build to LTO.
 
+Current matrix confirmation (`gcc-lto`) reached the same conclusion: FA-on
+passed only with warning-band logprob drift (`max_abs=0.011420941`,
+`mean_abs=0.000164639`) and was slower overall than the cached GCC native
+baseline (88.1925 s vs 87.2581 s) despite slightly higher prefill throughput.
+
 Clang/ICX comparison is now runnable after installing Clang/libomp and Intel
 oneAPI. Use the Cascade Lake matrix scripts above to build and benchmark
 `clang-native`, `icx-native`, `icx-mkl`, `gcc-mkl`, `clang-mkl`, and related
