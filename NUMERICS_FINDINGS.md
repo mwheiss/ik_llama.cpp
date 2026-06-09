@@ -2178,3 +2178,27 @@ performance:
 This is not a viable default for DSV4 generation. The result is consistent with
 BLAS/Intel runtime not helping the one-token decode-heavy path, and in this
 case substantially hurting it.
+
+The same FA-on result reproduced without MKL in the `icx-native` build:
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh icx-native
+
+text/tokens:
+  matched for 180 strict rows
+
+logprobs:
+  hard pass, warning band
+  max_abs_logprob_diff  = 0.014243629489883142
+  mean_abs_logprob_diff = 0.00023188951565778954
+
+performance:
+  GCC native baseline: prefill 32.962534 tok/s, decode 2.629701 tok/s
+  icx native:          prefill 33.090374 tok/s, decode 1.596346 tok/s
+```
+
+So the current IntelLLVM/OpenMP path is not just failing to benefit from MKL;
+it independently hurts DSV4 decode throughput and shifts FA-on logprobs into
+the warning band.
