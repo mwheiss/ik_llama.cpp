@@ -55,6 +55,7 @@ lcov-report/
 /rpc-server
 /out/
 /tmp/
+/dsv4-cascade-lake-results/
 /autogen-*.md
 /common/build-info.cpp
 

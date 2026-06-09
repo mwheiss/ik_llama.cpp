@@ -32,6 +32,36 @@ python3 scripts/engine_test_harness.py --ctx-size 1024 --n-predict 192 --filler-
 
 The second command reuses the cached baseline and runs only `build-cpu-opt`.
 
+The Cascade Lake compiler/BLAS matrix is automated by:
+
+```bash
+scripts/build-dsv4-cascade-lake-matrix.sh [case ...]
+scripts/bench-dsv4-cascade-lake-matrix.sh [case ...]
+```
+
+The build script encodes the safe Cascade Lake target envelope
+(`-march=cascadelake`, AVX-512/VNNI on, BF16/VBMI/FP16-native/AMX off), builds
+`llama-server`, `llama-bench`, and `test-dsv4-primitives`, runs the primitive
+test, verifies VNNI artifacts, and records CMake/ldd/version output under
+`dsv4-cascade-lake-results/`. The benchmark script compares each candidate
+against `build-cpu-opt` through the deterministic engine harness. FA-on is the
+primary/default benchmark mode (`DSV4_FLASH_MODES=on,off`) because it is the
+expected performance path for DSV4; FA-off remains in the default sequence as a
+numerics and stability regression gate. Optional `llama-bench` PP/TG shapes via
+`DSV4_RUN_LLAMA_BENCH=1`.
+
+Verified local toolchain/library stack after installation:
+
+```text
+GCC 14.3.1
+Intel oneAPI DPC++/C++ Compiler 2026.0.0: icx/icpx
+Clang 21.1.8 with libomp
+oneMKL 2026.0, MKLROOT=/opt/intel/oneapi/mkl/2026.0
+OpenBLAS 0.3.29 via FlexiBLAS OPENBLAS-OPENMP
+BLIS 2.0 OpenMP
+numactl, ninja, objdump
+```
+
 ## Current Baseline
 
 Short cached-baseline smoke, flash attention off:
@@ -319,10 +349,10 @@ logprobs: hard pass, warning band; max_abs=0.011420941, mean_abs=0.000164639
 Because total runtime is effectively flat and FA-on no longer has exact logprob
 parity, do not switch the default CPU optimization build to LTO.
 
-Clang/ICX comparison is not currently runnable on this host: only GCC 14.3.1 is
-available (`cc`/`c++`), and no `clang`, versioned `clang-*`, `icx`, or `icpx`
-binaries were found. Revisit compiler comparison only after a second compiler is
-installed.
+Clang/ICX comparison is now runnable after installing Clang/libomp and Intel
+oneAPI. Use the Cascade Lake matrix scripts above to build and benchmark
+`clang-native`, `icx-native`, `icx-mkl`, `gcc-mkl`, `clang-mkl`, and related
+BLAS variants before changing the default build recipe.
 
 ### 8. Runtime repack and row-interleaved packing
 
