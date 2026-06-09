@@ -184,6 +184,14 @@ with direct `ggml_mul_mat(v_attn, kq)` behind
 and slowed decode to `0.364 tok/s`. Keep the decomposition until the underlying
 4D F32/F32 matmul path is debugged with a focused regression test.
 
+Status: not currently actionable as a graph-level optimization. Multiple retry
+experiments in `NUMERICS_FINDINGS.md` show that cchuter-style F16 V input
+causes immediate text divergence or NaNs in ik's FA-off DSV4 path, including
+after the HC weighted-sum layout fix. Narrowly bypassing the IQK KQV path made
+the long-cache repro finite but was slower and did not recover parity. Keep the
+F32 V materialization guard until the underlying F16/IQK `V * softmax(KQ)`
+kernel issue has a focused low-level fix and regression test.
+
 ### 3. Check whether upstream AVX-512 Q4/Q5 IQK GEMM improvements are already present
 
 Upstream commit `6d4cdef5` targets Q4_K/Q5_K prompt processing. Q4_K_M-XL uses
