@@ -419,6 +419,35 @@ This is a promising build-path optimization. Before adopting it as the default,
 repeat with BLAS thread sweeps and llama-bench/prefill-focused runs to confirm
 the win is stable and not only a harness scheduling artifact.
 
+GCC + BLIS result: `gcc-blis` is slightly faster than the FlexiBLAS/OpenBLAS
+candidate in this harness, again with exact logits. The build links directly to
+`/usr/lib64/libblis.so`.
+
+```text
+build:
+  DSV4_CPU_MATRIX_JOBS=104 scripts/build-dsv4-cascade-lake-matrix.sh gcc-blis
+
+FA-on benchmark:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 scripts/bench-dsv4-cascade-lake-matrix.sh gcc-blis
+
+FA-on, ctx=1024, n_predict=192, --numa distribute -t 32 -tb 52
+GCC native baseline: prefill 32.9625 tok/s, decode 2.6297 tok/s, wall 87.2581 s
+GCC + BLIS:          prefill 33.5682 tok/s, decode 2.8750 tok/s, wall 81.0777 s
+comparison: PASS with exact logprobs
+
+FA-off regression benchmark:
+  DSV4_FLASH_MODES=off DSV4_BLAS_THREADS=1 scripts/bench-dsv4-cascade-lake-matrix.sh gcc-blis
+
+FA-off, same prompt/policy
+GCC native baseline: prefill 31.5584 tok/s, decode 2.1935 tok/s, wall 101.7068 s
+GCC + BLIS:          prefill 31.8438 tok/s, decode 2.5354 tok/s, wall 90.4640 s
+comparison: PASS with exact logprobs
+```
+
+This is the current best library/build candidate in the matrix. Next steps are
+BLIS thread sweeps, a direct comparison against FlexiBLAS/OpenBLAS variability,
+and llama-bench/prefill-heavy checks.
+
 Clang compiler-only result: `clang-native` gives a prefill gain and exact
 logprob parity, but decode regresses even more than IntelLLVM:
 

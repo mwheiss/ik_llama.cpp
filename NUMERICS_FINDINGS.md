@@ -2323,3 +2323,48 @@ This is the first compiler/library candidate with exact parity and a meaningful
 end-to-end DSV4 harness win. Treat it as promising but not final: repeat with
 BLAS thread sweeps, llama-bench, and possibly direct OpenBLAS linkage before
 making it the default build recommendation.
+
+## GCC + BLIS is the current best exact-parity BLAS candidate
+
+The Cascade Lake matrix tested `gcc-blis`, configured with GCC 14,
+`GGML_BLAS=ON`, `GGML_BLAS_VENDOR=FLAME`, `BLAS_INCLUDE_DIRS=/usr/include/blis`,
+and `BLAS_LIBRARIES=/usr/lib64/libblis.so`. The build passed
+`test-dsv4-primitives` and the VNNI artifact check.
+
+FA-on harness result against the current GCC native optimized build:
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh gcc-blis
+
+text/tokens/logprobs:
+  exact match for 180 strict rows
+  max_abs_logprob_diff  = 0.0
+  mean_abs_logprob_diff = 0.0
+
+performance:
+  GCC native baseline: prefill 32.962534 tok/s, decode 2.629701 tok/s
+  GCC + BLIS:          prefill 33.568158 tok/s, decode 2.875040 tok/s
+```
+
+FA-off regression gate:
+
+```text
+command:
+  DSV4_FLASH_MODES=off DSV4_BLAS_THREADS=1 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh gcc-blis
+
+text/tokens/logprobs:
+  exact match for 180 strict rows
+  max_abs_logprob_diff  = 0.0
+  mean_abs_logprob_diff = 0.0
+
+performance:
+  GCC native baseline: prefill 31.558419 tok/s, decode 2.193499 tok/s
+  GCC + BLIS:          prefill 31.843766 tok/s, decode 2.535428 tok/s
+```
+
+This is the current best exact-parity build/library candidate for the DSV4
+server harness. Before adopting it, run BLIS thread sweeps and llama-bench to
+separate real graph speedups from run-to-run or harness scheduling variation.
