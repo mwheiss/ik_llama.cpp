@@ -2408,6 +2408,19 @@ counts are small and noisy. Use `BLIS_NUM_THREADS=1` as the conservative default
 for this server-generation workload unless a larger prefill-batch benchmark
 shows a repeatable benefit from internal BLIS threading.
 
+A quick sequential `llama-bench` check with FA-on, `-t 52 -tgb 52`,
+`-p 512 -n 128 -r 1`, and CPU-only `-ngl 0` did not reproduce the server-harness
+BLIS speedup:
+
+```text
+baseline: pp512 46.09 tok/s, tg128 3.21 tok/s
+BLIS:     pp512 45.76 tok/s, tg128 3.19 tok/s
+```
+
+So BLIS remains numerically safe and useful in the server harness, but it should
+not yet be treated as a universal throughput improvement across every benchmark
+shape.
+
 FlexiBLAS/OpenBLAS thread sweep:
 
 ```text

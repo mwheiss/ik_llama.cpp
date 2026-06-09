@@ -491,6 +491,25 @@ comparison: PASS with exact logprobs for all listed runs
 This suggests the BLIS win is from the linked BLAS path itself rather than from
 oversubscribing BLAS worker threads on top of ik's OpenMP execution.
 
+Quick `llama-bench` check: a single-repetition FA-on mixed shape did not
+reproduce the server-harness BLIS win. This makes BLIS a promising
+`llama-server` path for the deterministic harness, not yet a universal
+throughput win:
+
+```text
+command, baseline:
+  numactl --interleave=all build-cpu-opt/bin/llama-bench ... -ngl 0 -fa 1 --numa distribute -t 52 -tgb 52 -p 512 -n 128 -r 1
+
+command, BLIS:
+  BLIS_NUM_THREADS=1 numactl --interleave=all build-cpu-gcc-blis/bin/llama-bench ... -ngl 0 -fa 1 --numa distribute -t 52 -tgb 52 -p 512 -n 128 -r 1
+
+baseline: pp512 46.09 tok/s, tg128 3.21 tok/s
+BLIS:     pp512 45.76 tok/s, tg128 3.19 tok/s
+```
+
+Keep the engine harness as the primary optimization gate for generation, and
+use llama-bench as a secondary workload-specific sanity check.
+
 FlexiBLAS/OpenBLAS thread sweep result: exact parity also held for all tested
 thread counts. Performance is competitive with BLIS but similarly noisy, and the
 best single high-thread result did not repeat.
