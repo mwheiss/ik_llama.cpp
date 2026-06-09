@@ -2202,3 +2202,22 @@ performance:
 So the current IntelLLVM/OpenMP path is not just failing to benefit from MKL;
 it independently hurts DSV4 decode throughput and shifts FA-on logprobs into
 the warning band.
+
+The `clang-native` build behaves differently: it has exact FA-on logprob parity
+with the GCC baseline and improves prefill, but still loses badly on decode.
+
+```text
+command:
+  DSV4_FLASH_MODES=on DSV4_BLAS_THREADS=1 \
+    scripts/bench-dsv4-cascade-lake-matrix.sh clang-native
+
+text/tokens/logprobs:
+  exact match for 180 strict rows
+
+performance:
+  GCC native baseline: prefill 32.962534 tok/s, decode 2.629701 tok/s
+  Clang native:        prefill 34.501413 tok/s, decode 1.538290 tok/s
+```
+
+Treat Clang as a possible prefill-heavy build candidate only. It is not suitable
+as the default DSV4 generation compiler without a decode-specific fix.
