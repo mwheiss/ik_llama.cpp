@@ -644,6 +644,27 @@ With DSV4 graph reuse disabled:
 - Q8 forced q8_0 KV reaches the same true decode boundary and still logs the
   forced-F16 warning.
 
+### Multi-slot server batching is not yet a valid DSV4 performance baseline
+
+During the NUMA/load-balancing optimization work, a single `llama-server` was
+tested with `-np 2`, flash attention on, and two concurrent harness requests.
+This is the obvious comparison for two separate node-local servers, but the
+current DSV4 graph did not handle it correctly:
+
+```text
+command shape:
+  build-cpu-opt/bin/llama-server ... --numa distribute -t 52 -tb 52 -np 2
+
+observed:
+  one request disconnected,
+  the other generated junk text ("1"),
+  the server aborted in build_deepseek4.
+```
+
+Treat `-np > 1` / multi-slot continuous batching as a correctness item before
+using it as a performance reference. For now, two separate single-slot
+node-local servers are the stable way to evaluate concurrent DSV4 serving.
+
 ## Early decode positions use raw/SWA attention before compressed rows exist
 
 ### Finding

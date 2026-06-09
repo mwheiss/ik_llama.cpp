@@ -319,6 +319,108 @@ also slower and drifts more, so the useful NUMA direction is likely balanced
 page/thread placement across sockets rather than forcing this model onto one
 socket.
 
+Follow-up FA-on sweep, using the current optimized binary against itself and
+the cached canonical baseline (`--numa distribute -t 32 -tb 52`), shows that
+NUMA/thread placement is workload-sensitive and should be measured with the
+serving shape:
+
+```text
+command:
+  DSV4_SWEEP_FLASH_MODES=on scripts/sweep-dsv4-cpu-opt.sh 1024 192 0
+
+cached baseline distribute -t 32 -tb 52:
+  prefill 32.96 tok/s, decode 2.63 tok/s, wall 87.26 s
+
+same-binary candidates:
+  control distribute -t 32 -tb 52:
+    exact, prefill 33.10 tok/s, decode 2.59 tok/s, wall 88.15 s
+  distribute -t 52 -tb 52:
+    exact, prefill 33.09 tok/s, decode 2.70 tok/s, wall 85.44 s
+  distribute -t 104 -tb 104:
+    warning drift, prefill 28.62 tok/s, decode 2.14 tok/s, wall 105.65 s
+  isolate -t 52 -tb 52:
+    exact, prefill 28.73 tok/s, decode 3.07 tok/s, wall 80.13 s
+  numactl --interleave=all -t 52 -tb 52:
+    exact, prefill 33.17 tok/s, decode 2.71 tok/s, wall 84.99 s
+  numactl --physcpubind=0-51 --interleave=all -t 52 -tb 52:
+    exact, prefill 34.01 tok/s, decode 2.77 tok/s, wall 83.32 s
+  numactl --physcpubind=0-25 --membind=0 -t 26 -tb 26:
+    warning drift, prefill 28.20 tok/s, decode 2.29 tok/s, wall 100.75 s
+  numactl --cpunodebind=0 --membind=0 -t 52 -tb 52:
+    exact, prefill 26.94 tok/s, decode 2.17 tok/s, wall 105.80 s
+```
+
+The single best `--numa isolate` result did not repeat on an immediate follow-up
+run (`wall 105.24 s`, exact logits), so do not switch the single-server default
+to `--numa isolate` without more repetitions. The best stable-looking
+single-server placement from this sweep is physical cores across both sockets
+with interleaved memory:
+
+```text
+numactl --physcpubind=0-51 --interleave=all ... -t 52 -tb 52
+```
+
+The earlier one-node numbers above used mmap and therefore were not a clean
+locality test. A single private node-local run with `--no-mmap` is the fastest
+per-request topology measured so far:
+
+```text
+command:
+  numactl --physcpubind=0-25 --membind=0 \
+    build-cpu-opt/bin/llama-server ... --numa numactl --no-mmap -t 26 -tb 26
+
+result:
+  prefill 31.59 tok/s, decode 3.78 tok/s, wall 67.21 s
+  peak RSS: about 167.5 GiB
+```
+
+`numastat -p` confirmed that the single private model copy was almost entirely
+on node 0. This explains the apparent contradiction: a single node-local
+instance with mmap was slower, but a single node-local instance with a private
+node-local model copy is faster than the cached cross-socket baseline for this
+decode-heavy request.
+
+Two-instance load balancing is still promising for aggregate throughput. A
+dedicated smoke now launches one server per socket and fires two requests
+concurrently:
+
+```text
+command:
+  scripts/bench-dsv4-two-node-servers.py \
+    --no-mmap \
+    --out dsv4-cascade-lake-results/two-node-no-mmap-fa-on \
+    --ctx-size 1024 --n-predict 192 --filler-lines 0
+
+result:
+  node0 private copy: prefill 30.67 tok/s, decode 3.73 tok/s, wall 68.50 s
+  node1 private copy: prefill 30.07 tok/s, decode 3.55 tok/s, wall 71.33 s
+  aggregate generated tokens / total wall: 5.05 tok/s
+  aggregate decode-only after first token: 7.10 tok/s
+  peak RSS: about 167.5 GiB per process
+```
+
+This means each private node-local instance is individually faster end-to-end
+than the cached single-server baseline for this request, despite slower prefill,
+because decode is materially faster. The single-server no-mmap run above is
+slightly faster than either instance in the concurrent pair, so the two-instance
+setup should be viewed as a throughput/load-balancing topology rather than a
+per-request latency improvement. `numastat -p` confirmed that `--no-mmap` placed
+the two private model copies almost entirely on their intended sockets. This is
+reasonable when memory capacity allows two full model copies and requests can be
+load-balanced across instances.
+
+The mmap/shared-page-cache two-instance variant is much more memory-efficient
+but was slower. Both requests completed, but `numastat -p` showed that most
+model pages for both processes landed on node 1, so the node0 process read
+mostly remote memory. Corrected metrics for that run were about `4.22 tok/s`
+aggregate decode-only and `3.34 tok/s` generated tokens per total wall. So mmap
+can hurt this specific two-instance NUMA-local strategy.
+
+The simpler one-server `-np 2` comparison is not a valid performance baseline
+yet: it produced junk for one request and aborted in `build_deepseek4`. Treat
+multi-slot concurrent batching as a separate correctness item before comparing
+it against two node-local processes.
+
 ### 7. Build-flag experiments
 
 Current `build-cpu-opt` keeps the Cascade Lake-safe flags:
