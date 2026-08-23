@@ -2828,12 +2828,28 @@ void server_context::process_single_task(server_task&& task) {
         }
 
 #ifdef GGML_USE_CUDA
-        if (
-            params_base.n_parallel == 1 &&
-            json_value(task.data, "clear_cuda_graph_cache", false)
-        ) {
+        const bool clear_cuda_graph_cache_present =
+            task.data.contains("clear_cuda_graph_cache");
+        const bool clear_cuda_graph_cache_requested =
+            json_value(task.data, "clear_cuda_graph_cache", false);
+        const bool clear_cuda_graph_cache_eligible =
+            params_base.n_parallel == 1 && clear_cuda_graph_cache_requested;
+        LOG_INFO("CUDA_GRAPH_CACHE_DIAG request", {
+            {"id_task", task.id},
+            {"flag_present", clear_cuda_graph_cache_present},
+            {"requested", clear_cuda_graph_cache_requested},
+            {"n_parallel", params_base.n_parallel},
+            {"clear_attempted", clear_cuda_graph_cache_eligible},
+        });
+        if (clear_cuda_graph_cache_eligible) {
             llama_synchronize(ctx);
-            ggml_backend_cuda_clear_graph_cache(model);
+            ggml_backend_cuda_clear_graph_cache(ctx);
+            if (llama_context * companion_ctx =
+                    common_speculative_get_companion_ctx(slot->spec);
+                companion_ctx != nullptr && companion_ctx != ctx) {
+                llama_synchronize(companion_ctx);
+                ggml_backend_cuda_clear_graph_cache(companion_ctx);
+            }
         }
 #endif
 

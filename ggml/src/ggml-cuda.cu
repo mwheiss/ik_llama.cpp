@@ -539,9 +539,18 @@ extern "C" void ggml_backend_cuda_clear_graph_cache(const void * model) {
     auto & info = const_cast<ggml_cuda_device_info &>(ggml_cuda_info());
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter == 0; });
+    size_t context_count = 0;
+    size_t graph_count = 0;
     if (auto it = info.all_ctx.find(model); it != info.all_ctx.end()) {
         for (auto ctx : it->second) {
             if (ctx) {
+                ++context_count;
+                ggml_cuda_set_device(ctx->device);
+                size_t free_before = 0;
+                size_t total_before = 0;
+                CUDA_CHECK(cudaMemGetInfo(&free_before, &total_before));
+                const size_t graphs_before = ctx->cuda_graphs.size();
+                graph_count += graphs_before;
                 for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
                     for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
                         if (ctx->streams[device][stream] != nullptr) {
@@ -552,10 +561,38 @@ extern "C" void ggml_backend_cuda_clear_graph_cache(const void * model) {
                 }
                 ctx->cur_graph = nullptr;
                 ctx->cuda_graphs.clear();
+                ggml_cuda_set_device(ctx->device);
+                size_t free_after = 0;
+                size_t total_after = 0;
+                CUDA_CHECK(cudaMemGetInfo(&free_after, &total_after));
+                GGML_CUDA_LOG_INFO(
+                    "CUDA_GRAPH_CACHE_DIAG clear model=%p device=%d "
+                    "graphs_before=%zu graphs_after=%zu free_before=%zu "
+                    "free_after=%zu free_delta=%lld total_before=%zu "
+                    "total_after=%zu\n",
+                    model,
+                    ctx->device,
+                    graphs_before,
+                    ctx->cuda_graphs.size(),
+                    free_before,
+                    free_after,
+                    static_cast<long long>(free_after) -
+                        static_cast<long long>(free_before),
+                    total_before,
+                    total_after);
             }
         }
     }
+    GGML_CUDA_LOG_INFO(
+        "CUDA_GRAPH_CACHE_DIAG clear_complete model=%p contexts=%zu "
+        "graphs_before=%zu\n",
+        model,
+        context_count,
+        graph_count);
 #else
+    GGML_CUDA_LOG_INFO(
+        "CUDA_GRAPH_CACHE_DIAG clear_ignored model=%p reason=graphs_disabled\n",
+        model);
     GGML_UNUSED(model);
 #endif
 }
