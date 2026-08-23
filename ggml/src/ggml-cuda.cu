@@ -538,6 +538,32 @@ static std::condition_variable ggml_cuda_lock_cv;
 //static std::atomic<int> ggml_cuda_lock_counter;
 static int ggml_cuda_lock_counter = 0;
 
+extern "C" void ggml_backend_cuda_clear_graph_cache(const void * context_key) {
+#ifdef USE_CUDA_GRAPH
+    auto & info = const_cast<ggml_cuda_device_info &>(ggml_cuda_info());
+    std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+    ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter == 0; });
+    if (auto it = info.all_ctx.find(context_key); it != info.all_ctx.end()) {
+        for (auto ctx : it->second) {
+            if (ctx) {
+                for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+                    for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+                        if (ctx->streams[device][stream] != nullptr) {
+                            ggml_cuda_set_device(device);
+                            CUDA_CHECK(cudaStreamSynchronize(ctx->streams[device][stream]));
+                        }
+                    }
+                }
+                ctx->cur_graph = nullptr;
+                ctx->cuda_graphs.clear();
+            }
+        }
+    }
+#else
+    GGML_UNUSED(context_key);
+#endif
+}
+
 ggml_backend_cuda_context::ggml_backend_cuda_context(int device, const void * model) :
     device(device), name(GGML_CUDA_NAME + std::to_string(device)), model(model) {
     auto info = const_cast<ggml_cuda_device_info*>(&ggml_cuda_info());

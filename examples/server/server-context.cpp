@@ -13,6 +13,10 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <fstream>
 #include <iostream>
 #include <regex>
@@ -2830,6 +2834,22 @@ void server_context::process_single_task(server_task&& task) {
             queue_tasks.defer(std::move(task));
             break;
         }
+
+#ifdef GGML_USE_CUDA
+        if (
+            params_base.n_parallel == 1 &&
+            json_value(task.data, "clear_cuda_graph_cache", false)
+        ) {
+            llama_synchronize(ctx);
+            ggml_backend_cuda_clear_graph_cache(ctx);
+            if (llama_context * companion_ctx =
+                    common_speculative_get_companion_ctx(slot->spec);
+                companion_ctx != nullptr && companion_ctx != ctx) {
+                llama_synchronize(companion_ctx);
+                ggml_backend_cuda_clear_graph_cache(companion_ctx);
+            }
+        }
+#endif
 
         if (task.data.contains("system_prompt")) {
             std::string sys_prompt = json_value(task.data, "system_prompt", std::string());
