@@ -1,0 +1,4 @@
+interface:
+  display_name: "ik_llama CUDA Refresh"
+  short_description: "Refresh, preserve CUDA cleanup, and build"
+  default_prompt: "Use $ik-llama-cuda-refresh to update ik_llama.cpp, preserve the CUDA graph cleanup API when needed, and rebuild it."
