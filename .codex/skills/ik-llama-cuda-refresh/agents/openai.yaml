@@ -1,0 +1,4 @@
+interface:
+  display_name: "ik_llama CUDA Refresh"
+  short_description: "Refresh, replay local patches, and build"
+  default_prompt: "Use $ik-llama-cuda-refresh to update ik_llama.cpp, retain manual CUDA graph cleanup alongside optional cache limits unless upstream supplies equivalent on-demand cleanup, replay the runtime RoPE frequency-scale override only while it remains clean, and rebuild it."
