@@ -2,9 +2,9 @@
 	import { defineMeta } from '@storybook/addon-svelte-csf';
 	import ChatScreenForm from '$lib/components/app/chat/ChatScreen/ChatScreenForm.svelte';
 	import { expect } from 'storybook/test';
-	import jpgAsset from './fixtures/assets/1.jpg?url';
+	import imageAsset from './fixtures/assets/beautiful-flowers-lotus.webp?url';
 	import svgAsset from './fixtures/assets/hf-logo.svg?url';
-	import pdfAsset from './fixtures/assets/example.pdf?raw';
+	import { PDF_FIXTURE } from './fixtures/minimal-pdf';
 
 	const { Story } = defineMeta({
 		title: 'Components/ChatScreen/ChatScreenForm',
@@ -17,11 +17,11 @@
 	let fileAttachments = $state([
 		{
 			id: '1',
-			name: '1.jpg',
-			type: 'image/jpeg',
+			name: 'flowers.webp',
+			type: 'image/webp',
 			size: 44891,
-			preview: jpgAsset,
-			file: new File([''], '1.jpg', { type: 'image/jpeg' })
+			preview: imageAsset,
+			file: new File([''], 'flowers.webp', { type: 'image/webp' })
 		},
 		{
 			id: '2',
@@ -36,7 +36,7 @@
 			name: 'example.pdf',
 			type: 'application/pdf',
 			size: 351048,
-			file: new File([pdfAsset], 'example.pdf', { type: 'application/pdf' })
+			file: new File([PDF_FIXTURE], 'example.pdf', { type: 'application/pdf' })
 		}
 	]);
 </script>
@@ -75,14 +75,14 @@
 		uploadedFiles: fileAttachments
 	}}
 	play={async ({ canvas }) => {
-		const jpgAttachment = canvas.getByAltText('1.jpg');
+		const imageAttachment = canvas.getByAltText('flowers.webp');
 		const svgAttachment = canvas.getByAltText('hf-logo.svg');
 		const pdfFileExtension = canvas.getByText('PDF');
 		const pdfAttachment = canvas.getByText('example.pdf');
 		const pdfSize = canvas.getByText('342.82 KB');
 
-		await expect(jpgAttachment).toBeInTheDocument();
-		await expect(jpgAttachment).toHaveAttribute('src', jpgAsset);
+		await expect(imageAttachment).toBeInTheDocument();
+		await expect(imageAttachment).toHaveAttribute('src', imageAsset);
 
 		await expect(svgAttachment).toBeInTheDocument();
 		await expect(svgAttachment).toHaveAttribute('src', svgAsset);

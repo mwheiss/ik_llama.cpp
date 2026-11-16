@@ -57,6 +57,10 @@ export default defineConfig({
 				extends: './vite.config.ts',
 				test: {
 					name: 'ui',
+					// Avoid competing browser-global stores and simultaneous cold document renders.
+					fileParallelism: false,
+					// The full KaTeX document story needs more than the inherited 15 s budget.
+					testTimeout: 30000,
 					environment: 'browser',
 					browser: {
 						enabled: true,
