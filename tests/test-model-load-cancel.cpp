@@ -15,13 +15,18 @@ int main(int argc, char *argv[] ) {
     fclose(file);
 
     llama_backend_init();
-    auto params = llama_model_params{};
+    auto params = llama_model_default_params();
+    params.n_gpu_layers = 0;
     params.use_mmap = false;
-    params.progress_callback = [](float progress, void * ctx){
-        (void) ctx;
-        return progress > 0.50;
+    bool cancellation_requested = false;
+    params.progress_callback_user_data = &cancellation_requested;
+    params.progress_callback = [](float, void * ctx) {
+        *static_cast<bool *>(ctx) = true;
+        return false;
     };
     auto * model = llama_model_load_from_file(model_path, params);
+    const bool cancelled = model == nullptr && cancellation_requested;
+    llama_free_model(model);
     llama_backend_free();
-    return model == nullptr ? EXIT_SUCCESS : EXIT_FAILURE;
+    return cancelled ? EXIT_SUCCESS : EXIT_FAILURE;
 }

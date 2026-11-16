@@ -1790,24 +1790,18 @@ int main(int argc, char ** argv) {
         const std::vector<json> body = json::parse(req.body);
         int max_idx = ctx_server.lora_adapters.size();
 
-        // clear existing value
-        for (auto & la : ctx_server.lora_adapters) {
-            la.scale = 0.0f;
-        }
-
-        // set value
+        // Validate here; apply the snapshot on the inference thread once all slots are idle.
         for (auto entry : body) {
             int id      = entry.at("id");
-            float scale = entry.at("scale");
-            if (0 <= id && id < max_idx) {
-                ctx_server.lora_adapters[id].scale = scale;
-            } else {
+            (void) entry.at("scale").get<float>();
+            if (id < 0 || id >= max_idx) {
                 throw std::runtime_error("invalid adapter id");
             }
         }
 
         server_task task;
         task.type = SERVER_TASK_TYPE_SET_LORA;
+        task.data = body;
         const int id_task = ctx_server.queue_tasks.post(std::move(task));
         ctx_server.queue_results.add_waiting_task_id(id_task);
 

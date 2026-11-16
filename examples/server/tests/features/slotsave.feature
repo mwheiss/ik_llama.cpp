@@ -19,14 +19,16 @@ Feature: llama.cpp server slot management
     Given a user prompt "What is the capital of France?"
     And   using slot id 1
     And   a completion request with no api error
-    Then  24 tokens are predicted matching (Lily|cake)
+    Then  24 tokens are predicted
+    And   the completion is recorded as france
     And   22 prompt tokens are processed
     When  the slot 1 is saved with filename "slot1.bin"
     Then  the server responds with status code 200
     # Since we have cache, this should only process the last tokens
     Given a user prompt "What is the capital of Germany?"
     And   a completion request with no api error
-    Then  24 tokens are predicted matching (Thank|special)
+    Then  24 tokens are predicted
+    And   the completion is recorded as germany
     And   7 prompt tokens are processed
     # Loading the original cache into slot 0,
     # we should only be processing 1 prompt token and get the same output
@@ -35,24 +37,28 @@ Feature: llama.cpp server slot management
     Given a user prompt "What is the capital of France?"
     And   using slot id 0
     And   a completion request with no api error
-    Then  24 tokens are predicted matching (Lily|cake)
+    Then  24 tokens are predicted
+    And   the completion equals france
     And   1 prompt tokens are processed
     # For verification that slot 1 was not corrupted during slot 0 load, same thing
     Given a user prompt "What is the capital of Germany?"
     And   using slot id 1
     And   a completion request with no api error
-    Then  24 tokens are predicted matching (Thank|special)
+    Then  24 tokens are predicted
+    And   the completion equals germany
     And   1 prompt tokens are processed
 
   Scenario: Erase Slot
     Given a user prompt "What is the capital of France?"
     And   using slot id 1
     And   a completion request with no api error
-    Then  24 tokens are predicted matching (Lily|cake)
+    Then  24 tokens are predicted
+    And   the completion is recorded as france
     And   22 prompt tokens are processed
     When  the slot 1 is erased
     Then  the server responds with status code 200
     Given a user prompt "What is the capital of France?"
     And   a completion request with no api error
-    Then  24 tokens are predicted matching (Lily|cake)
+    Then  24 tokens are predicted
+    And   the completion equals france
     And   22 prompt tokens are processed

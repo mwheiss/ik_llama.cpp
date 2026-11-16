@@ -29,16 +29,17 @@ Feature: llama.cpp server
     Given a prompt <prompt>
     And   <n_predict> max tokens to predict
     And   a completion request with no api error
-    Then  <n_predicted> tokens are predicted matching <re_content>
+    Then  <n_predicted> tokens are predicted
     And   the completion is <truncated> truncated
     And   <n_prompt> prompt tokens are processed
     And   prometheus metrics are exposed
     And   metric llamacpp:tokens_predicted is <n_predicted>
+    And   the completion matches its fixed-seed replay
 
     Examples: Prompts
-      | prompt                                                                    | n_predict | re_content                                  | n_prompt | n_predicted | truncated |
-      | I believe the meaning of life is                                          | 8         | (read\|going)+                              | 18       | 8           | not       |
-      | Write a joke about AI from a very long prompt which will not be truncated | 256       | (princesses\|everyone\|kids\|Anna\|forest)+ | 46       | 64          | not       |
+      | prompt                                                                    | n_predict | n_prompt | n_predicted | truncated |
+      | I believe the meaning of life is                                          | 8         | 18       | 8           | not       |
+      | Write a joke about AI from a very long prompt which will not be truncated | 256       | 46       | 64          | not       |
 
   Scenario: Completion prompt truncated
     Given a prompt:
@@ -49,9 +50,10 @@ Feature: llama.cpp server
     Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
     """
     And   a completion request with no api error
-    Then  64 tokens are predicted matching fun|Annaks|popcorns|pictry|bowl
+    Then  64 tokens are predicted
+    And   the completion matches its fixed-seed replay
     And   the completion is  truncated
-    And   109 prompt tokens are processed
+    And   112 prompt tokens are processed
 
 
   Scenario Outline: OAI Compatibility
@@ -61,14 +63,15 @@ Feature: llama.cpp server
     And   <max_tokens> max tokens to predict
     And   streaming is <enable_streaming>
     Given an OAI compatible chat completions request with no api error
-    Then  <n_predicted> tokens are predicted matching <re_content>
+    Then  <n_predicted> tokens are predicted
+    And   the completion matches its fixed-seed replay
     And   <n_prompt> prompt tokens are processed
-    And   the completion is <truncated> truncated
+    And   the completion finish reason is <finish_reason>
 
     Examples: Prompts
-      | model        | system_prompt               | user_prompt                          | max_tokens | re_content                        | n_prompt | n_predicted | enable_streaming | truncated |
-      | llama-2      | Book                        | What is the best book                | 8          | (Here\|what)+                     | 77       | 8           | disabled         | not       |
-      | codellama70b | You are a coding assistant. | Write the fibonacci function in c++. | 128        | (thanks\|happy\|bird\|Annabyear)+ | -1       | 64          | enabled          |           |
+      | model        | system_prompt               | user_prompt                          | max_tokens | n_prompt | n_predicted | enable_streaming | finish_reason |
+      | llama-2      | Book                        | What is the best book                | 8          | 77       | 8           | disabled         | length        |
+      | codellama70b | You are a coding assistant. | Write the fibonacci function in c++. | 128        | -1       | 64          | enabled          | length        |
 
 
   Scenario Outline: OAI Responses Compatibility
@@ -125,4 +128,4 @@ Feature: llama.cpp server
     Given available models
     Then  1 models are supported
     Then  model 0 is identified by tinyllama-2
-    Then  model 0 is trained on 128 tokens context
+    Then  model 0 is trained on 2048 tokens context

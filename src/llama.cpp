@@ -205,6 +205,7 @@ static std::vector<rpc_device>  extract_device_from_rpc_device(const std::vector
 
 enum llm_chat_template {
     LLM_CHAT_TEMPLATE_CHATML,
+    LLM_CHAT_TEMPLATE_PHI_4,
     LLM_CHAT_TEMPLATE_LLAMA_2,
     LLM_CHAT_TEMPLATE_LLAMA_2_SYS,
     LLM_CHAT_TEMPLATE_LLAMA_2_SYS_BOS,
@@ -253,6 +254,7 @@ enum llm_chat_template {
 
 static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "chatml",            LLM_CHAT_TEMPLATE_CHATML            },
+    { "phi4",              LLM_CHAT_TEMPLATE_PHI_4             },
     { "llama2",            LLM_CHAT_TEMPLATE_LLAMA_2           },
     { "llama2-sys",        LLM_CHAT_TEMPLATE_LLAMA_2_SYS       },
     { "llama2-sys-bos",    LLM_CHAT_TEMPLATE_LLAMA_2_SYS_BOS   },
@@ -8933,7 +8935,13 @@ int32_t llama_lora_adapter_set(
             struct llama_context * ctx,
             struct llama_lora_adapter * adapter,
             float scale) {
+    if (auto it = ctx->lora_adapters.find(adapter);
+        it != ctx->lora_adapters.end() && it->second == scale) {
+        return 0;
+    }
+    llama_synchronize(ctx);
     ctx->lora_adapters[adapter] = scale;
+    ctx->reset_scheduler();
     return 0;
 }
 
@@ -8942,14 +8950,20 @@ int32_t llama_lora_adapter_remove(
             struct llama_lora_adapter * adapter) {
     auto pos = ctx->lora_adapters.find(adapter);
     if (pos != ctx->lora_adapters.end()) {
+        llama_synchronize(ctx);
         ctx->lora_adapters.erase(pos);
+        ctx->reset_scheduler();
         return 0;
     }
     return -1;
 }
 
 void llama_lora_adapter_clear(struct llama_context * ctx) {
-    ctx->lora_adapters.clear();
+    if (!ctx->lora_adapters.empty()) {
+        llama_synchronize(ctx);
+        ctx->lora_adapters.clear();
+        ctx->reset_scheduler();
+    }
 }
 
 void llama_lora_adapter_free(struct llama_lora_adapter * adapter) {
@@ -14123,7 +14137,7 @@ static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
         return tmpl.find(haystack) != std::string::npos;
     };
     if (tmpl_contains("<|im_start|>")) {
-        return LLM_CHAT_TEMPLATE_CHATML;
+        return tmpl_contains("<|im_sep|>") ? LLM_CHAT_TEMPLATE_PHI_4 : LLM_CHAT_TEMPLATE_CHATML;
     } else if (tmpl.find("mistral") == 0 || tmpl_contains("[INST]")) {
         if (tmpl_contains("[SYSTEM_PROMPT]")) {
             return LLM_CHAT_TEMPLATE_MISTRAL_V7;
@@ -14246,13 +14260,16 @@ static int32_t llama_chat_apply_template_internal(
     std::string & dest, bool add_ass) {
     // Taken from the research: https://github.com/ggerganov/llama.cpp/issues/5527
     std::stringstream ss;
-    if (tmpl == LLM_CHAT_TEMPLATE_CHATML) {
-        // chatml template
+    if (tmpl == LLM_CHAT_TEMPLATE_CHATML || tmpl == LLM_CHAT_TEMPLATE_PHI_4) {
+        // Phi-4 uses ChatML role markers with an explicit separator and no newlines.
+        const bool phi4 = tmpl == LLM_CHAT_TEMPLATE_PHI_4;
+        const char * separator = phi4 ? "<|im_sep|>" : "\n";
+        const char * ending = phi4 ? "" : "\n";
         for (auto message : chat) {
-            ss << "<|im_start|>" << message->role << "\n" << message->content << "<|im_end|>\n";
+            ss << "<|im_start|>" << message->role << separator << message->content << "<|im_end|>" << ending;
         }
         if (add_ass) {
-            ss << "<|im_start|>assistant\n";
+            ss << "<|im_start|>assistant" << separator;
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_MISTRAL_V7) {
         // Official mistral 'v7' template
@@ -14596,7 +14613,7 @@ static int32_t llama_chat_apply_template_internal(
             ss << message->content << "<|end_of_text|>\n";
         }
         if (add_ass) {
-            ss << "<|start_of_role|>assistant<|end_of_role|>\n";
+            ss << "<|start_of_role|>assistant<|end_of_role|>";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_GIGACHAT) {
         // GigaChat template

@@ -1,0 +1,19 @@
+{
+  "ggml-org/models@499bc8821c6b12b4e53c5bffcb21ec206f212d81": [
+    ["tinyllamas/stories260K.gguf", "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d", ["stories260K.gguf", "test-model.gguf"]],
+    ["tinyllamas/stories15M-q4_0.gguf", "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739", ["stories15M-q4_0.gguf"]],
+    ["tinyllamas/split/stories15M-00001-of-00003.gguf", "b7f65a865470f8023edd038d0b787d8db9268abaa8a0a4e21448150772ceea33", ["stories15M-00001-of-00003.gguf", "test-model-00001-of-00003.gguf"]],
+    ["tinyllamas/split/stories15M-00002-of-00003.gguf", "44af9035d52becbe1dfe47fe73109eb6d806287cd7d1e25980dbd62ea18edd1e", ["stories15M-00002-of-00003.gguf", "test-model-00002-of-00003.gguf"]],
+    ["tinyllamas/split/stories15M-00003-of-00003.gguf", "34a6543e31bddf578870b1958b0a2937db1506314deaf0261c6d1e1f8db0ef21", ["stories15M-00003-of-00003.gguf", "test-model-00003-of-00003.gguf"]],
+    ["bert-bge-small/ggml-model-f16.gguf", "f0b2fef971e8366438bfd2d9aefea1b0115919389448806d290237f638bae999", ["bert-bge-small.gguf"]]
+  ],
+  "ggml-org/stories15M_MOE@b6dd737497465570b5f5e962dbc9d9454ed1e0eb": [
+    ["stories15M_MOE-F16.gguf", "1240dfc1957df9f3550dd6c1d9e64b466fc2f452d8bc34bd4e45e1a1e2ca6055", ["stories15M_MOE-F16.gguf"]],
+    ["stories15M_MOE-Q8_0.gguf", "c7aa6863f9a4b3cdf19716e2c95622dcbd3bd06989324bf1ac8e60486ef8e881", ["stories15M_MOE-Q8_0.gguf"]],
+    ["moe_shakespeare15M.gguf", "d1e0617d7e10de960639d18a4620ec8c6bb56343f45692830d3634a1a3e1fe1a", ["moe_shakespeare15M.gguf"]]
+  ],
+  "ggml-org/tinygemma3-GGUF@c287502cd9e278dac8eed805c112cce5d0081e0b": [
+    ["tinygemma3-Q8_0.gguf", "7566ae7219c93ea2ecc692a931ee122d30c55261d0e2c3347acb8b939d2e9abd", ["tinygemma3-Q8_0.gguf"]],
+    ["mmproj-tinygemma3.gguf", "93c2ba8c34574dd8f2dfda64931fc20943de2f941bfe03e6e9eca68951b80604", ["mmproj-tinygemma3.gguf"]]
+  ]
+}

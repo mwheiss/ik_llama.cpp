@@ -3323,7 +3323,19 @@ void server_context::process_single_task(server_task&& task) {
     } break;
     case SERVER_TASK_TYPE_SET_LORA:
     {
+        if (std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
+            queue_tasks.defer(std::move(task));
+            break;
+        }
+        for (auto & adapter : lora_adapters) {
+            adapter.scale = 0.0f;
+        }
+        for (const auto & entry : task.data) {
+            lora_adapters[entry.at("id").get<size_t>()].scale = entry.at("scale").get<float>();
+        }
         llama_lora_adapters_apply(ctx, lora_adapters);
+        // Prompt KV, saved checkpoints, and RAM prompt states depend on the active weights.
+        system_prompt_set(system_prompt);
         server_task_result result;
         result.id = task.id;
         result.error = false;

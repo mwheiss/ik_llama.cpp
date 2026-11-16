@@ -19,18 +19,53 @@ Feature: llama.cpp server
 
   Scenario: Completion LoRA disabled
     Given switch off lora adapter 0
+    Then  the server responds with status code 200
     Given a prompt:
     """
     Look in thy glass
     """
     And   a completion request with no api error
-    Then  64 tokens are predicted matching little|girl|three|years|old
+    Then  64 tokens are predicted
+    And   the completion is recorded as unadapted
+    Given a prompt:
+    """
+    Look in thy glass
+    """
+    And   a completion request with no api error
+    Then  64 tokens are predicted
+    And   the completion equals unadapted
+    And   the completion probabilities equal unadapted
 
   Scenario: Completion LoRA enabled
-    Given switch on lora adapter 0
+    Given prompt caching is enabled
+    Given switch off lora adapter 0
+    Then  the server responds with status code 200
     Given a prompt:
     """
     Look in thy glass
     """
     And   a completion request with no api error
-    Then  64 tokens are predicted matching eye|love|glass|sun
+    Then  64 tokens are predicted
+    And   5 prompt tokens are processed
+    And   the completion is recorded as unadapted
+    Given switch on lora adapter 0
+    Then  the server responds with status code 200
+    Given a prompt:
+    """
+    Look in thy glass
+    """
+    And   a completion request with no api error
+    Then  64 tokens are predicted
+    And   5 prompt tokens are processed
+    And   the completion differs from unadapted
+    Given switch off lora adapter 0
+    Then  the server responds with status code 200
+    Given a prompt:
+    """
+    Look in thy glass
+    """
+    And   a completion request with no api error
+    Then  64 tokens are predicted
+    And   5 prompt tokens are processed
+    And   the completion equals unadapted
+    And   the completion probabilities equal unadapted

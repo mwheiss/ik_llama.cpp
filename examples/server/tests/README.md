@@ -21,6 +21,21 @@ To mitigate it, you can increase values in `n_predict`, `kv_size`.
 
 `pip install -r requirements.txt`
 
+Use Python 3.11 for the pinned Behave runner. Python 3.14 no longer creates the
+implicit event loop that this runner expects.
+
+`tests.sh` prepares every required model and adapter before starting Behave.
+`fixtures.json` pins the Hugging Face revisions and SHA-256 digests, including
+the split models, projector, and MoE fixtures. Existing files with unexpected
+digests cause an error rather than being overwritten. After the first download,
+verified fixtures are loaded locally without following mutable `main` URLs.
+
+These scenarios check protocol behavior, token counts, finite probabilities,
+fixed-seed reproducibility, cache round trips, and adapter changes/restoration.
+Generated words from the toy models are not a quality benchmark. LoRA checks
+include token probabilities because the greedy winning tokens can remain the
+same when an adapter changes the distribution.
+
 ### Run tests
 
 1. Build the server

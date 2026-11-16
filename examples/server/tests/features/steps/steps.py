@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import re
 import signal
@@ -9,6 +10,8 @@ import sys
 import threading
 import time
 import requests
+from pathlib import Path
+from functools import partial
 from collections.abc import Sequence
 from contextlib import closing
 from re import RegexFlag
@@ -28,7 +31,7 @@ from prometheus_client import parser
 def step_server_config(context, server_fqdn: str, server_port: str):
     context.server_fqdn = server_fqdn
     context.server_port = int(server_port)
-    context.n_threads = None
+    context.n_threads = int(os.environ.get('N_THREADS', '4'))
     context.n_gpu_layer = None
     if 'PORT' in os.environ:
         context.server_port = int(os.environ['PORT'])
@@ -83,6 +86,8 @@ def step_server_config(context, server_fqdn: str, server_port: str):
     context.tasks_result = []
     context.concurrent_tasks = []
     context.prompts = []
+    context.recorded_completions = {}
+    context.recorded_probabilities = {}
 
 
 @step('a model file {hf_file} from HF repo {hf_repo}')
@@ -94,9 +99,11 @@ def step_download_hf_model(context, hf_file: str, hf_repo: str):
 @step('a lora adapter file from {lora_file_url}')
 def step_download_lora_file(context, lora_file_url: str):
     file_name = lora_file_url.split('/').pop()
-    context.lora_file = f'../../../{file_name}'
-    with open(context.lora_file, 'wb') as f:
-        f.write(requests.get(lora_file_url).content)
+    context.lora_file = file_name
+    if not Path(file_name).is_file():
+        response = requests.get(lora_file_url, timeout=120)
+        response.raise_for_status()
+        Path(file_name).write_bytes(response.content)
 
 @step('a model file {model_file}')
 def step_model_file(context, model_file: str):
@@ -130,7 +137,7 @@ def step_n_gpu_layer(context, ngl: int):
 
 @step('{n_threads:d} threads')
 def step_n_threads(context, n_threads: int):
-    context.n_thread = n_threads
+    context.n_threads = n_threads
 
 
 @step('{draft:d} as draft')
@@ -288,7 +295,7 @@ async def step_all_slots_status(context, expected_slot_status_string: Literal['i
 async def step_request_completion(context, api_error: Literal['raised'] | str):
     expect_api_error = api_error == 'raised'
     seeds = await completions_seed(context, num_seeds=1)
-    completion = await request_completion(context.prompts.pop(),
+    context.last_completion_request = partial(request_completion, context.prompts.pop(),
                                           seeds[0] if seeds is not None else seeds,
                                           context.base_url,
                                           debug=context.debug,
@@ -298,6 +305,7 @@ async def step_request_completion(context, api_error: Literal['raised'] | str):
                                           expect_api_error=expect_api_error,
                                           user_api_key=context.user_api_key,
                                           temperature=context.temperature)
+    completion = await context.last_completion_request()
     context.tasks_result.append(completion)
     if context.debug:
         print(f"Completion response: {completion}")
@@ -315,6 +323,44 @@ def step_n_tokens_predicted_with_content(context, predicted_n, re_content):
 def step_n_tokens_predicted(context, predicted_n):
     context.completion = context.tasks_result.pop()
     assert_n_tokens_predicted(context.completion, predicted_n)
+
+
+@step('the completion is recorded as {name}')
+def step_record_completion(context, name):
+    context.recorded_completions[name] = context.completion['content']
+    context.recorded_probabilities[name] = context.completion.get('completion_probabilities', [])
+
+
+@step('the completion equals {name}')
+def step_completion_equals(context, name):
+    assert context.completion['content'] == context.recorded_completions[name]
+
+
+@step('the completion differs from {name}')
+def step_completion_differs(context, name):
+    # An adapter can change logits without changing the greedy winning token.
+    assert (context.completion['content'] != context.recorded_completions[name]
+            or context.completion.get('completion_probabilities', []) != context.recorded_probabilities[name]), \
+        'Adapter changed neither text nor token probabilities'
+
+
+@step('the completion probabilities equal {name}')
+def step_completion_probabilities_equal(context, name):
+    assert context.recorded_probabilities[name], 'No probabilities were recorded'
+    assert context.completion['completion_probabilities'] == context.recorded_probabilities[name]
+
+
+@step('the completion matches its fixed-seed replay')
+@async_run_until_complete
+async def step_completion_replay(context):
+    repeated = await context.last_completion_request()
+    assert repeated['content'] == context.completion['content'], 'fixed-seed output changed'
+    assert repeated['timings']['predicted_n'] == context.completion['timings']['predicted_n']
+
+
+@step('the completion finish reason is {reason}')
+def step_completion_finish_reason(context, reason):
+    assert context.completion['finish_reason'] == reason
 
 
 @step('all predictions are equal')
@@ -501,9 +547,9 @@ async def step_oai_chat_completions(context, api_error):
     if context.debug:
         print(f"Submitting OAI compatible completions request...")
     expect_api_error = api_error == 'raised'
-    seeds = await completions_seed(context, num_seeds=1),
-    completion = await oai_chat_completions(context.prompts.pop(),
-                                            seeds[0] if seeds is not None else seeds,
+    seeds = await completions_seed(context, num_seeds=1)
+    context.last_completion_request = partial(oai_chat_completions, context.prompts.pop(),
+                                            seeds[0] if seeds is not None else None,
                                             context.system_prompt,
                                             context.base_url,
                                             '/v1/chat',
@@ -523,6 +569,7 @@ async def step_oai_chat_completions(context, api_error):
                                             if hasattr(context, 'user_api_key') else None,
 
                                             expect_api_error=expect_api_error)
+    completion = await context.last_completion_request()
     context.tasks_result.append(completion)
     if context.debug:
         print(f"Completion response: {completion}")
@@ -1078,7 +1125,7 @@ async def request_completion(prompt,
                                     "prompt": prompt,
                                     "input_suffix": prompt_suffix,
                                     "n_predict": n_predict if n_predict is not None else -1,
-                                    "cache_prompt": cache_prompt,
+                                    "cache_prompt": bool(cache_prompt),
                                     "id_slot": id_slot,
                                     "seed": seed if seed is not None else 42,
                                     "temperature": temperature if temperature is not None else 0.8,
@@ -1133,6 +1180,8 @@ async def oai_chat_completions(user_prompt,
     }
     if response_format is not None:
         payload['response_format'] = response_format
+    if enable_streaming:
+        payload['stream_options'] = {'include_usage': True}
     completion_response = {
         'content': '',
         'timings': {
@@ -1163,12 +1212,25 @@ async def oai_chat_completions(user_prompt,
                             assert event_data[0] == 'data', f'Bad event code received: ```{event_data}```'
                             chunk_raw = event_data[1]
 
+                            if chunk_raw == '[DONE]':
+                                break
                             chunk = json.loads(chunk_raw)
-                            assert len(chunk['choices']) == 1, f"no choices provided, line ```{line}```"
-                            delta = chunk['choices'][0]['delta']
-                            if 'content' in delta:
+                            if chunk.get('usage') is not None:
+                                completion_response['timings'] = {
+                                    'predicted_n': chunk['usage']['completion_tokens'],
+                                    'prompt_n': chunk['usage']['prompt_tokens'],
+                                }
+                            if not chunk['choices']:
+                                assert chunk.get('usage') is not None
+                                continue
+                            assert len(chunk['choices']) == 1, f"unexpected choices, line ```{line}```"
+                            choice = chunk['choices'][0]
+                            delta = choice['delta']
+                            if delta.get('content') is not None:
                                 completion_response['content'] += delta['content']
                                 completion_response['timings']['predicted_n'] += 1
+                            if choice.get('finish_reason') is not None:
+                                completion_response['finish_reason'] = choice['finish_reason']
                 else:
                     if expect_api_error is None or not expect_api_error:
                         assert response.status == 200
@@ -1176,7 +1238,8 @@ async def oai_chat_completions(user_prompt,
                         assert response.headers['Content-Type'] == "application/json; charset=utf-8"
                         chat_completion_raw = await response.json()
                         completion_response = {
-                            'content': chat_completion_raw['choices'][0]['message'],
+                            'content': chat_completion_raw['choices'][0]['message']['content'],
+                            'finish_reason': chat_completion_raw['choices'][0]['finish_reason'],
                             'timings': {
                                 'predicted_n': chat_completion_raw['usage']['completion_tokens'],
                                 'prompt_n': chat_completion_raw['usage']['prompt_tokens']
@@ -1195,6 +1258,7 @@ async def oai_chat_completions(user_prompt,
                 max_tokens=n_predict,
                 stream=enable_streaming,
                 response_format=payload.get('response_format') or openai.NOT_GIVEN,
+                stream_options=payload.get('stream_options', openai.NOT_GIVEN),
                 seed=seed,
                 temperature=payload['temperature']
             )
@@ -1207,12 +1271,21 @@ async def oai_chat_completions(user_prompt,
         if enable_streaming:
             chat_completion = cast(openai.Stream[ChatCompletionChunk], chat_completion)
             for chunk in chat_completion:
+                if chunk.usage is not None:
+                    completion_response['timings'] = {
+                        'predicted_n': chunk.usage.completion_tokens,
+                        'prompt_n': chunk.usage.prompt_tokens,
+                    }
+                if not chunk.choices:
+                    assert chunk.usage is not None
+                    continue
                 assert len(chunk.choices) == 1
                 delta = chunk.choices[0].delta
                 if delta.content is not None:
                     completion_response['content'] += delta.content
                     completion_response['timings']['predicted_n'] += 1
-                completion_response['truncated'] = chunk.choices[0].finish_reason != 'stop'
+                if chunk.choices[0].finish_reason is not None:
+                    completion_response['finish_reason'] = chunk.choices[0].finish_reason
         else:
             assert len(chat_completion.choices) == 1
             assert chat_completion.usage is not None
@@ -1222,7 +1295,7 @@ async def oai_chat_completions(user_prompt,
                     'predicted_n': chat_completion.usage.completion_tokens,
                     'prompt_n': chat_completion.usage.prompt_tokens
                     },
-                'truncated': chat_completion.choices[0].finish_reason != 'stop'
+                'finish_reason': chat_completion.choices[0].finish_reason,
             }
     if debug:
         print("OAI response formatted to llama.cpp:", completion_response)
@@ -1237,7 +1310,8 @@ async def request_embedding(content, seed, base_url=None) -> list[list[float]]:
                                 }) as response:
             assert response.status == 200
             response_json = await response.json()
-            return [response_json['embedding']]
+            assert isinstance(response_json, list) and response_json, response_json
+            return [vector for item in response_json for vector in item['embedding']]
 
 
 async def request_oai_embeddings(input, seed,
@@ -1287,6 +1361,9 @@ def assert_n_tokens_predicted(completion_response, expected_predicted_n=None, re
     content = completion_response['content']
     n_predicted = completion_response['timings']['predicted_n']
     assert len(content) > 0, "no token predicted"
+    for token in completion_response.get('completion_probabilities', []):
+        probabilities = [item['prob'] for item in token['probs']]
+        assert all(math.isfinite(p) and 0 <= p <= 1 for p in probabilities)
     if re_content is not None:
         p = re.compile(re_content, flags=RegexFlag.IGNORECASE | RegexFlag.MULTILINE | RegexFlag.DOTALL)
         matches = p.finditer(content)
@@ -1422,6 +1499,7 @@ def assert_embeddings(embeddings):
     for emb in embeddings:
         if not isinstance(emb, float):
             assert False, f"Bad embeddings: {embeddings}"
+        assert math.isfinite(emb), f'Nonfinite embedding: {emb}'
         if emb != 0:
             embeddings_computed = True
     assert embeddings_computed, f"Embeddings: {embeddings}"
@@ -1480,18 +1558,18 @@ def start_server_background(context):
     ]
     if context.model_file:
         server_args.extend(['--model', context.model_file])
-    if context.model_url:
+    if context.model_url and not Path(context.model_file).is_file():
         server_args.extend(['--model-url', context.model_url])
-    if context.model_hf_repo:
+    if context.model_hf_repo and not Path(context.model_file).is_file():
         server_args.extend(['--hf-repo', context.model_hf_repo])
-    if context.model_hf_file:
+    if context.model_hf_file and not Path(context.model_file).is_file():
         server_args.extend(['--hf-file', context.model_hf_file])
     if context.n_batch:
         server_args.extend(['--batch-size', context.n_batch])
     if context.n_ubatch:
         server_args.extend(['--ubatch-size', context.n_ubatch])
     if context.n_threads:
-        server_args.extend(['--threads', context.threads])
+        server_args.extend(['--threads', context.n_threads])
     if context.n_gpu_layer:
         server_args.extend(['--n-gpu-layers', context.n_gpu_layer])
     if context.draft is not None:
