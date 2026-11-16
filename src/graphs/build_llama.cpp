@@ -176,8 +176,11 @@ ggml_cgraph * llm_build_context::build_llama() {
                     LLM_FFN_SILU, true,
                     false, 0.0,
                     LLM_EXPERT_GATING_FUNC_SOFTMAX,
-                    cb, il, gf, true);
+                    cb, il, gf, false);
             cb(cur, "ffn_moe_out", il);
+
+            // The residual is the input before FFN normalization.
+            cur = ggml_add(ctx0, cur, ffn_inp);
         }
 
         // For Granite architecture

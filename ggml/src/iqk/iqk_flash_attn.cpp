@@ -263,6 +263,9 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                             int ith, int nth, int n_swa, [[maybe_unused]] ggml_tensor * indexer) {
 
     if (type_q != 0 || type_mask != 1 || max_bias > 0) return false;
+    // Every worker must choose the same path, including workers with no query
+    // rows. Otherwise idle workers report success while others fall back.
+    if (!mask || nek1 % 32 != 0 || !iqk_fa_supported_head_sizes(Dk, Dv)) return false;
 
     if (indexer && indexer->type == GGML_TYPE_I32) {
         // an unsupported K/V type must reach the abort below, as without the indexer, not the generic indexer path

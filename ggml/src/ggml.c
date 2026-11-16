@@ -24010,14 +24010,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         float       * VKQ32 = (float       *) params->wdata + ith*(3*Dkv + CACHE_LINE_SIZE_F32); // FP32 VKQ accumulator
         float       * V32   =                 (VKQ32 + 1*Dkv); // (temporary) FP32 V buffer
-        ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*Dkv); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*Dkv); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (v->type == GGML_TYPE_F16) {
-            memset(VKQ16, 0, Dkv*sizeof(ggml_fp16_t));
-        } else {
-            memset(VKQ32, 0, Dkv*sizeof(float));
-        }
+        // Keep the online softmax accumulator in F32, including for F16 V.
+        memset(VKQ32, 0, Dkv*sizeof(float));
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1]) : NULL;
         // without a mask, src[5] lists the K rows of this query
@@ -24051,7 +24047,14 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(Dk, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (k->type == GGML_TYPE_F16) {
+                // The generic F32 path need not round the query to F16.
+                // Reuse the temporary V buffer before accumulating this row.
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) k_data, V32, Dk);
+                ggml_vec_dot_f32(Dk, &s, 0, pq, 0, V32, 0, 1);
+            } else {
+                kq_vec_dot(Dk, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = softcap == 0.0f ? s*scale + mv : softcap*tanhf(s*scale) + mv; // scale KQ value and apply mask
 
@@ -24062,22 +24065,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
-            if (v->type == GGML_TYPE_F16) {
-                if (s > M) {
-                    // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
-                    M = s;
-                    ms = expf(Mold - M);
-
-                    // V = V*expf(Mold - M)
-                    ggml_vec_scale_f16(Dv, VKQ16, ms);
-                } else {
-                    // no new maximum, ms == 1.0f, vs != 1.0f
-                    vs = expf(s - M);
-                }
-
-                // V += v*expf(s - M)
-                ggml_vec_mad_f16(Dv, VKQ16, (const ggml_fp16_t *) v_data, vs);
-            } else {
+            {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -24097,12 +24085,6 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             }
 
             S = S*ms + vs; // scale and increment sum with partial sum
-        }
-
-        if (v->type == GGML_TYPE_F16) {
-            for (int64_t d = 0; d < Dv; ++d) {
-                VKQ32[d] = GGML_FP16_TO_FP32(VKQ16[d]);
-            }
         }
 
         if (sinks) {

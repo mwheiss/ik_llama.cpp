@@ -195,6 +195,7 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp )
 llama_build_and_test(test-json-partial.cpp )
 llama_build_and_test(test-cpu-affinity.cpp )
+llama_build_and_test(test-flash-attn-fallback.cpp )
 llama_build_and_test(test-nanbeige-loop.cpp )
 #llama_build_and_test(test-log.cpp)
 llama_build_and_test(
@@ -231,3 +232,12 @@ target_include_directories(test-moe-cache-shares PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/ggml/include)
 add_test(NAME test-moe-cache-shares COMMAND $<TARGET_FILE:test-moe-cache-shares>)
+
+# Model quality is a separate gate from protocol/replay invariants. Missing
+# pinned fixtures are reported as skipped, never counted as a passing model test.
+llama_build(model-quality-probe.cpp)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME test-model-quality COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test-model-quality.py
+    --probe $<TARGET_FILE:model-quality-probe>)
+set_tests_properties(test-model-quality PROPERTIES SKIP_RETURN_CODE 77 LABELS "quality")

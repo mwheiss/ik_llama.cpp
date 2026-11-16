@@ -63,15 +63,15 @@ Feature: llama.cpp server
     And   <max_tokens> max tokens to predict
     And   streaming is <enable_streaming>
     Given an OAI compatible chat completions request with no api error
-    Then  <n_predicted> tokens are predicted
+    Then  <n_predicted> tokens are predicted matching <re_content>
     And   the completion matches its fixed-seed replay
     And   <n_prompt> prompt tokens are processed
     And   the completion finish reason is <finish_reason>
 
     Examples: Prompts
-      | model        | system_prompt               | user_prompt                          | max_tokens | n_prompt | n_predicted | enable_streaming | finish_reason |
-      | llama-2      | Book                        | What is the best book                | 8          | 77       | 8           | disabled         | length        |
-      | codellama70b | You are a coding assistant. | Write the fibonacci function in c++. | 128        | -1       | 64          | enabled          | length        |
+      | model        | system_prompt               | user_prompt                          | max_tokens | re_content | n_prompt | n_predicted | enable_streaming | finish_reason |
+      | llama-2      | Book                        | What is the best book                | 8          | (Here\|what)+ | 77       | 8           | disabled         | length        |
+      | codellama70b | You are a coding assistant. | Write the fibonacci function in c++. | 128        | (thanks\|happy\|bird\|Annabyear)+ | -1       | 64          | enabled          | length        |
 
 
   Scenario Outline: OAI Responses Compatibility

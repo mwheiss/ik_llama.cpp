@@ -1,4 +1,6 @@
 *
+!quality/
+!quality/**
 !*.*
 *.o
 ggml-common.h

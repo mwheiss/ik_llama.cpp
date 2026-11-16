@@ -25,7 +25,7 @@ Feature: llama.cpp server
     Look in thy glass
     """
     And   a completion request with no api error
-    Then  64 tokens are predicted
+    Then  64 tokens are predicted matching little|girl|three|years|old
     And   the completion is recorded as unadapted
     Given a prompt:
     """
@@ -45,7 +45,7 @@ Feature: llama.cpp server
     Look in thy glass
     """
     And   a completion request with no api error
-    Then  64 tokens are predicted
+    Then  64 tokens are predicted matching little|girl|three|years|old
     And   5 prompt tokens are processed
     And   the completion is recorded as unadapted
     Given switch on lora adapter 0
@@ -55,7 +55,7 @@ Feature: llama.cpp server
     Look in thy glass
     """
     And   a completion request with no api error
-    Then  64 tokens are predicted
+    Then  64 tokens are predicted matching eye|love|glass|sun
     And   5 prompt tokens are processed
     And   the completion differs from unadapted
     Given switch off lora adapter 0

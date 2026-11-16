@@ -8,6 +8,16 @@
 
 #include <cstdint>
 
+inline bool iqk_fa_supported_head_sizes(int Dk, int Dv) {
+    switch (Dk) {
+        case 64: case 96: case 128: case 256: case 512: return Dv == Dk;
+        case 192: return Dv == 128 || Dv == 192;
+        case 320: return Dv == 256;
+        case 576: return Dv == 512;
+        default: return false;
+    }
+}
+
 bool iqk_flash_attn_impl(int type_k,             // type of k
                          int type_v,             // type of v
                          int Dk,                 // K head size

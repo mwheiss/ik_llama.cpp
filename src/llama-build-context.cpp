@@ -1122,6 +1122,11 @@ ggml_tensor * llm_build_context::llm_build_lora_mm(
         }
     }
     struct ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
+    if (w->type == GGML_TYPE_F16) {
+        // Preserve F32 projection outputs instead of rounding CUDA GEMMs and
+        // their accumulation to F16 before residual and adapter additions.
+        ggml_mul_mat_set_prec(res, GGML_PREC_F32);
+    }
     for (auto & it : lctx.lora_adapters) {
         struct llama_lora_weight * lora = it.first->get_weight(w);
         if (lora == nullptr) {
@@ -1130,10 +1135,10 @@ ggml_tensor * llm_build_context::llm_build_lora_mm(
         const float alpha = it.first->alpha;
         const float rank  = (float) lora->b->ne[0];
         const float scale = alpha ? it.second * alpha / rank : it.second;
-        struct ggml_tensor * ab_cur = ggml_mul_mat(
-            ctx0, lora->b,
-            ggml_mul_mat(ctx0, lora->a, cur)
-        );
+        struct ggml_tensor * a_cur = ggml_mul_mat(ctx0, lora->a, cur);
+        ggml_mul_mat_set_prec(a_cur, GGML_PREC_F32);
+        struct ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lora->b, a_cur);
+        ggml_mul_mat_set_prec(ab_cur, GGML_PREC_F32);
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
     }
@@ -1424,7 +1429,11 @@ ggml_tensor * llm_build_context::llm_build_ffn(
          ggml_tensor * post_norm, float post_norm_eps,
          post_norm_data * pnd) {
 
-    auto can_fuse_up_gate = [type_op] (const ggml_tensor * u, const ggml_tensor * g) {
+    auto can_fuse_up_gate = [&lctx, type_op] (ggml_tensor * u, ggml_tensor * g) {
+        // Fused kernels consume only the base weights.
+        for (const auto & adapter : lctx.lora_adapters) {
+            if (adapter.first->get_weight(u) || adapter.first->get_weight(g)) return false;
+        }
         if (type_op != LLM_FFN_SWIGLU_OAI && type_op != LLM_FFN_SITU) return true;
         return ggml_is_quantized(u->type) && u->type == g->type;
     };
@@ -1971,6 +1980,14 @@ llm_expert_gating_func_type   gating_op,
     bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU ||
                          type_op == LLM_FFN_SWIGLU_OAI ||
                          (type_op == LLM_FFN_SITU && lctx.model.n_gpu_layers == 0));
+    for (const auto & adapter : lctx.lora_adapters) {
+        if ((up_exps && adapter.first->get_weight(up_exps)) ||
+            (gate_exps && adapter.first->get_weight(gate_exps)) ||
+            (up_gate_exps && adapter.first->get_weight(up_gate_exps))) {
+            can_use_fmoe = false;
+            break;
+        }
+    }
 
     bool share_offload_eligible = false;
     if (share_ids_ready && n_tokens <= 32) {
@@ -2220,7 +2237,7 @@ llm_expert_gating_func_type   gating_op,
         *((float *)(par->op_params + 3)) = lctx.model.hparams.situ_linear_beta;
     } else {
     if (up_gate_exps) {
-        GGML_ASSERT(cache_ids && cached_up_gate);
+        GGML_ASSERT(!cache_ids || cached_up_gate);
         ggml_tensor * gate_up = llm_build_lora_mm_id(lctx, ctx, up_gate_exps, cur,
                 selected_experts, cached_up_gate, cache_ids, true);
         if (up_gate_exps_b) {
